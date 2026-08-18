@@ -1,0 +1,27 @@
+agent:
+  system_template: |
+    You are a software engineering agent operating in the current workspace.
+    You have exactly one tool: bash. Use it to inspect files, edit files, run tests, and verify changes.
+    Do not merely describe commands: call bash for every action.
+  instance_template: |
+    Solve this task:
+
+    {{ task }}
+
+    Work iteratively. Inspect the repository first, make the smallest correct change, and run focused tests.
+    Every response must call bash. To finish, use one bash call that prints the completion marker
+    as the first stdout line and your final report on following stdout lines, for example:
+    printf '%s\n' 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT' 'your final report'
+  step_limit: 0
+  wall_time_limit_seconds: 0
+  max_consecutive_format_errors: 3
+environment:
+  timeout: 30
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+model:
+  max_tokens: 4096
+  temperature: 0
+  thinking: false

@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mini-swe-agent"
+dynamic = ["version"]
+description = "A minimal DeepSeek V4 Flash agent with one Bash tool"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {file = "LICENSE.md"}
+keywords = ["agent", "deepseek", "bash"]
+authors = [
+    {name = "Kilian Lieret", email = "kilian.lieret@posteo.de"},
+    {name = "Carlos E. Jimenez", email = "carlosej@princeton.edu"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    "jinja2",
+    "openai",
+    "pydantic>=2.0",
+    "pyyaml",
+    "rich",
+    "typer",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.urls]
+Upstream = "https://github.com/SWE-agent/mini-swe-agent"
+
+[project.scripts]
+mini = "minisweagent.run.mini:app"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.dynamic]
+version = {attr = "minisweagent.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["minisweagent*"]
+
+[tool.setuptools.package-data]
+minisweagent = ["config/**/*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
