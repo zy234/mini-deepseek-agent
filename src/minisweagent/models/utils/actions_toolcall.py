@@ -11,13 +11,13 @@ BASH_TOOL = {
     "type": "function",
     "function": {
         "name": "bash",
-        "description": "Execute a bash command",
+        "description": "在当前工作目录执行一条 Bash 命令。仅用于必要的检查、编辑和验证；禁止提权、删除根目录或工作区、磁盘写入、远程脚本管道和泄露凭据。",
         "parameters": {
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The bash command to execute",
+                    "description": "要执行的 Bash 命令；应保持短小、可审查，并避免访问敏感信息或执行破坏性操作",
                 }
             },
             "required": ["command"],
@@ -25,6 +25,19 @@ BASH_TOOL = {
         },
     },
 }
+
+MAX_TOOL_OUTPUT_CHARS = 1000
+
+
+def truncate_tool_output(output: dict, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> dict:
+    """Limit captured command stdout before it is shown to or stored for the model."""
+    result = dict(output)
+    text = result.get("output", "")
+    if not isinstance(text, str) or len(text) <= max_chars:
+        return result
+    result["output"] = text[:max_chars]
+    result["extra"] = {**result.get("extra", {}), "output_truncated": True}
+    return result
 
 
 def parse_toolcall_actions(
@@ -42,7 +55,7 @@ def parse_toolcall_actions(
             {
                 "role": "user",
                 "content": Template(format_error_template, undefined=StrictUndefined).render(
-                    error="No tool calls found in the response. Every response MUST include at least one tool call.",
+                    error="响应中没有可执行的工具调用。",
                     actions=[],
                     has_tool_calls=False,
                     **template_kwargs,
@@ -57,11 +70,11 @@ def parse_toolcall_actions(
         try:
             args = json.loads(tool_call.function.arguments)
         except Exception as e:
-            error_msg = f"Error parsing tool call arguments: {e}."
+            error_msg = f"无法解析工具参数：{e}。"
         if tool_call.function.name != "bash":
-            error_msg += f"Unknown tool '{tool_call.function.name}'."
+            error_msg += f"未知工具：{tool_call.function.name}。"
         if not isinstance(args, dict) or "command" not in args:
-            error_msg += "Missing 'command' argument in bash tool call."
+            error_msg += "bash 工具调用缺少 command 参数。"
         if error_msg:
             raise FormatError(
                 {
@@ -84,10 +97,11 @@ def format_toolcall_observation_messages(
     template_vars: dict | None = None,
 ) -> list[dict]:
     """Format execution outputs into tool result messages."""
-    not_executed = {"output": "", "returncode": -1, "exception_info": "action was not executed"}
+    not_executed = {"output": "", "returncode": -1, "exception_info": "操作未执行"}
     padded_outputs = outputs + [not_executed] * (len(actions) - len(outputs))
     results = []
     for action, output in zip(actions, padded_outputs, strict=True):
+        output = truncate_tool_output(output)
         content = Template(observation_template, undefined=StrictUndefined).render(
             output=output, **(template_vars or {})
         )

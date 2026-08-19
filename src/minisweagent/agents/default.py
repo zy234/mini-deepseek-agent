@@ -4,6 +4,7 @@ or https://minimal-agent.com for a tutorial on the basic building principles.
 
 import json
 import logging
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
+from minisweagent.models.utils.actions_toolcall import truncate_tool_output
 from minisweagent.utils.serialize import recursive_merge
 
 
@@ -146,8 +148,35 @@ class DefaultAgent:
 
     def execute_actions(self, message: dict) -> list[dict]:
         """Execute actions in message, add observation messages, return them."""
-        outputs = [self.env.execute(action) for action in message.get("extra", {}).get("actions", [])]
+        actions = message.get("extra", {}).get("actions", [])
+        if not actions:
+            content = (message.get("content") or "").strip()
+            return self.add_messages(
+                self.model.format_message(
+                    role="exit",
+                    content=content,
+                    extra={"exit_status": "Submitted", "submission": content},
+                )
+            )
+        outputs = []
+        for action in actions:
+            output = self.env.execute(action)
+            outputs.append(output)
+            self._print_tool_result(output)
         return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
+
+    @staticmethod
+    def _print_tool_result(output: dict) -> None:
+        output = truncate_tool_output(output)
+        sys.stdout.write(f"\n[工具结果] returncode={output.get('returncode')}\n")
+        text = output.get("output", "")
+        if text:
+            sys.stdout.write(text)
+            if not text.endswith("\n"):
+                sys.stdout.write("\n")
+        if output.get("extra", {}).get("output_truncated"):
+            sys.stdout.write("[工具结果已截断，仅保留前 1000 个字符]\n")
+        sys.stdout.flush()
 
     def serialize(self, *extra_dicts) -> dict:
         """Serialize agent state to a json-compatible nested dictionary for saving."""

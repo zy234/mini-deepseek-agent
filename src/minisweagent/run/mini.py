@@ -21,6 +21,22 @@ console = Console(highlight=False)
 app = typer.Typer(add_completion=False)
 
 
+def _submission_was_streamed(agent: Any) -> bool:
+    if not getattr(agent.model.config, "stream_output", False):
+        return False
+    previous = agent.messages[-2] if len(agent.messages) >= 2 else {}
+    return previous.get("role") == "assistant" and not previous.get("extra", {}).get("actions")
+
+
+def _print_result(result: dict, *, submission_streamed: bool) -> None:
+    """Print a final answer only when it was not already emitted by streaming."""
+    status = result.get("exit_status", "unknown")
+    if status != "Submitted":
+        console.print(f"[bold]{status}[/bold]")
+    if result.get("submission") and not submission_streamed:
+        console.print(result["submission"])
+
+
 @app.command()
 def main(
     task: str | None = typer.Option(None, "-t", "--task", help="Task for the agent."),
@@ -48,9 +64,7 @@ def main(
     environment = get_environment(settings.get("environment", {}))
     agent = get_agent(model, environment, settings.get("agent", {}))
     result = agent.run(task)
-    console.print(f"[bold]{result.get('exit_status', 'unknown')}[/bold]")
-    if result.get("submission"):
-        console.print(result["submission"])
+    _print_result(result, submission_streamed=_submission_was_streamed(agent))
     return agent
 
 

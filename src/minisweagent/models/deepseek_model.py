@@ -2,7 +2,9 @@
 
 import logging
 import os
+import sys
 import time
+from dataclasses import dataclass, field
 from typing import Any
 
 from openai import OpenAI
@@ -18,24 +20,24 @@ from minisweagent.utils.serialize import recursive_merge
 logger = logging.getLogger("minisweagent.model")
 MODEL_NAME = "deepseek-v4-flash"
 BASE_URL = "https://api.deepseek.com"
+DEFAULT_API_TIMEOUT_SECONDS = 60.0
 
 DEFAULT_OBSERVATION_TEMPLATE = """
 {%- if output.output | length < 10000 -%}
 {"returncode": {{ output.returncode }}, "output": {{ output.output | tojson }}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
 {%- else -%}
-{"returncode": {{ output.returncode }}, "output_head": {{ output.output[:5000] | tojson }}, "output_tail": {{ output.output[-5000:] | tojson }}, "warning": "Output too long."}
+{"returncode": {{ output.returncode }}, "output_head": {{ output.output[:5000] | tojson }}, "output_tail": {{ output.output[-5000:] | tojson }}, "warning": "工具输出过长，已截断。"}
 {%- endif -%}
 """.strip()
 
 DEFAULT_FORMAT_ERROR_TEMPLATE = """
-Tool call error:
+响应格式无法解析：
 {{ error }}
 
-Every response must call the bash tool exactly as:
-{"command": "your command"}
+如果确实需要操作，请使用 bash 工具，并传入如下 JSON 参数：
+{"command": "要执行的命令"}
 
-Finish with one bash call that prints the marker first and the final report afterwards:
-printf '%s\n' 'COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT' 'your final report'
+如果任务已经可以回答，请直接返回中文最终答复，不要强行调用工具。
 """.strip()
 
 
@@ -46,6 +48,8 @@ class DeepSeekModelConfig(BaseModel):
     temperature: float = 0.0
     thinking: bool = False
     retry_attempts: int = 3
+    api_timeout_seconds: float = DEFAULT_API_TIMEOUT_SECONDS
+    stream_output: bool = True
     observation_template: str = DEFAULT_OBSERVATION_TEMPLATE
     format_error_template: str = DEFAULT_FORMAT_ERROR_TEMPLATE
 
@@ -58,47 +62,63 @@ class DeepSeekModel:
         api_key = os.getenv("DS_KEY")
         if not api_key:
             raise ValueError("DS_KEY is required to call DeepSeek")
-        self.client = OpenAI(api_key=api_key, base_url=BASE_URL)
+        # This applies the 60-second limit to SDK connect/read/write/pool operations.
+        self.client = OpenAI(api_key=api_key, base_url=BASE_URL, timeout=self.config.api_timeout_seconds)
 
     def query(self, messages: list[dict[str, Any]], **_kwargs) -> dict:
         request = {
             "model": MODEL_NAME,
             "messages": self._api_messages(messages),
             "tools": [BASH_TOOL],
-            "tool_choice": "required",
+            "tool_choice": "auto",
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
-            "stream": False,
+            "stream": True,
         }
-        if not self.config.thinking:
-            request["extra_body"] = {"thinking": {"type": "disabled"}}
+        request["extra_body"] = {
+            "thinking": {"type": "enabled" if self.config.thinking else "disabled"}
+        }
 
         response = self._request(request)
-        choice = response.choices[0]
-        tool_calls = choice.message.tool_calls or []
-        usage = response.usage.model_dump(exclude_none=True) if response.usage else {}
-        extra = {
-            "actions": parse_toolcall_actions(
+        content, reasoning_content, tool_calls, finish_reason, usage = self._consume_stream(response)
+        actions = []
+        if tool_calls:
+            actions = parse_toolcall_actions(
                 tool_calls,
                 format_error_template=self.config.format_error_template,
-                template_kwargs={"finish_reason": choice.finish_reason},
-            ),
-            "finish_reason": choice.finish_reason,
+                template_kwargs={"finish_reason": finish_reason},
+            )
+        elif not content.strip():
+            parse_toolcall_actions(
+                [],
+                format_error_template=self.config.format_error_template,
+                template_kwargs={"finish_reason": finish_reason},
+            )
+        extra = {
+            "actions": actions,
+            "finish_reason": finish_reason,
             "usage": usage,
             "timestamp": time.time(),
         }
-        return {
+        if reasoning_content:
+            extra["reasoning_content"] = reasoning_content
+        result = {
             "role": "assistant",
-            "content": choice.message.content,
-            "tool_calls": [call.model_dump(exclude_none=True) for call in tool_calls],
+            "content": content or None,
+            "tool_calls": [call.model_dump() for call in tool_calls],
             "extra": extra,
         }
+        if reasoning_content:
+            result["reasoning_content"] = reasoning_content
+        return result
 
     def _request(self, request: dict) -> Any:
         last_error: Exception | None = None
         for attempt in range(max(1, self.config.retry_attempts)):
             try:
-                return self.client.chat.completions.create(**request)
+                return self.client.chat.completions.create(
+                    **request, timeout=self.config.api_timeout_seconds
+                )
             except Exception as error:
                 last_error = error
                 if attempt + 1 >= max(1, self.config.retry_attempts):
@@ -108,13 +128,71 @@ class DeepSeekModel:
                 time.sleep(delay)
         raise RuntimeError("DeepSeek request failed") from last_error  # pragma: no cover
 
+    def _consume_stream(self, response: Any) -> tuple[str, str, list["_ToolCall"], str | None, dict]:
+        content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+        tool_calls: dict[int, _ToolCall] = {}
+        finish_reason = None
+        usage: dict = {}
+        output_state = _OutputState(enabled=self.config.stream_output)
+
+        for chunk in response:
+            if getattr(chunk, "usage", None):
+                usage = chunk.usage.model_dump(exclude_none=True)
+            for choice in getattr(chunk, "choices", []) or []:
+                finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+                delta = getattr(choice, "delta", None)
+                if delta is None:
+                    continue
+                reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                if reasoning:
+                    reasoning_parts.append(reasoning)
+                    self._stream_text(output_state, "思考", reasoning)
+                content = getattr(delta, "content", None)
+                if content:
+                    content_parts.append(content)
+                    self._stream_text(output_state, "回复", content)
+                for tool_delta in getattr(delta, "tool_calls", None) or []:
+                    index = getattr(tool_delta, "index", None)
+                    index = 0 if index is None else index
+                    call = tool_calls.setdefault(index, _ToolCall())
+                    call.id = getattr(tool_delta, "id", None) or call.id
+                    function = getattr(tool_delta, "function", None)
+                    if function is None:
+                        continue
+                    name = getattr(function, "name", None)
+                    arguments = getattr(function, "arguments", None)
+                    if name:
+                        call.function.name = name
+                    if arguments:
+                        call.function.arguments += arguments
+                        self._stream_text(output_state, f"工具:{call.function.name}", arguments)
+
+        if output_state.enabled and output_state.open:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        return "".join(content_parts), "".join(reasoning_parts), list(tool_calls.values()), finish_reason, usage
+
+    @staticmethod
+    def _stream_text(state: "_OutputState", label: str, text: str) -> None:
+        if not state.enabled:
+            return
+        if state.label != label:
+            if state.open:
+                sys.stdout.write("\n")
+            sys.stdout.write(f"[{label}] ")
+            state.label = label
+            state.open = True
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
     @staticmethod
     def _api_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Drop local trajectory metadata before sending OpenAI-compatible messages."""
         allowed = {
             "system": {"role", "content"},
             "user": {"role", "content"},
-            "assistant": {"role", "content", "tool_calls"},
+            "assistant": {"role", "content", "tool_calls", "reasoning_content"},
             "tool": {"role", "content", "tool_call_id"},
         }
         result = []
@@ -162,3 +240,29 @@ class DeepSeekModel:
                 "model_type": f"{self.__class__.__module__}.{self.__class__.__name__}",
             }
         }
+
+
+@dataclass
+class _FunctionCall:
+    name: str = "bash"
+    arguments: str = ""
+
+
+@dataclass
+class _ToolCall:
+    id: str = ""
+    function: _FunctionCall = field(default_factory=_FunctionCall)
+
+    def model_dump(self) -> dict:
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.function.name, "arguments": self.function.arguments},
+        }
+
+
+@dataclass
+class _OutputState:
+    enabled: bool
+    label: str | None = None
+    open: bool = False

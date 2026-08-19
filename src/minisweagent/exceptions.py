@@ -22,5 +22,9 @@ class UserInterruption(InterruptAgentFlow):
     """Raised when the user interrupts the agent."""
 
 
+class CommandNotApproved(InterruptAgentFlow):
+    """Raised when a Bash command is forbidden or not approved by the user."""
+
+
 class FormatError(InterruptAgentFlow):
     """Raised when the LM's output is not in the expected format."""
