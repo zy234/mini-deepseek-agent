@@ -81,7 +81,8 @@ def render_tool_actions(actions: list[dict[str, Any]], *, stream: TextIO | None 
     """Render parsed Bash calls separately instead of printing raw argument JSON."""
     stream = stream or sys.stdout
     for index, action in enumerate(actions, start=1):
-        _separator(f"工具调用 {index} · bash", stream)
+        tool_name = action.get("tool", "bash")
+        _separator(f"工具调用 {index} · {tool_name}", stream)
         description = action.get("description")
         if description:
             stream.write(_paint(stream, "描述  ", DIM) + f"{description}\n")
@@ -91,6 +92,16 @@ def render_tool_actions(actions: list[dict[str, Any]], *, stream: TextIO | None 
         timeout = action.get("timeout")
         if timeout is not None:
             stream.write(_paint(stream, "超时  ", DIM) + f"{timeout} 秒\n")
+        if tool_name == "str_replace_editor":
+            stream.write(_paint(stream, f"操作  {action.get('command', '')}\n", COLORS["工具"]))
+            stream.write(_paint(stream, f"路径  {action.get('path', '')}\n", DIM))
+            if action.get("expected_hash"):
+                stream.write(_paint(stream, f"版本  {action['expected_hash']}\n", DIM))
+            if action.get("file_text") is not None:
+                _render_preview(str(action["file_text"]), label=f"工具调用 {index} 的文件内容", stream=stream)
+            elif action.get("old_str") is not None:
+                _render_preview(str(action["old_str"]), label=f"工具调用 {index} 的替换原文", stream=stream)
+            continue
         stream.write(_paint(stream, "命令\n", COLORS["工具"]))
         _render_preview(
             str(action.get("command", "")),

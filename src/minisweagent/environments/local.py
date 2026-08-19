@@ -11,6 +11,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from minisweagent.environments.bash_policy import analyze_bash_command
+from minisweagent.environments.editor import execute_editor
 from minisweagent.exceptions import CommandNotApproved, Submitted
 from minisweagent.utils.serialize import recursive_merge
 
@@ -54,6 +55,8 @@ class LocalEnvironment:
 
     def execute(self, action: dict, cwd: str = "", *, timeout: float | None = None) -> dict[str, Any]:
         """Execute a command in the local environment and return the result as a dict."""
+        if action.get("tool") == "str_replace_editor":
+            return self._execute_editor(action, cwd)
         command = action.get("command", "")
         cwd = action.get("workdir") or cwd or self.config.cwd or os.getcwd()
         global_timeout = timeout if timeout is not None else self.config.timeout
@@ -96,11 +99,44 @@ class LocalEnvironment:
                 "stderr_truncated": False,
                 "stdout_spill_path": None,
                 "stderr_spill_path": None,
+                "path": None,
+                "operation": None,
+                "content_hash": None,
                 "exception_info": f"执行命令时发生错误：{e}",
                 "extra": {"exception_type": type(e).__name__, "exception": str(e)},
             }
         self._check_finished(output)
         return output
+
+    def _execute_editor(self, action: dict, cwd: str) -> dict[str, Any]:
+        workspace = cwd or self.config.cwd or os.getcwd()
+        operation = action.get("command")
+        if operation in {"create", "str_replace", "insert"}:
+            approval_text = f"str_replace_editor {operation}: {action.get('path', '')}"
+            if not self.approval_callback(approval_text, "文件修改操作"):
+                self._stop_for_approval(approval_text, "文件修改操作", hard_denied=False)
+        try:
+            return {**execute_editor(action, workspace), "exception_info": ""}
+        except Exception as error:
+            return {
+                "stdout": "",
+                "stderr": "",
+                "returncode": -1,
+                "exit_code": None,
+                "status": "error",
+                "timed_out": False,
+                "signal": None,
+                "termination": None,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "stdout_spill_path": None,
+                "stderr_spill_path": None,
+                "path": action.get("path"),
+                "operation": action.get("command"),
+                "content_hash": None,
+                "exception_info": f"文件编辑失败：{error}",
+                "extra": {"error_code": getattr(error, "code", type(error).__name__)},
+            }
 
     @staticmethod
     def _stop_for_approval(command: str, reason: str, *, hard_denied: bool) -> None:
@@ -210,6 +246,9 @@ def _run(
         "stderr_truncated": streams["stderr"]["truncated"],
         "stdout_spill_path": streams["stdout"]["spill_path"],
         "stderr_spill_path": streams["stderr"]["spill_path"],
+        "path": None,
+        "operation": None,
+        "content_hash": None,
         "returncode": returncode,
         "exit_code": returncode if returncode >= 0 else None,
         "status": (

@@ -200,6 +200,9 @@ class DefaultAgent:
                         "stderr_truncated": False,
                         "stdout_spill_path": None,
                         "stderr_spill_path": None,
+                        "path": None,
+                        "operation": None,
+                        "content_hash": None,
                         "exception_info": error.messages[-1].get("content", ""),
                     }
                 )

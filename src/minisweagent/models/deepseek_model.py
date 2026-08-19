@@ -10,7 +10,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
 
 from minisweagent.models.utils.actions_toolcall import (
-    BASH_TOOL,
+    TOOL_DEFINITIONS,
     format_toolcall_observation_messages,
     parse_toolcall_actions,
 )
@@ -23,7 +23,7 @@ BASE_URL = "https://api.deepseek.com"
 DEFAULT_API_TIMEOUT_SECONDS = 60.0
 
 DEFAULT_OBSERVATION_TEMPLATE = """
-{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "exit_code": {{ output.exit_code | tojson }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "termination": {{ output.termination | tojson }}, "stdout": {{ output.stdout | tojson }}, "stderr": {{ output.stderr | tojson }}, "stdout_truncated": {{ output.stdout_truncated | tojson }}, "stderr_truncated": {{ output.stderr_truncated | tojson }}{% if output.stdout_spill_path %}, "stdout_spill_path": {{ output.stdout_spill_path | tojson }}{% endif %}{% if output.stderr_spill_path %}, "stderr_spill_path": {{ output.stderr_spill_path | tojson }}{% endif %}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
+{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "exit_code": {{ output.exit_code | tojson }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "termination": {{ output.termination | tojson }}, "path": {{ output.get("path") | tojson }}, "operation": {{ output.get("operation") | tojson }}, "content_hash": {{ output.get("content_hash") | tojson }}, "error_code": {{ output.get("extra", {}).get("error_code") | tojson }}, "stdout": {{ output.stdout | tojson }}, "stderr": {{ output.stderr | tojson }}, "stdout_truncated": {{ output.stdout_truncated | tojson }}, "stderr_truncated": {{ output.stderr_truncated | tojson }}{% if output.stdout_spill_path %}, "stdout_spill_path": {{ output.stdout_spill_path | tojson }}{% endif %}{% if output.stderr_spill_path %}, "stderr_spill_path": {{ output.stderr_spill_path | tojson }}{% endif %}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
 """.strip()
 
 DEFAULT_FORMAT_ERROR_TEMPLATE = """
@@ -32,6 +32,8 @@ DEFAULT_FORMAT_ERROR_TEMPLATE = """
 
 如果确实需要操作，请使用 bash 工具，并传入如下 JSON 参数：
 {"command": "要执行的命令", "workdir": "可选工作目录", "timeout": 30}
+
+如果需要修改文件，请使用 str_replace_editor 工具；先用 view 查看，再用 str_replace、insert 或 create 修改。
 
 如果任务已经可以回答，请直接返回中文最终答复，不要强行调用工具。
 """.strip()
@@ -51,7 +53,7 @@ class DeepSeekModelConfig(BaseModel):
 
 
 class DeepSeekModel:
-    """One-tool model adapter; all file changes happen through Bash."""
+    """DeepSeek adapter exposing host-owned Bash and text-editor tools."""
 
     def __init__(self, **kwargs):
         self.config = DeepSeekModelConfig(**kwargs)
@@ -65,7 +67,7 @@ class DeepSeekModel:
         request = {
             "model": MODEL_NAME,
             "messages": self._api_messages(messages),
-            "tools": [BASH_TOOL],
+            "tools": TOOL_DEFINITIONS,
             "tool_choice": "auto",
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,

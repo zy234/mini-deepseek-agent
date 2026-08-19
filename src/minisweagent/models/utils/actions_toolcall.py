@@ -39,6 +39,30 @@ BASH_TOOL = {
     },
 }
 
+EDITOR_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "str_replace_editor",
+        "description": "在当前工作区查看和修改 UTF-8 文本文件；修改操作会请求用户批准。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "enum": ["view", "create", "str_replace", "insert"]},
+                "path": {"type": "string", "description": "工作区内的文件或目录路径"},
+                "file_text": {"type": "string", "description": "create 使用的完整文件内容"},
+                "old_str": {"type": "string", "description": "str_replace 要替换的原文"},
+                "new_str": {"type": "string", "description": "替换后的文本；str_replace 可为空，insert 必填"},
+                "insert_line": {"type": "integer", "description": "insert 插入到该行之后，行号从 1 开始；0 表示文件开头"},
+                "view_range": {"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 2},
+                "expected_hash": {"type": "string", "description": "可选的 view 返回 hash，用于检测文件被外部修改"},
+            },
+            "required": ["command", "path"],
+            "additionalProperties": False,
+        },
+    },
+}
+TOOL_DEFINITIONS = [BASH_TOOL, EDITOR_TOOL]
+
 def parse_toolcall_actions(
     tool_calls: list, *, format_error_template: str, template_kwargs: dict | None = None
 ) -> list[dict]:
@@ -70,24 +94,31 @@ def parse_toolcall_actions(
             args = json.loads(tool_call.function.arguments)
         except Exception as e:
             error_msg = f"无法解析工具参数：{e}。"
-        if tool_call.function.name != "bash":
-            error_msg += f"未知工具：{tool_call.function.name}。"
-        if not isinstance(args, dict) or "command" not in args:
-            error_msg += "bash 工具调用缺少 command 参数。"
-        elif not isinstance(args["command"], str) or not args["command"].strip():
-            error_msg += "bash 工具的 command 必须是非空字符串。"
+        tool_name = tool_call.function.name
+        if tool_name not in {"bash", "str_replace_editor"}:
+            error_msg += f"未知工具：{tool_name}。"
+        if not isinstance(args, dict):
+            error_msg += f"{tool_name} 工具参数必须是对象。"
+        elif tool_name == "bash":
+            if "command" not in args or not isinstance(args["command"], str) or not args["command"].strip():
+                error_msg += "bash 工具的 command 必须是非空字符串。"
+        elif tool_name == "str_replace_editor":
+            error_msg += _validate_editor_args(args)
         if isinstance(args, dict):
-            unknown_keys = set(args) - {"command", "workdir", "timeout", "description"}
+            allowed = {"command", "workdir", "timeout", "description"} if tool_name == "bash" else {
+                "command", "path", "file_text", "old_str", "new_str", "insert_line", "view_range", "expected_hash"
+            }
+            unknown_keys = set(args) - allowed
             if unknown_keys:
-                error_msg += f"bash 工具包含未知参数：{', '.join(sorted(unknown_keys))}。"
-            if "workdir" in args and not isinstance(args["workdir"], str):
+                error_msg += f"{tool_name} 工具包含未知参数：{', '.join(sorted(unknown_keys))}。"
+            if tool_name == "bash" and "workdir" in args and not isinstance(args["workdir"], str):
                 error_msg += "bash 工具的 workdir 必须是字符串。"
-            timeout = args.get("timeout")
+            timeout = args.get("timeout") if tool_name == "bash" else None
             if timeout is not None and (
                 isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0
             ):
                 error_msg += "bash 工具的 timeout 必须是正数。"
-            if "description" in args and not isinstance(args["description"], str):
+            if tool_name == "bash" and "description" in args and not isinstance(args["description"], str):
                 error_msg += "bash 工具的 description 必须是字符串。"
         if error_msg:
             raise FormatError(
@@ -99,12 +130,42 @@ def parse_toolcall_actions(
                     "extra": {"interrupt_type": "FormatError"},
                 }
             )
-        action = {"command": args["command"], "tool_call_id": tool_call.id}
-        for key in ("workdir", "timeout", "description"):
+        action = {"tool": tool_name, "command": args["command"], "tool_call_id": tool_call.id}
+        keys = ("workdir", "timeout", "description") if tool_name == "bash" else (
+            "path", "file_text", "old_str", "new_str", "insert_line", "view_range", "expected_hash"
+        )
+        for key in keys:
             if key in args:
                 action[key] = args[key]
         actions.append(action)
     return actions
+
+
+def _validate_editor_args(args: dict) -> str:
+    operation = args.get("command")
+    if operation not in {"view", "create", "str_replace", "insert"}:
+        return "编辑器 command 必须是 view、create、str_replace 或 insert。"
+    if not isinstance(args.get("path"), str) or not args["path"].strip():
+        return "编辑器 path 必须是非空字符串。"
+    if operation == "create" and not isinstance(args.get("file_text"), str):
+        return "编辑器 create 必须提供 file_text。"
+    if operation == "str_replace" and not isinstance(args.get("old_str"), str):
+        return "编辑器 str_replace 必须提供 old_str。"
+    if operation == "insert":
+        if not isinstance(args.get("insert_line"), int) or isinstance(args.get("insert_line"), bool):
+            return "编辑器 insert 必须提供整数 insert_line。"
+        if not isinstance(args.get("new_str"), str):
+            return "编辑器 insert 必须提供 new_str。"
+    view_range = args.get("view_range")
+    if view_range is not None and (
+        not isinstance(view_range, list)
+        or len(view_range) != 2
+        or any(not isinstance(value, int) or isinstance(value, bool) for value in view_range)
+    ):
+        return "编辑器 view_range 必须是两个整数。"
+    if "expected_hash" in args and not isinstance(args["expected_hash"], str):
+        return "编辑器 expected_hash 必须是字符串。"
+    return ""
 
 
 def format_toolcall_observation_messages(
@@ -128,6 +189,9 @@ def format_toolcall_observation_messages(
         "stderr_truncated": False,
         "stdout_spill_path": None,
         "stderr_spill_path": None,
+        "path": None,
+        "operation": None,
+        "content_hash": None,
         "exception_info": "操作未执行",
     }
     padded_outputs = outputs + [not_executed] * (len(actions) - len(outputs))
@@ -151,6 +215,10 @@ def format_toolcall_observation_messages(
                 "stderr_truncated": output.get("stderr_truncated", False),
                 "stdout_spill_path": output.get("stdout_spill_path"),
                 "stderr_spill_path": output.get("stderr_spill_path"),
+                "path": output.get("path"),
+                "operation": output.get("operation"),
+                "content_hash": output.get("content_hash"),
+                "error_code": output.get("extra", {}).get("error_code"),
                 "timestamp": time.time(),
                 "exception_info": output.get("exception_info"),
                 **output.get("extra", {}),

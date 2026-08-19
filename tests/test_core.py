@@ -6,6 +6,7 @@ import pytest
 import typer
 
 from minisweagent.agents.default import DefaultAgent
+from minisweagent.environments import editor
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.exceptions import CommandNotApproved, Submitted
@@ -153,6 +154,7 @@ def test_bash_action_accepts_optional_execution_metadata():
 
     assert parse_toolcall_actions([tool_call], format_error_template="{{ error }}") == [
         {
+            "tool": "bash",
             "command": "pwd",
             "workdir": "/tmp",
             "timeout": 2.5,
@@ -183,7 +185,7 @@ def test_bash_action_rejects_non_object_arguments():
     with pytest.raises(Exception) as exc_info:
         parse_toolcall_actions([tool_call], format_error_template="{{ error }}")
 
-    assert "缺少 command 参数" in exc_info.value.messages[0]["content"]
+    assert "参数必须是对象" in exc_info.value.messages[0]["content"]
 
 
 def test_bash_action_rejects_unknown_arguments():
@@ -196,6 +198,162 @@ def test_bash_action_rejects_unknown_arguments():
         parse_toolcall_actions([tool_call], format_error_template="{{ error }}")
 
     assert "未知参数：shell" in exc_info.value.messages[0]["content"]
+
+
+def test_editor_action_parses_structured_fields():
+    tool_call = SimpleNamespace(
+        id="edit_1",
+        function=SimpleNamespace(
+            name="str_replace_editor",
+            arguments=(
+                '{"command":"str_replace","path":"README.md",'
+                '"old_str":"old","new_str":"new","expected_hash":"abc"}'
+            ),
+        ),
+    )
+
+    assert parse_toolcall_actions([tool_call], format_error_template="{{ error }}") == [
+        {
+            "tool": "str_replace_editor",
+            "command": "str_replace",
+            "path": "README.md",
+            "old_str": "old",
+            "new_str": "new",
+            "expected_hash": "abc",
+            "tool_call_id": "edit_1",
+        }
+    ]
+
+
+def test_editor_action_requires_operation_specific_fields():
+    tool_call = SimpleNamespace(
+        id="edit_1",
+        function=SimpleNamespace(
+            name="str_replace_editor",
+            arguments='{"command":"create","path":"new.txt"}',
+        ),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        parse_toolcall_actions([tool_call], format_error_template="{{ error }}")
+
+    assert "create 必须提供 file_text" in exc_info.value.messages[0]["content"]
+
+
+def test_editor_create_view_replace_and_insert(tmp_path: Path):
+    approvals = []
+    env = LocalEnvironment(
+        cwd=str(tmp_path),
+        approval_callback=lambda command, reason: approvals.append((command, reason)) or True,
+    )
+
+    created = env.execute(
+        {"tool": "str_replace_editor", "command": "create", "path": "note.txt", "file_text": "one\ntwo\n"}
+    )
+    viewed = env.execute(
+        {"tool": "str_replace_editor", "command": "view", "path": "note.txt", "view_range": [1, 1]}
+    )
+    replaced = env.execute(
+        {
+            "tool": "str_replace_editor",
+            "command": "str_replace",
+            "path": "note.txt",
+            "old_str": "two",
+            "new_str": "THREE",
+            "expected_hash": viewed["content_hash"],
+        }
+    )
+    inserted = env.execute(
+        {
+            "tool": "str_replace_editor",
+            "command": "insert",
+            "path": "note.txt",
+            "insert_line": 1,
+            "new_str": "middle",
+            "expected_hash": replaced["content_hash"],
+        }
+    )
+
+    assert created["status"] == "success"
+    assert viewed["stdout"] == "     1\tone\n"
+    assert inserted["status"] == "success"
+    assert (tmp_path / "note.txt").read_text() == "one\nmiddle\nTHREE\n"
+    assert len(approvals) == 3
+
+
+def test_editor_rejects_ambiguous_and_stale_replacements(tmp_path: Path):
+    path = tmp_path / "note.txt"
+    path.write_text("same same\n")
+    env = LocalEnvironment(cwd=str(tmp_path), approval_callback=lambda *_args: True)
+
+    viewed = env.execute({"tool": "str_replace_editor", "command": "view", "path": "note.txt"})
+    ambiguous = env.execute(
+        {
+            "tool": "str_replace_editor",
+            "command": "str_replace",
+            "path": "note.txt",
+            "old_str": "same",
+            "new_str": "new",
+            "expected_hash": viewed["content_hash"],
+        }
+    )
+    path.write_text("external change\n")
+    stale = env.execute(
+        {
+            "tool": "str_replace_editor",
+            "command": "str_replace",
+            "path": "note.txt",
+            "old_str": "same same",
+            "new_str": "new",
+            "expected_hash": viewed["content_hash"],
+        }
+    )
+
+    assert ambiguous["extra"]["error_code"] == "ambiguous_edit"
+    assert stale["extra"]["error_code"] == "stale_file"
+    assert path.read_text() == "external change\n"
+
+
+def test_editor_rejects_paths_and_symlinks_outside_workspace(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    (workspace / "link.txt").symlink_to(outside)
+    env = LocalEnvironment(cwd=str(workspace), approval_callback=lambda *_args: True)
+
+    relative_escape = env.execute(
+        {"tool": "str_replace_editor", "command": "view", "path": "../outside.txt"}
+    )
+    symlink_escape = env.execute(
+        {"tool": "str_replace_editor", "command": "view", "path": "link.txt"}
+    )
+
+    assert relative_escape["extra"]["error_code"] == "outside_workspace"
+    assert symlink_escape["extra"]["error_code"] == "outside_workspace"
+
+
+def test_editor_atomic_failure_preserves_original_file(tmp_path: Path, monkeypatch):
+    path = tmp_path / "note.txt"
+    path.write_text("old\n")
+    env = LocalEnvironment(cwd=str(tmp_path), approval_callback=lambda *_args: True)
+    viewed = env.execute({"tool": "str_replace_editor", "command": "view", "path": "note.txt"})
+    monkeypatch.setattr(editor.os, "replace", lambda *_args: (_ for _ in ()).throw(OSError("failed")))
+
+    result = env.execute(
+        {
+            "tool": "str_replace_editor",
+            "command": "str_replace",
+            "path": "note.txt",
+            "old_str": "old",
+            "new_str": "new",
+            "expected_hash": viewed["content_hash"],
+        }
+    )
+
+    assert result["status"] == "error"
+    assert path.read_text() == "old\n"
+    assert list(tmp_path.iterdir()) == [path]
 
 
 def test_local_environment_action_timeout_is_reported():
@@ -574,7 +732,10 @@ def test_deepseek_model_streams_and_emits_only_bash_tool_call(monkeypatch, capsy
     assert captured["timeout"] == 60
     assert captured["extra_body"] == {"thinking": {"type": "enabled"}}
     assert captured["tools"][0]["function"]["name"] == "bash"
-    assert message["extra"]["actions"] == [{"command": "printf MODEL_OK", "tool_call_id": "call_1"}]
+    assert [tool["function"]["name"] for tool in captured["tools"]] == ["bash", "str_replace_editor"]
+    assert message["extra"]["actions"] == [
+        {"tool": "bash", "command": "printf MODEL_OK", "tool_call_id": "call_1"}
+    ]
     assert message["extra"]["reasoning_content"] == "thinking "
     assert message["reasoning_content"] == "thinking "
     cli_output = capsys.readouterr().out
