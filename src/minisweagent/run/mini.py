@@ -2,6 +2,7 @@
 """Run the single-model DeepSeek Bash agent."""
 
 import os
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,7 @@ from minisweagent.agents import get_agent
 from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
 from minisweagent.models import get_model
+from minisweagent.utils.cli_display import clear_recent_full_blocks, render_recent_full_blocks
 from minisweagent.utils.serialize import UNSET, recursive_merge
 
 DEFAULT_CONFIG_FILE = Path(
@@ -35,6 +37,30 @@ def _print_result(result: dict, *, submission_streamed: bool) -> None:
         console.print(f"[bold]{status}[/bold]")
     if result.get("submission") and not submission_streamed:
         console.print(result["submission"])
+
+
+def _run_session(agent: Any, task: str, *, interactive: bool) -> None:
+    clear_recent_full_blocks()
+    result = agent.run(task)
+    _print_result(result, submission_streamed=_submission_was_streamed(agent))
+    if not interactive:
+        return
+    while True:
+        try:
+            request = typer.prompt("继续提问（/open 展开，/exit 退出）").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return
+        if request in {"/exit", "/quit"}:
+            return
+        if request in {"/open", "\x0f"}:
+            render_recent_full_blocks()
+            continue
+        if not request:
+            continue
+        clear_recent_full_blocks()
+        result = agent.continue_run(request)
+        _print_result(result, submission_streamed=_submission_was_streamed(agent))
 
 
 @app.command()
@@ -63,8 +89,7 @@ def main(
     model = get_model(settings.get("model", {}))
     environment = get_environment(settings.get("environment", {}))
     agent = get_agent(model, environment, settings.get("agent", {}))
-    result = agent.run(task)
-    _print_result(result, submission_streamed=_submission_was_streamed(agent))
+    _run_session(agent, task, interactive=sys.stdin.isatty())
     return agent
 
 

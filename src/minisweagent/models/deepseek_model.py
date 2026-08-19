@@ -2,7 +2,6 @@
 
 import logging
 import os
-import sys
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +14,7 @@ from minisweagent.models.utils.actions_toolcall import (
     format_toolcall_observation_messages,
     parse_toolcall_actions,
 )
+from minisweagent.utils.cli_display import StreamRenderer, render_tool_actions
 from minisweagent.utils.serialize import recursive_merge
 
 logger = logging.getLogger("minisweagent.model")
@@ -84,6 +84,8 @@ class DeepSeekModel:
                 format_error_template=self.config.format_error_template,
                 template_kwargs={"finish_reason": finish_reason},
             )
+            if self.config.stream_output:
+                render_tool_actions(actions)
         elif not content.strip():
             parse_toolcall_actions(
                 [],
@@ -101,9 +103,10 @@ class DeepSeekModel:
         result = {
             "role": "assistant",
             "content": content or None,
-            "tool_calls": [call.model_dump() for call in tool_calls],
             "extra": extra,
         }
+        if tool_calls:
+            result["tool_calls"] = [call.model_dump() for call in tool_calls]
         if reasoning_content:
             result["reasoning_content"] = reasoning_content
         return result
@@ -162,25 +165,15 @@ class DeepSeekModel:
                         call.function.name = name
                     if arguments:
                         call.function.arguments += arguments
-                        self._stream_text(output_state, f"工具:{call.function.name}", arguments)
 
-        if output_state.enabled and output_state.open:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+        output_state.finish()
         return "".join(content_parts), "".join(reasoning_parts), list(tool_calls.values()), finish_reason, usage
 
     @staticmethod
     def _stream_text(state: "_OutputState", label: str, text: str) -> None:
         if not state.enabled:
             return
-        if state.label != label:
-            if state.open:
-                sys.stdout.write("\n")
-            sys.stdout.write(f"[{label}] ")
-            state.label = label
-            state.open = True
-        sys.stdout.write(text)
-        sys.stdout.flush()
+        state.renderer.write(label, text)
 
     @staticmethod
     def _api_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -196,13 +189,14 @@ class DeepSeekModel:
             role = message.get("role")
             if role not in allowed:
                 continue
-            result.append(
-                {
-                    key: value
-                    for key, value in message.items()
-                    if key in allowed[role] and value is not None
-                }
-            )
+            api_message = {
+                key: value
+                for key, value in message.items()
+                if key in allowed[role] and value is not None
+            }
+            if role == "assistant" and not api_message.get("tool_calls"):
+                api_message.pop("tool_calls", None)
+            result.append(api_message)
         return result
 
     def format_message(self, **kwargs) -> dict:
@@ -260,5 +254,8 @@ class _ToolCall:
 @dataclass
 class _OutputState:
     enabled: bool
-    label: str | None = None
-    open: bool = False
+    renderer: StreamRenderer = field(default_factory=StreamRenderer)
+
+    def finish(self) -> None:
+        if self.enabled:
+            self.renderer.finish()

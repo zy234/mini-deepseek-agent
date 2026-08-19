@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import typer
 
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.environments.bash_policy import analyze_bash_command
@@ -13,6 +14,12 @@ from minisweagent.models.utils.actions_toolcall import (
     parse_toolcall_actions,
 )
 from minisweagent.run import mini
+from minisweagent.utils.cli_display import (
+    clear_recent_full_blocks,
+    render_block,
+    render_recent_full_blocks,
+    render_tool_actions,
+)
 
 
 class FakeModel:
@@ -335,6 +342,29 @@ def test_agent_can_finish_without_using_bash():
     assert agent.run("回答问题") == {"exit_status": "Submitted", "submission": "直接回答，不需要工具。"}
 
 
+def test_agent_continues_with_existing_conversation():
+    agent = DefaultAgent(
+        DirectAnswerModel(),
+        LocalEnvironment(timeout=5),
+        system_template="你是助手。",
+        instance_template="{{ task }}",
+    )
+
+    agent.run("第一个问题")
+    agent.continue_run("继续追问")
+
+    assert [message["role"] for message in agent.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "exit",
+    ]
+    assert agent.messages[1]["content"] == "第一个问题"
+    assert agent.messages[3]["content"] == "继续追问"
+
+
 def test_cli_does_not_repeat_streamed_submission(monkeypatch):
     output = []
     monkeypatch.setattr(mini.console, "print", lambda value: output.append(value))
@@ -380,6 +410,24 @@ def test_cli_detects_only_direct_answer_as_streamed():
     assert mini._submission_was_streamed(tool_agent) is False
 
 
+def test_cli_session_keeps_context_until_exit(monkeypatch):
+    agent = DefaultAgent(
+        DirectAnswerModel(),
+        LocalEnvironment(timeout=5),
+        system_template="你是助手。",
+        instance_template="{{ task }}",
+    )
+    requests = iter(["第二个问题", "/exit"])
+    monkeypatch.setattr(typer, "prompt", lambda _label: next(requests))
+
+    mini._run_session(agent, "第一个问题", interactive=True)
+
+    assert [message["content"] for message in agent.messages if message["role"] == "user"] == [
+        "第一个问题",
+        "第二个问题",
+    ]
+
+
 class DangerousCommandModel(FakeModel):
     def __init__(self):
         super().__init__()
@@ -407,7 +455,13 @@ def test_agent_stops_without_sending_denial_back_to_model():
 
     assert result["exit_status"] == "CommandBlocked"
     assert model.query_count == 1
-    assert [message["role"] for message in agent.messages] == ["system", "user", "assistant", "exit"]
+    assert [message["role"] for message in agent.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+        "exit",
+    ]
 
 
 class _FakeToolDelta:
@@ -489,7 +543,11 @@ def test_deepseek_model_streams_and_emits_only_bash_tool_call(monkeypatch, capsy
     assert message["extra"]["actions"] == [{"command": "printf MODEL_OK", "tool_call_id": "call_1"}]
     assert message["extra"]["reasoning_content"] == "thinking "
     assert message["reasoning_content"] == "thinking "
-    assert "[思考] thinking" in capsys.readouterr().out
+    cli_output = capsys.readouterr().out
+    assert "思考" in cli_output
+    assert "工具调用 1 · bash" in cli_output
+    assert "printf MODEL_OK" in cli_output
+    assert '{"command"' not in cli_output
     assert model.client._client.timeout.read == 60
     assert model._api_messages([{"role": "user", "content": "x", "extra": {"secret": True}}]) == [
         {"role": "user", "content": "x"}
@@ -506,6 +564,29 @@ def test_deepseek_model_accepts_direct_answer(monkeypatch):
 
     assert message["content"] == "你好，我可以直接回答。"
     assert message["extra"]["actions"] == []
+    assert "tool_calls" not in message
+
+
+def test_deepseek_model_omits_empty_tool_calls_from_followup_request(monkeypatch):
+    monkeypatch.setenv("DS_KEY", "test")
+    model = DeepSeekModel(retry_attempts=1, thinking=True, stream_output=False)
+    captured = {}
+
+    def create(**request):
+        captured.update(request)
+        return _FakeTextStream()
+
+    model.client.chat.completions.create = create
+    model.query(
+        [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "第一个问题"},
+            {"role": "assistant", "content": "第一个回答", "tool_calls": []},
+            {"role": "user", "content": "继续追问"},
+        ]
+    )
+
+    assert captured["messages"][2] == {"role": "assistant", "content": "第一个回答"}
 
 
 def test_tool_observation_preserves_separate_streams():
@@ -518,3 +599,57 @@ def test_tool_observation_preserves_separate_streams():
     assert messages[0]["content"] == "out|err"
     assert messages[0]["extra"]["stdout"] == "out"
     assert messages[0]["extra"]["stderr"] == "err"
+
+
+def test_cli_render_block_truncates_long_text_without_prompt(capsys, monkeypatch):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+    truncated = render_block("工具", "x" * 1001)
+
+    output = capsys.readouterr().out
+    assert truncated is True
+    assert len(output) < 1200
+    assert "已截断" in output
+
+
+def test_cli_render_block_only_expands_on_explicit_open(capsys):
+    clear_recent_full_blocks()
+    render_block("思考", "x" * 1001)
+    preview = capsys.readouterr().out
+    assert "完整" not in preview
+    assert preview.count("x") == 1000
+
+    assert render_recent_full_blocks() is True
+    expanded = capsys.readouterr().out
+    assert "完整" in expanded
+    assert expanded.count("x") == 1001
+
+
+def test_cli_renders_each_tool_action_with_parsed_fields(capsys):
+    render_tool_actions(
+        [
+            {"command": "cat README.md", "description": "读取 README"},
+            {
+                "command": "cat pyproject.toml",
+                "description": "读取配置",
+                "workdir": "/workspace",
+                "timeout": 5,
+            },
+        ]
+    )
+
+    output = capsys.readouterr().out
+    assert "工具调用 1 · bash" in output
+    assert "描述  读取 README" in output
+    assert "cat README.md" in output
+    assert "工具调用 2 · bash" in output
+    assert "目录  /workspace" in output
+    assert "超时  5 秒" in output
+
+
+def test_cli_tool_command_truncates_at_1000_characters(capsys):
+    render_tool_actions([{"command": "x" * 1200, "description": "长命令"}])
+
+    output = capsys.readouterr().out
+    assert output.count("x") == 1000
+    assert "已截断，原文 1200 字符" in output

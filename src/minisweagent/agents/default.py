@@ -14,6 +14,7 @@ from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
+from minisweagent.utils.cli_display import render_block, render_status
 from minisweagent.utils.serialize import recursive_merge
 
 
@@ -44,6 +45,7 @@ class DefaultAgent:
         self.extra_template_vars = {}
         self.logger = logging.getLogger("agent")
         self.n_calls = 0
+        self._turn_calls = 0
         self.n_consecutive_format_errors = 0
         self._start_time = time.time()
 
@@ -86,10 +88,30 @@ class DefaultAgent:
         """Run step() until agent is finished. Returns dictionary with exit_status, submission keys."""
         self.extra_template_vars |= {"task": task, **kwargs}
         self.messages = []
+        self._start_turn()
         self.add_messages(
             self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
             self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
         )
+        return self._run_until_exit()
+
+    def continue_run(self, task: str, **kwargs) -> dict:
+        """Continue the existing conversation with a new user request."""
+        if not self.messages:
+            return self.run(task, **kwargs)
+        while self.messages and self.messages[-1].get("role") == "exit":
+            self.messages.pop()
+        self.extra_template_vars |= {"task": task, **kwargs}
+        self._start_turn()
+        self.add_messages(self.model.format_message(role="user", content=task))
+        return self._run_until_exit()
+
+    def _start_turn(self) -> None:
+        self._turn_calls = 0
+        self.n_consecutive_format_errors = 0
+        self._start_time = time.time()
+
+    def _run_until_exit(self) -> dict:
         while True:
             try:
                 self.step()
@@ -124,7 +146,7 @@ class DefaultAgent:
 
     def query(self) -> dict:
         """Query the model and return model messages. Override to add hooks."""
-        if 0 < self.config.step_limit <= self.n_calls:
+        if 0 < self.config.step_limit <= self._turn_calls:
             raise LimitsExceeded(
                 {
                     "role": "exit",
@@ -141,6 +163,7 @@ class DefaultAgent:
                 }
             )
         self.n_calls += 1
+        self._turn_calls += 1
         message = self.model.query(self.messages)
         self.add_messages(message)
         return message
@@ -159,26 +182,44 @@ class DefaultAgent:
             )
         outputs = []
         for action in actions:
-            output = self.env.execute(action)
+            try:
+                output = self.env.execute(action)
+            except InterruptAgentFlow as error:
+                status = error.messages[-1].get("extra", {}).get("exit_status", type(error).__name__)
+                outputs.append(
+                    {
+                        "stdout": "",
+                        "stderr": "",
+                        "returncode": 0 if status == "Submitted" else -1,
+                        "status": status,
+                        "timed_out": False,
+                        "signal": None,
+                        "stdout_truncated": False,
+                        "stderr_truncated": False,
+                        "stdout_spill_path": None,
+                        "stderr_spill_path": None,
+                        "exception_info": error.messages[-1].get("content", ""),
+                    }
+                )
+                self.add_messages(
+                    *self.model.format_observation_messages(message, outputs, self.get_template_vars())
+                )
+                raise
             outputs.append(output)
             self._print_tool_result(output)
         return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
 
     @staticmethod
     def _print_tool_result(output: dict) -> None:
-        sys.stdout.write(
-            f"\n[工具结果] status={output.get('status')} returncode={output.get('returncode')}\n"
-        )
+        render_status(output.get("status"), output.get("returncode"))
         for name in ("stdout", "stderr"):
             text = output.get(name, "")
             if text:
-                sys.stdout.write(f"[{name}]\n{text}")
-                if not text.endswith("\n"):
-                    sys.stdout.write("\n")
+                render_block(f"工具结果 · {name}", text)
             if output.get(f"{name}_truncated"):
                 spill_path = output.get(f"{name}_spill_path")
                 suffix = f"完整输出：{spill_path}" if spill_path else "完整输出未保留"
-                sys.stdout.write(f"[{name} 已截断；{suffix}]\n")
+                sys.stdout.write(f"[{name} 执行结果也已截断；{suffix}]\n")
         sys.stdout.flush()
 
     def serialize(self, *extra_dicts) -> dict:
