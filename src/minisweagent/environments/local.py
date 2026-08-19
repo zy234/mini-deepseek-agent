@@ -64,7 +64,12 @@ class LocalEnvironment:
                 raise ValueError("命令 timeout 必须是正数")
             if requested_timeout > global_timeout:
                 raise ValueError(f"命令 timeout 不能超过全局上限 {global_timeout} 秒")
-            result = _run(command, cwd, _safe_environment(self.config.env), requested_timeout)
+            result = _run(
+                command,
+                cwd,
+                _safe_environment(self.config.env),
+                requested_timeout,
+            )
             returncode = result.returncode
             output = {
                 "output": result.stdout,
@@ -133,14 +138,26 @@ class LocalEnvironment:
         }
 
 
-def _run(command: str, cwd: str, env: dict[str, str], timeout: int) -> subprocess.CompletedProcess[str]:
-    """Like subprocess.run, but kills the whole process group on timeout so no children are orphaned."""
+def _run(
+    command: str,
+    cwd: str,
+    env: dict[str, str],
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    """Run an explicit Bash command; timeout cleanup remains process-group scoped."""
+    execution_env = {
+        "NO_COLOR": "1",
+        "TERM": "dumb",
+        "PAGER": "cat",
+        "GIT_PAGER": "cat",
+        **env,
+    }
     process = subprocess.Popen(
-        command,
-        shell=True,
+        ["bash", "-c", command],
+        shell=False,
         text=True,
         cwd=cwd,
-        env=env,
+        env=execution_env,
         encoding="utf-8",
         errors="replace",
         stdout=subprocess.PIPE,

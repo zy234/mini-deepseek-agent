@@ -76,6 +76,26 @@ def test_local_environment_captures_output_and_completion():
     assert result["timed_out"] is False
 
 
+def test_local_environment_uses_bash_and_noninteractive_environment():
+    env = LocalEnvironment(approval_callback=lambda _command, _reason: True)
+
+    result = env.execute({"command": "printf '%s' \"${BASH_VERSION:+BASH_OK}\""})
+
+    assert result["returncode"] == 0
+    assert result["output"] == "BASH_OK"
+
+
+def test_local_environment_explicit_env_overrides_terminal_defaults():
+    env = LocalEnvironment(
+        env={"TERM": "custom-terminal"},
+        approval_callback=lambda _command, _reason: True,
+    )
+
+    result = env.execute({"command": "printf '%s' \"$TERM\""})
+
+    assert result["returncode"] == 0
+    assert result["output"] == "custom-terminal"
+
 def test_bash_action_accepts_optional_execution_metadata():
     tool_call = SimpleNamespace(
         id="call_1",
