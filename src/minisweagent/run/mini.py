@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import typer
+from prompt_toolkit import prompt as terminal_prompt
 from rich.console import Console
 
 from minisweagent.agents import get_agent
@@ -47,7 +48,7 @@ def _run_session(agent: Any, task: str, *, interactive: bool) -> None:
         return
     while True:
         try:
-            request = typer.prompt("继续提问（/open 展开，/exit 退出）").strip()
+            request = terminal_prompt("继续提问（/open 展开，/exit 退出）: ").strip()
         except (EOFError, KeyboardInterrupt):
             console.print()
             return
@@ -84,7 +85,7 @@ def main(
         "environment": {"timeout": timeout if timeout is not None else UNSET},
     }
     settings = recursive_merge(settings, overrides)
-    task = task or typer.prompt("Task")
+    task = task or terminal_prompt("Task: ")
 
     model = get_model(settings.get("model", {}))
     environment = get_environment(settings.get("environment", {}))

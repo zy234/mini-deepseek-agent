@@ -24,6 +24,7 @@ dependencies = [
     "bashlex>=0.18",
     "jinja2",
     "openai",
+    "prompt-toolkit>=3.0,<4",
     "pydantic>=2.0",
     "pyyaml",
     "rich",

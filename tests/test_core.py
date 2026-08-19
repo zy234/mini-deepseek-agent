@@ -3,7 +3,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import typer
 
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.environments import editor
@@ -610,7 +609,7 @@ def test_cli_session_keeps_context_until_exit(monkeypatch):
         instance_template="{{ task }}",
     )
     requests = iter(["第二个问题", "/exit"])
-    monkeypatch.setattr(typer, "prompt", lambda _label: next(requests))
+    monkeypatch.setattr(mini, "terminal_prompt", lambda _label: next(requests))
 
     mini._run_session(agent, "第一个问题", interactive=True)
 
