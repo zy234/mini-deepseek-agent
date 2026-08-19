@@ -38,7 +38,7 @@ class FakeModel:
         return format_toolcall_observation_messages(
             actions=message["extra"]["actions"],
             outputs=outputs,
-            observation_template="{{ output.output }}",
+            observation_template="{{ output.stdout }}",
             template_vars=template_vars,
         )
 
@@ -70,7 +70,7 @@ def test_agent_runs_bash_and_saves_submission(tmp_path: Path):
 def test_local_environment_captures_output_and_completion():
     env = LocalEnvironment(timeout=5)
     result = env.execute({"command": "printf ENV_OK"})
-    assert result["output"] == "ENV_OK"
+    assert result["stdout"] == "ENV_OK"
     assert result["returncode"] == 0
     assert result["status"] == "success"
     assert result["timed_out"] is False
@@ -82,7 +82,7 @@ def test_local_environment_uses_bash_and_noninteractive_environment():
     result = env.execute({"command": "printf '%s' \"${BASH_VERSION:+BASH_OK}\""})
 
     assert result["returncode"] == 0
-    assert result["output"] == "BASH_OK"
+    assert result["stdout"] == "BASH_OK"
 
 
 def test_local_environment_explicit_env_overrides_terminal_defaults():
@@ -94,7 +94,45 @@ def test_local_environment_explicit_env_overrides_terminal_defaults():
     result = env.execute({"command": "printf '%s' \"$TERM\""})
 
     assert result["returncode"] == 0
-    assert result["output"] == "custom-terminal"
+    assert result["stdout"] == "custom-terminal"
+
+
+def test_local_environment_separates_streams():
+    env = LocalEnvironment(timeout=5, approval_callback=lambda _command, _reason: True)
+
+    result = env.execute({"command": "printf OUT; printf ERR >&2"})
+
+    assert result["stdout"] == "OUT"
+    assert result["stderr"] == "ERR"
+    assert result["stdout_truncated"] is False
+    assert result["stderr_truncated"] is False
+
+
+def test_local_environment_keeps_tail_and_spills_full_output():
+    env = LocalEnvironment(timeout=5, approval_callback=lambda _command, _reason: True)
+    command = "printf 'HEAD-'; for i in $(seq 1 100000); do printf x; done; printf '%s' '-TAIL'"
+
+    result = env.execute({"command": command})
+
+    assert result["stdout_truncated"] is True
+    assert result["stdout"].endswith("-TAIL")
+    assert result["stdout_spill_path"] is not None
+    spill = Path(result["stdout_spill_path"])
+    assert spill.read_text().startswith("HEAD-")
+    assert spill.read_text().endswith("-TAIL")
+
+
+def test_local_environment_drops_spill_when_full_output_exceeds_spill_cap(monkeypatch):
+    from minisweagent.environments import local
+
+    monkeypatch.setattr(local, "STREAM_MAX_BYTES", 4)
+    monkeypatch.setattr(local, "STREAM_SPILL_MAX_BYTES", 8)
+    env = LocalEnvironment(timeout=5, approval_callback=lambda _command, _reason: True)
+
+    result = env.execute({"command": "printf 0123456789abcdef"})
+
+    assert result["stdout_truncated"] is True
+    assert result["stdout_spill_path"] is None
 
 def test_bash_action_accepts_optional_execution_metadata():
     tool_call = SimpleNamespace(
@@ -187,7 +225,7 @@ def test_local_environment_blocks_dangerous_commands_and_hides_keys(monkeypatch)
     assert blocked.value.messages[0]["extra"]["exit_status"] == "CommandBlocked"
     assert network.value.messages[0]["extra"]["exit_status"] == "CommandNotApproved"
     assert approval_requests == [("curl https://example.com", "命令不在只读允许列表中：curl")]
-    assert secret["output"] == ""
+    assert secret["stdout"] == ""
     assert "DS_KEY" not in env.get_template_vars()
 
 
@@ -212,7 +250,7 @@ def test_local_environment_allows_dev_null_redirect(tmp_path):
     result = env.execute({"command": command})
 
     assert result["returncode"] == 1
-    assert result["output"] == ""
+    assert result["stdout"] == ""
 
 
 def test_bash_policy_allows_redirects_to_tmp(tmp_path):
@@ -470,13 +508,13 @@ def test_deepseek_model_accepts_direct_answer(monkeypatch):
     assert message["extra"]["actions"] == []
 
 
-def test_tool_observation_truncates_output():
+def test_tool_observation_preserves_separate_streams():
     messages = format_toolcall_observation_messages(
         actions=[{"command": "printf", "tool_call_id": "call_1"}],
-        outputs=[{"output": "x" * 1001, "returncode": 0, "exception_info": ""}],
-        observation_template="{{ output.output }}",
+        outputs=[{"stdout": "out", "stderr": "err", "returncode": 0, "status": "success"}],
+        observation_template="{{ output.stdout }}|{{ output.stderr }}",
     )
 
-    assert len(messages[0]["content"]) == 1000
-    assert len(messages[0]["extra"]["raw_output"]) == 1000
-    assert messages[0]["extra"]["output_truncated"] is True
+    assert messages[0]["content"] == "out|err"
+    assert messages[0]["extra"]["stdout"] == "out"
+    assert messages[0]["extra"]["stderr"] == "err"

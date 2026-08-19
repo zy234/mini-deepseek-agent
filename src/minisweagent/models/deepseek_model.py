@@ -23,11 +23,7 @@ BASE_URL = "https://api.deepseek.com"
 DEFAULT_API_TIMEOUT_SECONDS = 60.0
 
 DEFAULT_OBSERVATION_TEMPLATE = """
-{%- if output.output | length < 10000 -%}
-{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "output": {{ output.output | tojson }}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
-{%- else -%}
-{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "output_head": {{ output.output[:5000] | tojson }}, "output_tail": {{ output.output[-5000:] | tojson }}, "warning": "工具输出过长，已截断。"}
-{%- endif -%}
+{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "stdout": {{ output.stdout | tojson }}, "stderr": {{ output.stderr | tojson }}, "stdout_truncated": {{ output.stdout_truncated | tojson }}, "stderr_truncated": {{ output.stderr_truncated | tojson }}{% if output.stdout_spill_path %}, "stdout_spill_path": {{ output.stdout_spill_path | tojson }}{% endif %}{% if output.stderr_spill_path %}, "stderr_spill_path": {{ output.stderr_spill_path | tojson }}{% endif %}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
 """.strip()
 
 DEFAULT_FORMAT_ERROR_TEMPLATE = """

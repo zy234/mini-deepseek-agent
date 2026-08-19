@@ -14,7 +14,6 @@ from pydantic import BaseModel
 
 from minisweagent import Environment, Model, __version__
 from minisweagent.exceptions import FormatError, InterruptAgentFlow, LimitsExceeded, TimeExceeded
-from minisweagent.models.utils.actions_toolcall import truncate_tool_output
 from minisweagent.utils.serialize import recursive_merge
 
 
@@ -167,17 +166,19 @@ class DefaultAgent:
 
     @staticmethod
     def _print_tool_result(output: dict) -> None:
-        output = truncate_tool_output(output)
         sys.stdout.write(
             f"\n[工具结果] status={output.get('status')} returncode={output.get('returncode')}\n"
         )
-        text = output.get("output", "")
-        if text:
-            sys.stdout.write(text)
-            if not text.endswith("\n"):
-                sys.stdout.write("\n")
-        if output.get("extra", {}).get("output_truncated"):
-            sys.stdout.write("[工具结果已截断，仅保留前 1000 个字符]\n")
+        for name in ("stdout", "stderr"):
+            text = output.get(name, "")
+            if text:
+                sys.stdout.write(f"[{name}]\n{text}")
+                if not text.endswith("\n"):
+                    sys.stdout.write("\n")
+            if output.get(f"{name}_truncated"):
+                spill_path = output.get(f"{name}_spill_path")
+                suffix = f"完整输出：{spill_path}" if spill_path else "完整输出未保留"
+                sys.stdout.write(f"[{name} 已截断；{suffix}]\n")
         sys.stdout.flush()
 
     def serialize(self, *extra_dicts) -> dict:

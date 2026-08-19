@@ -1,7 +1,10 @@
 import os
 import platform
+import selectors
 import signal
 import subprocess
+import tempfile
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -26,6 +29,8 @@ SENSITIVE_ENV_NAMES = frozenset(
     }
 )
 SENSITIVE_ENV_SUFFIXES = ("_API_KEY", "_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PAT")
+STREAM_MAX_BYTES = 64_000
+STREAM_SPILL_MAX_BYTES = 64 * 1024 * 1024
 
 
 class LocalEnvironmentConfig(BaseModel):
@@ -70,28 +75,24 @@ class LocalEnvironment:
                 _safe_environment(self.config.env),
                 requested_timeout,
             )
-            returncode = result.returncode
             output = {
-                "output": result.stdout,
-                "returncode": returncode,
-                "status": "success" if returncode == 0 else "failed",
-                "timed_out": False,
-                "signal": -returncode if returncode < 0 else None,
+                **result,
                 "exception_info": "",
             }
             if action.get("description"):
                 output["extra"] = {"description": action["description"]}
         except Exception as e:
-            raw_output = getattr(e, "output", None)
-            raw_output = (
-                raw_output.decode("utf-8", errors="replace") if isinstance(raw_output, bytes) else (raw_output or "")
-            )
             output = {
-                "output": raw_output,
+                "stdout": "",
+                "stderr": "",
                 "returncode": -1,
                 "status": "timeout" if isinstance(e, subprocess.TimeoutExpired) else "error",
                 "timed_out": isinstance(e, subprocess.TimeoutExpired),
                 "signal": None,
+                "stdout_truncated": False,
+                "stderr_truncated": False,
+                "stdout_spill_path": None,
+                "stderr_spill_path": None,
                 "exception_info": f"执行命令时发生错误：{e}",
                 "extra": {"exception_type": type(e).__name__, "exception": str(e)},
             }
@@ -113,7 +114,7 @@ class LocalEnvironment:
 
     def _check_finished(self, output: dict):
         """Raises Submitted if the output indicates task completion."""
-        lines = output.get("output", "").lstrip().splitlines(keepends=True)
+        lines = output.get("stdout", "").lstrip().splitlines(keepends=True)
         if lines and lines[0].strip() == "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT" and output["returncode"] == 0:
             submission = "".join(lines[1:])
             raise Submitted(
@@ -143,8 +144,8 @@ def _run(
     cwd: str,
     env: dict[str, str],
     timeout: float,
-) -> subprocess.CompletedProcess[str]:
-    """Run an explicit Bash command; timeout cleanup remains process-group scoped."""
+) -> dict[str, Any]:
+    """Run Bash while collecting bounded stdout/stderr tails and optional spill files."""
     execution_env = {
         "NO_COLOR": "1",
         "TERM": "dumb",
@@ -155,22 +156,114 @@ def _run(
     process = subprocess.Popen(
         ["bash", "-c", command],
         shell=False,
-        text=True,
+        text=False,
         cwd=cwd,
         env=execution_env,
-        encoding="utf-8",
-        errors="replace",
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         start_new_session=os.name == "posix",
     )
-    try:
-        stdout, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as error:
-        os.killpg(process.pid, signal.SIGKILL) if os.name == "posix" else process.kill()
-        stdout, _ = process.communicate()
-        raise subprocess.TimeoutExpired(command, timeout, output=stdout) from error
-    return subprocess.CompletedProcess(command, process.returncode, stdout=stdout)
+    collectors = {
+        "stdout": _OutputCollector("stdout", STREAM_MAX_BYTES, STREAM_SPILL_MAX_BYTES),
+        "stderr": _OutputCollector("stderr", STREAM_MAX_BYTES, STREAM_SPILL_MAX_BYTES),
+    }
+    selector = selectors.DefaultSelector()
+    for name, stream in (("stdout", process.stdout), ("stderr", process.stderr)):
+        assert stream is not None
+        selector.register(stream, selectors.EVENT_READ, name)
+    timed_out = False
+    deadline = time.monotonic() + timeout
+    while selector.get_map():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and process.poll() is None and not timed_out:
+            timed_out = True
+            _kill_process_group(process)
+        events = selector.select(max(0, min(remaining, 0.1)))
+        for key, _ in events:
+            chunk = key.fileobj.read(8192)
+            if chunk:
+                collectors[key.data].feed(chunk)
+            else:
+                selector.unregister(key.fileobj)
+                key.fileobj.close()
+    returncode = process.wait()
+    streams = {name: collector.finish() for name, collector in collectors.items()}
+    return {
+        "stdout": streams["stdout"]["text"],
+        "stderr": streams["stderr"]["text"],
+        "stdout_truncated": streams["stdout"]["truncated"],
+        "stderr_truncated": streams["stderr"]["truncated"],
+        "stdout_spill_path": streams["stdout"]["spill_path"],
+        "stderr_spill_path": streams["stderr"]["spill_path"],
+        "returncode": returncode,
+        "status": "timeout" if timed_out else ("success" if returncode == 0 else "failed"),
+        "timed_out": timed_out,
+        "signal": -returncode if returncode < 0 else None,
+    }
+
+
+def _kill_process_group(process: subprocess.Popen) -> None:
+    if os.name == "posix":
+        os.killpg(process.pid, signal.SIGKILL)
+    else:
+        process.kill()
+
+
+class _OutputCollector:
+    def __init__(self, name: str, max_bytes: int = STREAM_MAX_BYTES, spill_max_bytes: int = STREAM_SPILL_MAX_BYTES):
+        self.name = name
+        self.max_bytes = max_bytes
+        self.spill_max_bytes = spill_max_bytes
+        self.tail = bytearray()
+        self.total_bytes = 0
+        self.spill_bytes = 0
+        self.spill_file = None
+        self.spill_path = None
+
+    def feed(self, chunk: bytes) -> None:
+        self.total_bytes += len(chunk)
+        if self.total_bytes > self.max_bytes and self.spill_file is None:
+            self._start_spill()
+        if self.spill_file is not None and self.spill_bytes < self.spill_max_bytes:
+            writable = chunk[: self.spill_max_bytes - self.spill_bytes]
+            self.spill_file.write(writable)
+            self.spill_bytes += len(writable)
+            if len(writable) < len(chunk):
+                self._discard_spill()
+        self.tail.extend(chunk)
+        if len(self.tail) > self.max_bytes:
+            del self.tail[: len(self.tail) - self.max_bytes]
+
+    def _start_spill(self) -> None:
+        spill_dir = tempfile.mkdtemp(prefix="minisweagent-")
+        os.chmod(spill_dir, 0o700)
+        self.spill_path = os.path.join(spill_dir, f"{self.name}.log")
+        self.spill_file = open(self.spill_path, "wb", opener=lambda path, flags: os.open(path, flags, 0o600))
+        self.spill_file.write(bytes(self.tail))
+        self.spill_bytes = len(self.tail)
+
+    def _discard_spill(self) -> None:
+        if self.spill_file is not None:
+            self.spill_file.close()
+            self.spill_file = None
+        if self.spill_path:
+            try:
+                os.unlink(self.spill_path)
+                os.rmdir(os.path.dirname(self.spill_path))
+            except OSError:
+                pass
+        self.spill_path = None
+
+    def finish(self) -> dict[str, Any]:
+        if self.spill_file is not None:
+            self.spill_file.flush()
+            self.spill_file.close()
+            self.spill_file = None
+        return {
+            "text": bytes(self.tail).decode("utf-8", errors="replace"),
+            "truncated": self.total_bytes > self.max_bytes,
+            "spill_path": self.spill_path,
+        }
 
 
 def _safe_environment(extra: dict[str, str] | None = None) -> dict[str, str]:

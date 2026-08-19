@@ -39,20 +39,6 @@ BASH_TOOL = {
     },
 }
 
-MAX_TOOL_OUTPUT_CHARS = 1000
-
-
-def truncate_tool_output(output: dict, max_chars: int = MAX_TOOL_OUTPUT_CHARS) -> dict:
-    """Limit captured command stdout before it is shown to or stored for the model."""
-    result = dict(output)
-    text = result.get("output", "")
-    if not isinstance(text, str) or len(text) <= max_chars:
-        return result
-    result["output"] = text[:max_chars]
-    result["extra"] = {**result.get("extra", {}), "output_truncated": True}
-    return result
-
-
 def parse_toolcall_actions(
     tool_calls: list, *, format_error_template: str, template_kwargs: dict | None = None
 ) -> list[dict]:
@@ -130,28 +116,37 @@ def format_toolcall_observation_messages(
 ) -> list[dict]:
     """Format execution outputs into tool result messages."""
     not_executed = {
-        "output": "",
+        "stdout": "",
+        "stderr": "",
         "returncode": -1,
         "status": "not_executed",
         "timed_out": False,
         "signal": None,
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "stdout_spill_path": None,
+        "stderr_spill_path": None,
         "exception_info": "操作未执行",
     }
     padded_outputs = outputs + [not_executed] * (len(actions) - len(outputs))
     results = []
     for action, output in zip(actions, padded_outputs, strict=True):
-        output = truncate_tool_output(output)
         content = Template(observation_template, undefined=StrictUndefined).render(
             output=output, **(template_vars or {})
         )
         msg = {
             "content": content,
             "extra": {
-                "raw_output": output.get("output", ""),
+                "stdout": output.get("stdout", ""),
+                "stderr": output.get("stderr", ""),
                 "returncode": output.get("returncode"),
                 "status": output.get("status"),
                 "timed_out": output.get("timed_out", False),
                 "signal": output.get("signal"),
+                "stdout_truncated": output.get("stdout_truncated", False),
+                "stderr_truncated": output.get("stderr_truncated", False),
+                "stdout_spill_path": output.get("stdout_spill_path"),
+                "stderr_spill_path": output.get("stderr_spill_path"),
                 "timestamp": time.time(),
                 "exception_info": output.get("exception_info"),
                 **output.get("extra", {}),
