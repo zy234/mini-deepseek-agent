@@ -102,6 +102,24 @@ def test_local_environment_executes_approved_command(tmp_path):
     assert result["returncode"] == 0
 
 
+def test_local_environment_allows_dev_null_redirect(tmp_path):
+    command = "wc -l missing.py 2>/dev/null"
+    env = LocalEnvironment(
+        cwd=str(tmp_path),
+        timeout=5,
+        approval_callback=lambda _command, _reason: pytest.fail("/dev/null 不应请求审批"),
+    )
+
+    result = env.execute({"command": command})
+
+    assert result["returncode"] == 1
+    assert result["output"] == ""
+
+
+def test_bash_policy_allows_redirects_to_tmp(tmp_path):
+    assert analyze_bash_command("printf x > /tmp/minisweagent-output", str(tmp_path)) is None
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -120,6 +138,7 @@ def test_bash_policy_allows_known_read_only_commands(command, tmp_path):
     "command",
     [
         "printf x > output.txt",
+        "printf x > /tmp/../etc/minisweagent-output",
         "cat $(rm output.txt)",
         "sed -i '' README.md",
         "git status && curl https://example.com",

@@ -109,6 +109,8 @@ UNSUPPORTED_NODE_KINDS = frozenset(
     {"arithfor", "case", "compound", "for", "function", "if", "select", "until", "while"}
 )
 READ_ONLY_REDIRECTS = frozenset({"<", "<<", "<<<", "<&"})
+UNATTENDED_WRITE_TARGETS = frozenset({"/dev/null"})
+TEMP_DIRECTORY = Path("/tmp").resolve()
 
 
 def analyze_bash_command(command: str, cwd: str) -> BashRisk | None:
@@ -151,9 +153,18 @@ def _analyze_redirect(node: Any, workspace: Path) -> BashRisk | None:
     redirect_type = getattr(node, "type", "")
     target = getattr(getattr(node, "output", None), "word", "")
     if redirect_type not in READ_ONLY_REDIRECTS:
+        if _allows_unattended_write(target):
+            return None
         hard_denied = target == "/dev" or target.startswith("/dev/")
         return BashRisk(f"包含写入重定向 {redirect_type} {target}".strip(), hard_denied=hard_denied)
     return _outside_workspace_risk([target], workspace)
+
+
+def _allows_unattended_write(target: str) -> bool:
+    if target in UNATTENDED_WRITE_TARGETS:
+        return True
+    path = Path(target)
+    return path.is_absolute() and path.resolve().is_relative_to(TEMP_DIRECTORY)
 
 
 def _analyze_simple_command(node: Any, workspace: Path) -> BashRisk | None:
