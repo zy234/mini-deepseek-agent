@@ -168,7 +168,9 @@ class DefaultAgent:
     @staticmethod
     def _print_tool_result(output: dict) -> None:
         output = truncate_tool_output(output)
-        sys.stdout.write(f"\n[工具结果] returncode={output.get('returncode')}\n")
+        sys.stdout.write(
+            f"\n[工具结果] status={output.get('status')} returncode={output.get('returncode')}\n"
+        )
         text = output.get("output", "")
         if text:
             sys.stdout.write(text)

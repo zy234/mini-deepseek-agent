@@ -18,7 +18,20 @@ BASH_TOOL = {
                 "command": {
                     "type": "string",
                     "description": "要执行的 Bash 命令；应保持短小、可审查，并避免访问敏感信息或执行破坏性操作",
-                }
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "可选的工作目录；必须是本地已有目录",
+                },
+                "timeout": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": "可选的单次命令超时秒数，不能超过环境全局限制",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "可选的简短命令意图，便于审批和记录",
+                },
             },
             "required": ["command"],
             "additionalProperties": False,
@@ -75,6 +88,21 @@ def parse_toolcall_actions(
             error_msg += f"未知工具：{tool_call.function.name}。"
         if not isinstance(args, dict) or "command" not in args:
             error_msg += "bash 工具调用缺少 command 参数。"
+        elif not isinstance(args["command"], str) or not args["command"].strip():
+            error_msg += "bash 工具的 command 必须是非空字符串。"
+        if isinstance(args, dict):
+            unknown_keys = set(args) - {"command", "workdir", "timeout", "description"}
+            if unknown_keys:
+                error_msg += f"bash 工具包含未知参数：{', '.join(sorted(unknown_keys))}。"
+            if "workdir" in args and not isinstance(args["workdir"], str):
+                error_msg += "bash 工具的 workdir 必须是字符串。"
+            timeout = args.get("timeout")
+            if timeout is not None and (
+                isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0
+            ):
+                error_msg += "bash 工具的 timeout 必须是正数。"
+            if "description" in args and not isinstance(args["description"], str):
+                error_msg += "bash 工具的 description 必须是字符串。"
         if error_msg:
             raise FormatError(
                 {
@@ -85,7 +113,11 @@ def parse_toolcall_actions(
                     "extra": {"interrupt_type": "FormatError"},
                 }
             )
-        actions.append({"command": args["command"], "tool_call_id": tool_call.id})
+        action = {"command": args["command"], "tool_call_id": tool_call.id}
+        for key in ("workdir", "timeout", "description"):
+            if key in args:
+                action[key] = args[key]
+        actions.append(action)
     return actions
 
 
@@ -97,7 +129,14 @@ def format_toolcall_observation_messages(
     template_vars: dict | None = None,
 ) -> list[dict]:
     """Format execution outputs into tool result messages."""
-    not_executed = {"output": "", "returncode": -1, "exception_info": "操作未执行"}
+    not_executed = {
+        "output": "",
+        "returncode": -1,
+        "status": "not_executed",
+        "timed_out": False,
+        "signal": None,
+        "exception_info": "操作未执行",
+    }
     padded_outputs = outputs + [not_executed] * (len(actions) - len(outputs))
     results = []
     for action, output in zip(actions, padded_outputs, strict=True):
@@ -110,6 +149,9 @@ def format_toolcall_observation_messages(
             "extra": {
                 "raw_output": output.get("output", ""),
                 "returncode": output.get("returncode"),
+                "status": output.get("status"),
+                "timed_out": output.get("timed_out", False),
+                "signal": output.get("signal"),
                 "timestamp": time.time(),
                 "exception_info": output.get("exception_info"),
                 **output.get("extra", {}),

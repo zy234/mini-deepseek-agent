@@ -24,9 +24,9 @@ DEFAULT_API_TIMEOUT_SECONDS = 60.0
 
 DEFAULT_OBSERVATION_TEMPLATE = """
 {%- if output.output | length < 10000 -%}
-{"returncode": {{ output.returncode }}, "output": {{ output.output | tojson }}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
+{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "output": {{ output.output | tojson }}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
 {%- else -%}
-{"returncode": {{ output.returncode }}, "output_head": {{ output.output[:5000] | tojson }}, "output_tail": {{ output.output[-5000:] | tojson }}, "warning": "工具输出过长，已截断。"}
+{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "output_head": {{ output.output[:5000] | tojson }}, "output_tail": {{ output.output[-5000:] | tojson }}, "warning": "工具输出过长，已截断。"}
 {%- endif -%}
 """.strip()
 
@@ -35,7 +35,7 @@ DEFAULT_FORMAT_ERROR_TEMPLATE = """
 {{ error }}
 
 如果确实需要操作，请使用 bash 工具，并传入如下 JSON 参数：
-{"command": "要执行的命令"}
+{"command": "要执行的命令", "workdir": "可选工作目录", "timeout": 30}
 
 如果任务已经可以回答，请直接返回中文最终答复，不要强行调用工具。
 """.strip()

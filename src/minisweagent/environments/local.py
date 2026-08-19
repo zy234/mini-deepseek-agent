@@ -31,7 +31,7 @@ SENSITIVE_ENV_SUFFIXES = ("_API_KEY", "_KEY", "_TOKEN", "_SECRET", "_PASSWORD", 
 class LocalEnvironmentConfig(BaseModel):
     cwd: str = ""
     env: dict[str, str] = {}
-    timeout: int = 30
+    timeout: float = 30
 
 
 class LocalEnvironment:
@@ -46,16 +46,36 @@ class LocalEnvironment:
         self.config = config_class(**kwargs)
         self.approval_callback = approval_callback or _prompt_for_approval
 
-    def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> dict[str, Any]:
+    def execute(self, action: dict, cwd: str = "", *, timeout: float | None = None) -> dict[str, Any]:
         """Execute a command in the local environment and return the result as a dict."""
         command = action.get("command", "")
-        cwd = cwd or self.config.cwd or os.getcwd()
+        cwd = action.get("workdir") or cwd or self.config.cwd or os.getcwd()
+        global_timeout = timeout if timeout is not None else self.config.timeout
+        requested_timeout = action.get("timeout")
         risk = analyze_bash_command(command, cwd)
         if risk and (risk.hard_denied or not self.approval_callback(command, risk.reason)):
             self._stop_for_approval(command, risk.reason, hard_denied=risk.hard_denied)
         try:
-            result = _run(command, cwd, _safe_environment(self.config.env), timeout or self.config.timeout)
-            output = {"output": result.stdout, "returncode": result.returncode, "exception_info": ""}
+            if requested_timeout is None:
+                requested_timeout = global_timeout
+            if isinstance(requested_timeout, bool) or not isinstance(requested_timeout, (int, float)):
+                raise ValueError("命令 timeout 必须是数字")
+            if requested_timeout <= 0:
+                raise ValueError("命令 timeout 必须是正数")
+            if requested_timeout > global_timeout:
+                raise ValueError(f"命令 timeout 不能超过全局上限 {global_timeout} 秒")
+            result = _run(command, cwd, _safe_environment(self.config.env), requested_timeout)
+            returncode = result.returncode
+            output = {
+                "output": result.stdout,
+                "returncode": returncode,
+                "status": "success" if returncode == 0 else "failed",
+                "timed_out": False,
+                "signal": -returncode if returncode < 0 else None,
+                "exception_info": "",
+            }
+            if action.get("description"):
+                output["extra"] = {"description": action["description"]}
         except Exception as e:
             raw_output = getattr(e, "output", None)
             raw_output = (
@@ -64,6 +84,9 @@ class LocalEnvironment:
             output = {
                 "output": raw_output,
                 "returncode": -1,
+                "status": "timeout" if isinstance(e, subprocess.TimeoutExpired) else "error",
+                "timed_out": isinstance(e, subprocess.TimeoutExpired),
+                "signal": None,
                 "exception_info": f"执行命令时发生错误：{e}",
                 "extra": {"exception_type": type(e).__name__, "exception": str(e)},
             }

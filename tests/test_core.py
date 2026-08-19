@@ -8,7 +8,10 @@ from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.exceptions import CommandNotApproved, Submitted
 from minisweagent.models.deepseek_model import DeepSeekModel
-from minisweagent.models.utils.actions_toolcall import format_toolcall_observation_messages
+from minisweagent.models.utils.actions_toolcall import (
+    format_toolcall_observation_messages,
+    parse_toolcall_actions,
+)
 from minisweagent.run import mini
 
 
@@ -69,6 +72,82 @@ def test_local_environment_captures_output_and_completion():
     result = env.execute({"command": "printf ENV_OK"})
     assert result["output"] == "ENV_OK"
     assert result["returncode"] == 0
+    assert result["status"] == "success"
+    assert result["timed_out"] is False
+
+
+def test_bash_action_accepts_optional_execution_metadata():
+    tool_call = SimpleNamespace(
+        id="call_1",
+        function=SimpleNamespace(
+            name="bash",
+            arguments='{"command":"pwd","workdir":"/tmp","timeout":2.5,"description":"检查目录"}',
+        ),
+    )
+
+    assert parse_toolcall_actions([tool_call], format_error_template="{{ error }}") == [
+        {
+            "command": "pwd",
+            "workdir": "/tmp",
+            "timeout": 2.5,
+            "description": "检查目录",
+            "tool_call_id": "call_1",
+        }
+    ]
+
+
+def test_bash_action_rejects_invalid_optional_metadata():
+    tool_call = SimpleNamespace(
+        id="call_1",
+        function=SimpleNamespace(name="bash", arguments='{"command":"pwd","timeout":0}'),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        parse_toolcall_actions([tool_call], format_error_template="{{ error }}")
+
+    assert "timeout 必须是正数" in exc_info.value.messages[0]["content"]
+
+
+def test_bash_action_rejects_non_object_arguments():
+    tool_call = SimpleNamespace(
+        id="call_1",
+        function=SimpleNamespace(name="bash", arguments="[]"),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        parse_toolcall_actions([tool_call], format_error_template="{{ error }}")
+
+    assert "缺少 command 参数" in exc_info.value.messages[0]["content"]
+
+
+def test_bash_action_rejects_unknown_arguments():
+    tool_call = SimpleNamespace(
+        id="call_1",
+        function=SimpleNamespace(name="bash", arguments='{"command":"pwd","shell":"bash"}'),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        parse_toolcall_actions([tool_call], format_error_template="{{ error }}")
+
+    assert "未知参数：shell" in exc_info.value.messages[0]["content"]
+
+
+def test_local_environment_action_timeout_is_reported():
+    env = LocalEnvironment(timeout=5, approval_callback=lambda _command, _reason: True)
+
+    result = env.execute({"command": "sleep 1", "timeout": 0.01})
+
+    assert result["status"] == "timeout"
+    assert result["timed_out"] is True
+
+
+def test_local_environment_rejects_action_timeout_above_global_limit():
+    env = LocalEnvironment(timeout=1, approval_callback=lambda _command, _reason: True)
+
+    result = env.execute({"command": "printf TOO_LATE", "timeout": 2})
+
+    assert result["status"] == "error"
+    assert "不能超过全局上限" in result["exception_info"]
 
 
 def test_local_environment_blocks_dangerous_commands_and_hides_keys(monkeypatch):
