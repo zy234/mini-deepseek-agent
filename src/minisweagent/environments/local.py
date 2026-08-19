@@ -31,6 +31,7 @@ SENSITIVE_ENV_NAMES = frozenset(
 SENSITIVE_ENV_SUFFIXES = ("_API_KEY", "_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_PAT")
 STREAM_MAX_BYTES = 64_000
 STREAM_SPILL_MAX_BYTES = 64 * 1024 * 1024
+TERMINATION_GRACE_SECONDS = 0.25
 
 
 class LocalEnvironmentConfig(BaseModel):
@@ -86,9 +87,11 @@ class LocalEnvironment:
                 "stdout": "",
                 "stderr": "",
                 "returncode": -1,
+                "exit_code": None,
                 "status": "timeout" if isinstance(e, subprocess.TimeoutExpired) else "error",
                 "timed_out": isinstance(e, subprocess.TimeoutExpired),
                 "signal": None,
+                "termination": None,
                 "stdout_truncated": False,
                 "stderr_truncated": False,
                 "stdout_spill_path": None,
@@ -172,13 +175,25 @@ def _run(
         assert stream is not None
         selector.register(stream, selectors.EVENT_READ, name)
     timed_out = False
+    termination = None
+    forced_kill = False
     deadline = time.monotonic() + timeout
+    termination_deadline = None
     while selector.get_map():
-        remaining = deadline - time.monotonic()
+        now = time.monotonic()
+        remaining = deadline - now
         if remaining <= 0 and process.poll() is None and not timed_out:
             timed_out = True
-            _kill_process_group(process)
-        events = selector.select(max(0, min(remaining, 0.1)))
+            termination = "graceful"
+            termination_deadline = now + TERMINATION_GRACE_SECONDS
+            _signal_process_group(process, signal.SIGTERM)
+        elif timed_out and process.poll() is None and termination_deadline is not None and now >= termination_deadline:
+            forced_kill = True
+            termination = "forced"
+            termination_deadline = None
+            _signal_process_group(process, signal.SIGKILL)
+        wait_for = 0.1 if timed_out else max(0, min(remaining, 0.1))
+        events = selector.select(wait_for)
         for key, _ in events:
             chunk = key.fileobj.read(8192)
             if chunk:
@@ -196,17 +211,29 @@ def _run(
         "stdout_spill_path": streams["stdout"]["spill_path"],
         "stderr_spill_path": streams["stderr"]["spill_path"],
         "returncode": returncode,
-        "status": "timeout" if timed_out else ("success" if returncode == 0 else "failed"),
+        "exit_code": returncode if returncode >= 0 else None,
+        "status": (
+            "timeout"
+            if timed_out
+            else ("signal" if returncode < 0 else ("success" if returncode == 0 else "failed"))
+        ),
         "timed_out": timed_out,
         "signal": -returncode if returncode < 0 else None,
+        "termination": termination or ("forced" if forced_kill else None),
     }
 
 
-def _kill_process_group(process: subprocess.Popen) -> None:
+def _signal_process_group(process: subprocess.Popen, sig: signal.Signals) -> None:
     if os.name == "posix":
-        os.killpg(process.pid, signal.SIGKILL)
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
     else:
-        process.kill()
+        if sig == signal.SIGKILL:
+            process.kill()
+        else:
+            process.terminate()
 
 
 class _OutputCollector:

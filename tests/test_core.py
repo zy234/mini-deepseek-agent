@@ -1,3 +1,4 @@
+import signal
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -204,6 +205,39 @@ def test_local_environment_action_timeout_is_reported():
 
     assert result["status"] == "timeout"
     assert result["timed_out"] is True
+    assert result["exit_code"] is None
+    assert result["termination"] in {"graceful", "forced"}
+
+
+def test_local_environment_timeout_allows_graceful_term_handler():
+    env = LocalEnvironment(timeout=0.05, approval_callback=lambda _command, _reason: True)
+
+    result = env.execute({"command": "trap 'exit 0' TERM; sleep 10"})
+
+    assert result["status"] == "timeout"
+    assert result["timed_out"] is True
+    assert result["termination"] == "graceful"
+
+
+def test_local_environment_timeout_forces_process_group_that_ignores_term():
+    env = LocalEnvironment(timeout=0.05, approval_callback=lambda _command, _reason: True)
+
+    result = env.execute({"command": "trap '' TERM; sleep 10"})
+
+    assert result["status"] == "timeout"
+    assert result["timed_out"] is True
+    assert result["termination"] == "forced"
+
+
+def test_local_environment_reports_signal_exit():
+    env = LocalEnvironment(timeout=5, approval_callback=lambda _command, _reason: True)
+
+    result = env.execute({"command": "kill -TERM $$"})
+
+    assert result["status"] == "signal"
+    assert result["returncode"] < 0
+    assert result["exit_code"] is None
+    assert result["signal"] == signal.SIGTERM
 
 
 def test_local_environment_rejects_action_timeout_above_global_limit():

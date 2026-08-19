@@ -23,7 +23,7 @@ BASE_URL = "https://api.deepseek.com"
 DEFAULT_API_TIMEOUT_SECONDS = 60.0
 
 DEFAULT_OBSERVATION_TEMPLATE = """
-{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "stdout": {{ output.stdout | tojson }}, "stderr": {{ output.stderr | tojson }}, "stdout_truncated": {{ output.stdout_truncated | tojson }}, "stderr_truncated": {{ output.stderr_truncated | tojson }}{% if output.stdout_spill_path %}, "stdout_spill_path": {{ output.stdout_spill_path | tojson }}{% endif %}{% if output.stderr_spill_path %}, "stderr_spill_path": {{ output.stderr_spill_path | tojson }}{% endif %}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
+{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "exit_code": {{ output.exit_code | tojson }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "termination": {{ output.termination | tojson }}, "stdout": {{ output.stdout | tojson }}, "stderr": {{ output.stderr | tojson }}, "stdout_truncated": {{ output.stdout_truncated | tojson }}, "stderr_truncated": {{ output.stderr_truncated | tojson }}{% if output.stdout_spill_path %}, "stdout_spill_path": {{ output.stdout_spill_path | tojson }}{% endif %}{% if output.stderr_spill_path %}, "stderr_spill_path": {{ output.stderr_spill_path | tojson }}{% endif %}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
 """.strip()
 
 DEFAULT_FORMAT_ERROR_TEMPLATE = """
