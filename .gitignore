@@ -6,6 +6,7 @@ preds.json
 *.traj.json
 .env
 traj.json
+.sessions/
 .claude/**
 .vscode/**
 

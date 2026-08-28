@@ -8,10 +8,14 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.editor import execute_editor
+from minisweagent.environments.web_search import (
+    DEFAULT_SEARCH_ENGINES,
+    execute_web_search,
+)
 from minisweagent.exceptions import CommandNotApproved, Submitted
 from minisweagent.utils.serialize import recursive_merge
 
@@ -39,6 +43,8 @@ class LocalEnvironmentConfig(BaseModel):
     cwd: str = ""
     env: dict[str, str] = {}
     timeout: float = 30
+    web_search_engines: list[str] = Field(default_factory=lambda: list(DEFAULT_SEARCH_ENGINES))
+    web_search_max_results: int = Field(default=8, ge=1)
 
 
 class LocalEnvironment:
@@ -57,6 +63,8 @@ class LocalEnvironment:
         """Execute a command in the local environment and return the result as a dict."""
         if action.get("tool") == "str_replace_editor":
             return self._execute_editor(action, cwd)
+        if action.get("tool") == "web_search":
+            return self._execute_web_search(action, timeout=timeout)
         command = action.get("command", "")
         cwd = action.get("workdir") or cwd or self.config.cwd or os.getcwd()
         global_timeout = timeout if timeout is not None else self.config.timeout
@@ -137,6 +145,15 @@ class LocalEnvironment:
                 "exception_info": f"文件编辑失败：{error}",
                 "extra": {"error_code": getattr(error, "code", type(error).__name__)},
             }
+
+    def _execute_web_search(self, action: dict, *, timeout: float | None) -> dict[str, Any]:
+        search_timeout = timeout if timeout is not None else self.config.timeout
+        return execute_web_search(
+            action.get("queries", []),
+            timeout=search_timeout,
+            engines=self.config.web_search_engines,
+            max_results=self.config.web_search_max_results,
+        )
 
     @staticmethod
     def _stop_for_approval(command: str, reason: str, *, hard_denied: bool) -> None:

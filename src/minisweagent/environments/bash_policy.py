@@ -117,7 +117,7 @@ def analyze_bash_command(command: str, cwd: str) -> BashRisk | None:
     """Return the first risk that requires approval, or None for a known read-only command."""
     try:
         trees = bashlex.parse(command)
-    except (NotImplementedError, ValueError) as exc:
+    except (bashlex.errors.ParsingError, NotImplementedError, ValueError) as exc:
         return BashRisk(f"无法可靠解析 Bash 语法：{exc}")
     if not trees:
         return BashRisk("命令为空")

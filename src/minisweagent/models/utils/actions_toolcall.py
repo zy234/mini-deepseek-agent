@@ -61,7 +61,28 @@ EDITOR_TOOL = {
         },
     },
 }
-TOOL_DEFINITIONS = [BASH_TOOL, EDITOR_TOOL]
+WEB_SEARCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_search",
+        "description": "使用仓库自带的零 Key 多引擎能力搜索当前网络信息。返回去重后的来源 URL、标题、抓取时间和摘要；最终答复应引用相关 URL。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "description": "1 到 4 个非空搜索查询；单个查询也必须放在数组中",
+                }
+            },
+            "required": ["queries"],
+            "additionalProperties": False,
+        },
+    },
+}
+TOOL_DEFINITIONS = [BASH_TOOL, EDITOR_TOOL, WEB_SEARCH_TOOL]
 
 def parse_toolcall_actions(
     tool_calls: list, *, format_error_template: str, template_kwargs: dict | None = None
@@ -95,7 +116,7 @@ def parse_toolcall_actions(
         except Exception as e:
             error_msg = f"无法解析工具参数：{e}。"
         tool_name = tool_call.function.name
-        if tool_name not in {"bash", "str_replace_editor"}:
+        if tool_name not in {"bash", "str_replace_editor", "web_search"}:
             error_msg += f"未知工具：{tool_name}。"
         if not isinstance(args, dict):
             error_msg += f"{tool_name} 工具参数必须是对象。"
@@ -104,10 +125,24 @@ def parse_toolcall_actions(
                 error_msg += "bash 工具的 command 必须是非空字符串。"
         elif tool_name == "str_replace_editor":
             error_msg += _validate_editor_args(args)
+        elif tool_name == "web_search":
+            error_msg += _validate_web_search_args(args)
         if isinstance(args, dict):
-            allowed = {"command", "workdir", "timeout", "description"} if tool_name == "bash" else {
-                "command", "path", "file_text", "old_str", "new_str", "insert_line", "view_range", "expected_hash"
-            }
+            if tool_name == "bash":
+                allowed = {"command", "workdir", "timeout", "description"}
+            elif tool_name == "web_search":
+                allowed = {"queries"}
+            else:
+                allowed = {
+                    "command",
+                    "path",
+                    "file_text",
+                    "old_str",
+                    "new_str",
+                    "insert_line",
+                    "view_range",
+                    "expected_hash",
+                }
             unknown_keys = set(args) - allowed
             if unknown_keys:
                 error_msg += f"{tool_name} 工具包含未知参数：{', '.join(sorted(unknown_keys))}。"
@@ -130,7 +165,12 @@ def parse_toolcall_actions(
                     "extra": {"interrupt_type": "FormatError"},
                 }
             )
-        action = {"tool": tool_name, "command": args["command"], "tool_call_id": tool_call.id}
+        action = {"tool": tool_name, "tool_call_id": tool_call.id}
+        if tool_name == "web_search":
+            action["queries"] = args["queries"]
+            actions.append(action)
+            continue
+        action["command"] = args["command"]
         keys = ("workdir", "timeout", "description") if tool_name == "bash" else (
             "path", "file_text", "old_str", "new_str", "insert_line", "view_range", "expected_hash"
         )
@@ -165,6 +205,15 @@ def _validate_editor_args(args: dict) -> str:
         return "编辑器 view_range 必须是两个整数。"
     if "expected_hash" in args and not isinstance(args["expected_hash"], str):
         return "编辑器 expected_hash 必须是字符串。"
+    return ""
+
+
+def _validate_web_search_args(args: dict) -> str:
+    queries = args.get("queries")
+    if not isinstance(queries, list) or not 1 <= len(queries) <= 4:
+        return "web_search 的 queries 必须是包含 1 到 4 项的数组。"
+    if any(not isinstance(query, str) or not query.strip() for query in queries):
+        return "web_search 的 queries 每一项都必须是非空字符串。"
     return ""
 
 

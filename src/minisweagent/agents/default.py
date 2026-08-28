@@ -33,6 +33,12 @@ class AgentConfig(BaseModel):
     """Exit after this many format errors in a row (0 = no limit)."""
     output_path: Path | None = None
     """Save the trajectory to this path."""
+    session_id: str = ""
+    """Identifier assigned to a CLI session."""
+    session_started_at: str = ""
+    """Local ISO-8601 start time assigned to a CLI session."""
+    session_cwd: str = ""
+    """Current directory from which the CLI session was started."""
 
 
 class DefaultAgent:
@@ -239,6 +245,11 @@ class DefaultAgent:
                 "config": {
                     "agent": self.config.model_dump(mode="json"),
                     "agent_type": f"{self.__class__.__module__}.{self.__class__.__name__}",
+                },
+                "session": {
+                    "id": self.config.session_id,
+                    "started_at": self.config.session_started_at,
+                    "cwd": self.config.session_cwd,
                 },
                 "mini_version": __version__,
                 "exit_status": last_extra.get("exit_status", ""),

@@ -102,6 +102,14 @@ def render_tool_actions(actions: list[dict[str, Any]], *, stream: TextIO | None 
             elif action.get("old_str") is not None:
                 _render_preview(str(action["old_str"]), label=f"工具调用 {index} 的替换原文", stream=stream)
             continue
+        if tool_name == "web_search":
+            stream.write(_paint(stream, "查询\n", COLORS["工具"]))
+            _render_preview(
+                "\n".join(str(query) for query in action.get("queries", [])),
+                label=f"工具调用 {index} 的完整查询",
+                stream=stream,
+            )
+            continue
         stream.write(_paint(stream, "命令\n", COLORS["工具"]))
         _render_preview(
             str(action.get("command", "")),

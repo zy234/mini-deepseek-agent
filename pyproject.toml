@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mini-swe-agent"
 dynamic = ["version"]
-description = "A minimal DeepSeek V4 Flash agent with one Bash tool"
+description = "A minimal DeepSeek V4 Flash agent with Bash, editor, and zero-key web search tools"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {file = "LICENSE.md"}
-keywords = ["agent", "deepseek", "bash"]
+keywords = ["agent", "deepseek", "bash", "web-search"]
 authors = [
     {name = "Kilian Lieret", email = "kilian.lieret@posteo.de"},
     {name = "Carlos E. Jimenez", email = "carlosej@princeton.edu"},

@@ -1,15 +1,18 @@
+import json
+import re
 import signal
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from minisweagent.agents.default import DefaultAgent
-from minisweagent.environments import editor
+from minisweagent.environments import editor, web_search
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.exceptions import CommandNotApproved, Submitted
-from minisweagent.models.deepseek_model import DeepSeekModel
+from minisweagent.models.deepseek_model import DEFAULT_OBSERVATION_TEMPLATE, DeepSeekModel
 from minisweagent.models.utils.actions_toolcall import (
     format_toolcall_observation_messages,
     parse_toolcall_actions,
@@ -75,6 +78,38 @@ def test_agent_runs_bash_and_saves_submission(tmp_path: Path):
     assert any(message.get("role") == "tool" for message in agent.messages)
 
 
+def test_new_session_record_uses_current_directory_and_unique_sortable_name(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    path, session_id, started_at = mini._new_session_record()
+
+    assert path.parent == tmp_path / ".sessions"
+    assert path.name == f"{session_id}.json"
+    assert session_id.startswith("20")
+    assert len(session_id.rsplit("-", 1)[-1]) == 8
+    assert datetime.fromisoformat(started_at).tzinfo is not None
+
+
+def test_agent_serializes_session_metadata(tmp_path):
+    agent = DefaultAgent(
+        FakeModel(),
+        LocalEnvironment(timeout=5),
+        system_template="你是助手。",
+        instance_template="{{ task }}",
+        session_id="session-test",
+        session_started_at="2026-08-28T12:00:00+08:00",
+        session_cwd=str(tmp_path),
+    )
+
+    data = agent.serialize()
+
+    assert data["info"]["session"] == {
+        "id": "session-test",
+        "started_at": "2026-08-28T12:00:00+08:00",
+        "cwd": str(tmp_path),
+    }
+
+
 def test_local_environment_captures_output_and_completion():
     env = LocalEnvironment(timeout=5)
     result = env.execute({"command": "printf ENV_OK"})
@@ -82,6 +117,182 @@ def test_local_environment_captures_output_and_completion():
     assert result["returncode"] == 0
     assert result["status"] == "success"
     assert result["timed_out"] is False
+
+
+def test_web_search_is_standalone_without_ds_key_and_deduplicates(monkeypatch):
+    calls = []
+
+    def fake_search(query, timeout, limit):
+        calls.append((query, timeout, limit))
+        return [
+            web_search.SearchResult(
+                url="https://example.test/article?utm_source=search",
+                title="测试新闻",
+                snippet="摘要",
+                source_engine="fake",
+                fetched_at="2026-08-28T10:00:00+08:00",
+            ),
+            web_search.SearchResult(
+                url="https://example.test/article",
+                title="重复结果",
+                snippet="",
+                source_engine="fake",
+                fetched_at="2026-08-28T10:00:01+08:00",
+            ),
+            web_search.SearchResult(
+                url="https://example.test/second?id=2",
+                title="第二条",
+                snippet="第二个摘要",
+                source_engine="fake",
+                fetched_at="2026-08-28T10:01:00+08:00",
+            ),
+        ]
+
+    monkeypatch.setenv("DS_KEY", "must-not-be-used")
+    monkeypatch.setattr(web_search, "ENGINE_SEARCHERS", {"fake": fake_search})
+
+    result = web_search.execute_web_search(
+        ["今天新闻", "今天新闻", "第二查询"],
+        timeout=2,
+        engines=["fake"],
+        max_results=2,
+    )
+
+    assert result["status"] == "success"
+    assert result["extra"]["sources"] == [
+        {
+            "url": "https://example.test/article",
+            "title": "测试新闻",
+            "snippet": "摘要",
+            "source_engine": "fake",
+            "fetched_at": "2026-08-28T10:00:00+08:00",
+        },
+        {
+            "url": "https://example.test/second?id=2",
+            "title": "第二条",
+            "snippet": "第二个摘要",
+            "source_engine": "fake",
+            "fetched_at": "2026-08-28T10:01:00+08:00",
+        },
+    ]
+    assert "https://example.test/article" in result["stdout"]
+    assert calls == [("今天新闻", 2.0, 2)]
+    assert result["extra"]["attempts"][0]["status"] == "success"
+
+
+def test_web_search_reports_invalid_queries_and_engines():
+    invalid = web_search.execute_web_search(["新闻"] * 5, timeout=2)
+    assert invalid["status"] == "error"
+    assert invalid["extra"]["error_code"] == "WEB_INVALID_ARGUMENT"
+
+    result = web_search.execute_web_search(["新闻"], timeout=2, engines=["unknown"])
+    assert result["status"] == "error"
+    assert result["extra"]["error_code"] == "WEB_INVALID_ARGUMENT"
+
+
+def test_web_search_exposes_engine_failures_instead_of_returning_empty(monkeypatch):
+    def blocked(_query, _timeout, _limit):
+        raise web_search.EngineFailure("blocked", "HTTP 429")
+
+    def network_error(_query, _timeout, _limit):
+        raise web_search.EngineFailure("network_error", "timed out")
+
+    monkeypatch.setattr(
+        web_search,
+        "ENGINE_SEARCHERS",
+        {"blocked": blocked, "network": network_error},
+    )
+
+    result = web_search.execute_web_search(
+        ["今日行情"],
+        timeout=2,
+        engines=["blocked", "network"],
+    )
+
+    assert result["status"] == "error"
+    assert result["extra"]["error_code"] == "WEB_SEARCH_UNAVAILABLE"
+    assert [attempt["status"] for attempt in result["extra"]["attempts"]] == [
+        "blocked",
+        "network_error",
+    ]
+    assert "不要用相近关键词反复重试" in result["stderr"]
+
+
+def test_web_search_failure_diagnostics_are_visible_in_model_observation():
+    attempts = [{
+        "query": "今日行情",
+        "engine": "baidu_html",
+        "status": "blocked",
+        "result_count": 0,
+        "detail": "HTTP 429",
+    }]
+    messages = format_toolcall_observation_messages(
+        actions=[{"tool": "web_search", "tool_call_id": "search_1"}],
+        outputs=[{
+            "status": "error",
+            "returncode": -1,
+            "exit_code": None,
+            "timed_out": False,
+            "signal": None,
+            "termination": None,
+            "path": None,
+            "operation": "web_search",
+            "content_hash": None,
+            "stdout": "",
+            "stderr": "网页搜索引擎均不可用。",
+            "stdout_truncated": False,
+            "stderr_truncated": False,
+            "stdout_spill_path": None,
+            "stderr_spill_path": None,
+            "exception_info": "网页搜索引擎均不可用。",
+            "extra": {"error_code": "WEB_SEARCH_UNAVAILABLE", "attempts": attempts},
+        }],
+        observation_template=DEFAULT_OBSERVATION_TEMPLATE,
+    )
+
+    # 使用模型默认模板时，逐引擎状态必须位于发送给模型的 tool message 中。
+    assert "WEB_SEARCH_UNAVAILABLE" in messages[0]["content"]
+    assert "baidu_html" in messages[0]["content"]
+    assert "HTTP 429" in messages[0]["content"]
+
+
+def test_web_search_distinguishes_real_empty_results(monkeypatch):
+    monkeypatch.setattr(web_search, "ENGINE_SEARCHERS", {"empty": lambda *_args: []})
+
+    result = web_search.execute_web_search(["不存在的内容"], timeout=2, engines=["empty"])
+
+    assert result["status"] == "success"
+    assert result["extra"]["sources"] == []
+    assert result["extra"]["attempts"][0]["status"] == "empty"
+    assert "empty=empty" in result["stdout"]
+
+
+def test_bing_rss_parser_returns_structured_sources(monkeypatch):
+    payload = """<?xml version="1.0" encoding="utf-8"?>
+    <rss><channel><item><title>今日 &amp; 行情</title><link>https://example.test/news?id=1</link>
+    <description><![CDATA[<b>收盘摘要</b>]]></description></item></channel></rss>"""
+    monkeypatch.setattr(web_search, "_http_get", lambda *_args, **_kwargs: payload)
+
+    results = web_search._search_bing_rss("今日行情", 2, 5)
+
+    assert len(results) == 1
+    assert results[0].url == "https://example.test/news?id=1"
+    assert results[0].title == "今日 & 行情"
+    assert results[0].snippet == "收盘摘要"
+    assert results[0].source_engine == "bing_rss"
+
+
+def test_html_parser_reports_changed_result_structure():
+    with pytest.raises(web_search.EngineFailure) as exc_info:
+        web_search._html_results(
+            "<html><body>search response changed</body></html>",
+            re.compile(r"never-matches"),
+            [],
+            "fake",
+            5,
+        )
+
+    assert exc_info.value.status == "parse_error"
 
 
 def test_local_environment_uses_bash_and_noninteractive_environment():
@@ -222,6 +433,33 @@ def test_editor_action_parses_structured_fields():
             "tool_call_id": "edit_1",
         }
     ]
+
+
+def test_web_search_action_parses_queries():
+    tool_call = SimpleNamespace(
+        id="search_1",
+        function=SimpleNamespace(name="web_search", arguments='{"queries":["今天的新闻","市场快讯"]}'),
+    )
+
+    assert parse_toolcall_actions([tool_call], format_error_template="{{ error }}") == [
+        {
+            "tool": "web_search",
+            "queries": ["今天的新闻", "市场快讯"],
+            "tool_call_id": "search_1",
+        }
+    ]
+
+
+def test_web_search_action_rejects_empty_query():
+    tool_call = SimpleNamespace(
+        id="search_1",
+        function=SimpleNamespace(name="web_search", arguments='{"queries":["  "]}'),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        parse_toolcall_actions([tool_call], format_error_template="{{ error }}")
+
+    assert "queries 每一项都必须是非空字符串" in exc_info.value.messages[0]["content"]
 
 
 def test_editor_action_requires_operation_specific_fields():
@@ -455,6 +693,29 @@ def test_bash_policy_allows_redirects_to_tmp(tmp_path):
     assert analyze_bash_command("printf x > /tmp/minisweagent-output", str(tmp_path)) is None
 
 
+def test_bash_policy_requires_approval_for_quoted_heredoc(tmp_path):
+    command = "python3 - <<'EOF'\nprint('ok')\nEOF"
+
+    risk = analyze_bash_command(command, str(tmp_path))
+
+    assert risk is not None
+    assert risk.hard_denied is False
+    assert "无法可靠解析 Bash 语法" in risk.reason
+
+
+def test_local_environment_handles_quoted_heredoc_parse_error(tmp_path):
+    command = "python3 - <<'EOF'\nprint('ok')\nEOF"
+    env = LocalEnvironment(
+        cwd=str(tmp_path),
+        approval_callback=lambda _command, _reason: False,
+    )
+
+    with pytest.raises(CommandNotApproved) as exc_info:
+        env.execute({"command": command})
+
+    assert exc_info.value.messages[0]["extra"]["exit_status"] == "CommandNotApproved"
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -601,12 +862,14 @@ def test_cli_detects_only_direct_answer_as_streamed():
     assert mini._submission_was_streamed(tool_agent) is False
 
 
-def test_cli_session_keeps_context_until_exit(monkeypatch):
+def test_cli_session_keeps_context_until_exit(tmp_path, monkeypatch):
+    session_path = tmp_path / ".sessions" / "session.json"
     agent = DefaultAgent(
         DirectAnswerModel(),
         LocalEnvironment(timeout=5),
         system_template="你是助手。",
         instance_template="{{ task }}",
+        output_path=session_path,
     )
     requests = iter(["第二个问题", "/exit"])
     monkeypatch.setattr(mini, "terminal_prompt", lambda _label: next(requests))
@@ -614,6 +877,11 @@ def test_cli_session_keeps_context_until_exit(monkeypatch):
     mini._run_session(agent, "第一个问题", interactive=True)
 
     assert [message["content"] for message in agent.messages if message["role"] == "user"] == [
+        "第一个问题",
+        "第二个问题",
+    ]
+    saved = json.loads(session_path.read_text())
+    assert [message["content"] for message in saved["messages"] if message["role"] == "user"] == [
         "第一个问题",
         "第二个问题",
     ]
@@ -708,7 +976,7 @@ class _FakeTextStream:
         )
 
 
-def test_deepseek_model_streams_and_emits_only_bash_tool_call(monkeypatch, capsys):
+def test_deepseek_model_streams_and_emits_configured_tool_calls(monkeypatch, capsys):
     monkeypatch.setenv("DS_KEY", "test")
     model = DeepSeekModel(retry_attempts=1, thinking=True)
     captured = {}
@@ -731,7 +999,9 @@ def test_deepseek_model_streams_and_emits_only_bash_tool_call(monkeypatch, capsy
     assert captured["timeout"] == 60
     assert captured["extra_body"] == {"thinking": {"type": "enabled"}}
     assert captured["tools"][0]["function"]["name"] == "bash"
-    assert [tool["function"]["name"] for tool in captured["tools"]] == ["bash", "str_replace_editor"]
+    assert [tool["function"]["name"] for tool in captured["tools"]] == [
+        "bash", "str_replace_editor", "web_search"
+    ]
     assert message["extra"]["actions"] == [
         {"tool": "bash", "command": "printf MODEL_OK", "tool_call_id": "call_1"}
     ]

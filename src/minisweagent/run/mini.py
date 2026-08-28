@@ -2,7 +2,9 @@
 """Run the single-model DeepSeek Bash agent."""
 
 import os
+import secrets
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,14 @@ DEFAULT_CONFIG_FILE = Path(
 )
 console = Console(highlight=False)
 app = typer.Typer(add_completion=False)
+
+
+def _new_session_record() -> tuple[Path, str, str]:
+    """为一次 CLI 会话生成可排序且低碰撞的轨迹路径和元数据。"""
+    started_at = datetime.now().astimezone()
+    timestamp = started_at.strftime("%Y%m%d-%H%M%S-%f")
+    session_id = f"{timestamp}-{secrets.token_hex(4)}"
+    return Path.cwd() / ".sessions" / f"{session_id}.json", session_id, started_at.isoformat()
 
 
 def _submission_was_streamed(agent: Any) -> bool:
@@ -78,10 +88,18 @@ def main(
     ),
     timeout: int | None = typer.Option(None, "--timeout", min=1, help="Bash timeout in seconds."),
 ) -> Any:
-    """Run DeepSeek V4 Flash with one Bash tool in the current directory."""
+    """Run DeepSeek V4 Flash with host-owned Bash, editor, and web search tools."""
     settings = get_config_from_spec(config)
+    configured_output = settings.get("agent", {}).get("output_path")
+    session_output, session_id, session_started_at = _new_session_record()
     overrides = {
-        "agent": {"output_path": output or UNSET, "step_limit": step_limit if step_limit is not None else UNSET},
+        "agent": {
+            "output_path": output or configured_output or session_output,
+            "session_id": session_id,
+            "session_started_at": session_started_at,
+            "session_cwd": str(Path.cwd()),
+            "step_limit": step_limit if step_limit is not None else UNSET,
+        },
         "environment": {"timeout": timeout if timeout is not None else UNSET},
     }
     settings = recursive_merge(settings, overrides)
