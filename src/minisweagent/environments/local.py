@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.editor import execute_editor
+from minisweagent.environments.web_fetch import execute_web_fetch
 from minisweagent.environments.web_search import (
     DEFAULT_SEARCH_ENGINES,
     execute_web_search,
@@ -65,6 +66,11 @@ class LocalEnvironment:
             return self._execute_editor(action, cwd)
         if action.get("tool") == "web_search":
             return self._execute_web_search(action, timeout=timeout)
+        if action.get("tool") == "web_fetch":
+            return execute_web_fetch(
+                action.get("url", ""),
+                timeout=timeout if timeout is not None else self.config.timeout,
+            )
         command = action.get("command", "")
         cwd = action.get("workdir") or cwd or self.config.cwd or os.getcwd()
         global_timeout = timeout if timeout is not None else self.config.timeout

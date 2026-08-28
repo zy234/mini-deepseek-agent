@@ -82,7 +82,25 @@ WEB_SEARCH_TOOL = {
         },
     },
 }
-TOOL_DEFINITIONS = [BASH_TOOL, EDITOR_TOOL, WEB_SEARCH_TOOL]
+WEB_FETCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_fetch",
+        "description": "打开 web_search 返回的一个 URL，提取页面标题、可识别的发布时间和正文文本。仅用于查看具体来源，不要批量抓取。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "完整的 http 或 https 网页地址，通常来自 web_search 的结果",
+                }
+            },
+            "required": ["url"],
+            "additionalProperties": False,
+        },
+    },
+}
+TOOL_DEFINITIONS = [BASH_TOOL, EDITOR_TOOL, WEB_SEARCH_TOOL, WEB_FETCH_TOOL]
 
 def parse_toolcall_actions(
     tool_calls: list, *, format_error_template: str, template_kwargs: dict | None = None
@@ -116,7 +134,7 @@ def parse_toolcall_actions(
         except Exception as e:
             error_msg = f"无法解析工具参数：{e}。"
         tool_name = tool_call.function.name
-        if tool_name not in {"bash", "str_replace_editor", "web_search"}:
+        if tool_name not in {"bash", "str_replace_editor", "web_search", "web_fetch"}:
             error_msg += f"未知工具：{tool_name}。"
         if not isinstance(args, dict):
             error_msg += f"{tool_name} 工具参数必须是对象。"
@@ -127,11 +145,15 @@ def parse_toolcall_actions(
             error_msg += _validate_editor_args(args)
         elif tool_name == "web_search":
             error_msg += _validate_web_search_args(args)
+        elif tool_name == "web_fetch":
+            error_msg += _validate_web_fetch_args(args)
         if isinstance(args, dict):
             if tool_name == "bash":
                 allowed = {"command", "workdir", "timeout", "description"}
             elif tool_name == "web_search":
                 allowed = {"queries"}
+            elif tool_name == "web_fetch":
+                allowed = {"url"}
             else:
                 allowed = {
                     "command",
@@ -168,6 +190,10 @@ def parse_toolcall_actions(
         action = {"tool": tool_name, "tool_call_id": tool_call.id}
         if tool_name == "web_search":
             action["queries"] = args["queries"]
+            actions.append(action)
+            continue
+        if tool_name == "web_fetch":
+            action["url"] = args["url"]
             actions.append(action)
             continue
         action["command"] = args["command"]
@@ -214,6 +240,13 @@ def _validate_web_search_args(args: dict) -> str:
         return "web_search 的 queries 必须是包含 1 到 4 项的数组。"
     if any(not isinstance(query, str) or not query.strip() for query in queries):
         return "web_search 的 queries 每一项都必须是非空字符串。"
+    return ""
+
+
+def _validate_web_fetch_args(args: dict) -> str:
+    url = args.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return "web_fetch 的 url 必须是非空字符串。"
     return ""
 
 

@@ -23,7 +23,7 @@ BASE_URL = "https://api.deepseek.com"
 DEFAULT_API_TIMEOUT_SECONDS = 60.0
 
 DEFAULT_OBSERVATION_TEMPLATE = """
-{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "exit_code": {{ output.exit_code | tojson }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "termination": {{ output.termination | tojson }}, "path": {{ output.get("path") | tojson }}, "operation": {{ output.get("operation") | tojson }}, "content_hash": {{ output.get("content_hash") | tojson }}, "error_code": {{ output.get("extra", {}).get("error_code") | tojson }}, "attempts": {{ output.get("extra", {}).get("attempts", []) | tojson }}, "stdout": {{ output.stdout | tojson }}, "stderr": {{ output.stderr | tojson }}, "stdout_truncated": {{ output.stdout_truncated | tojson }}, "stderr_truncated": {{ output.stderr_truncated | tojson }}{% if output.stdout_spill_path %}, "stdout_spill_path": {{ output.stdout_spill_path | tojson }}{% endif %}{% if output.stderr_spill_path %}, "stderr_spill_path": {{ output.stderr_spill_path | tojson }}{% endif %}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
+{"status": {{ output.status | tojson }}, "returncode": {{ output.returncode }}, "exit_code": {{ output.exit_code | tojson }}, "timed_out": {{ output.timed_out | tojson }}, "signal": {{ output.signal | tojson }}, "termination": {{ output.termination | tojson }}, "path": {{ output.get("path") | tojson }}, "operation": {{ output.get("operation") | tojson }}, "content_hash": {{ output.get("content_hash") | tojson }}, "error_code": {{ output.get("extra", {}).get("error_code") | tojson }}, "attempts": {{ output.get("extra", {}).get("attempts", []) | tojson }}, "page": {{ output.get("extra", {}).get("page", {}) | tojson }}, "stdout": {{ output.stdout | tojson }}, "stderr": {{ output.stderr | tojson }}, "stdout_truncated": {{ output.stdout_truncated | tojson }}, "stderr_truncated": {{ output.stderr_truncated | tojson }}{% if output.stdout_spill_path %}, "stdout_spill_path": {{ output.stdout_spill_path | tojson }}{% endif %}{% if output.stderr_spill_path %}, "stderr_spill_path": {{ output.stderr_spill_path | tojson }}{% endif %}{% if output.exception_info %}, "exception_info": {{ output.exception_info | tojson }}{% endif %}}
 """.strip()
 
 DEFAULT_FORMAT_ERROR_TEMPLATE = """
@@ -35,7 +35,7 @@ DEFAULT_FORMAT_ERROR_TEMPLATE = """
 
 如果需要修改文件，请使用 str_replace_editor 工具；先用 view 查看，再用 str_replace、insert 或 create 修改。
 
-如果需要当前网络信息，请使用仓库自带的 web_search；它不需要 DS_KEY，并应在最终答复中引用返回的 URL。
+如果需要当前网络信息，请先使用 web_search 搜索；需要查看某篇具体文章时，再使用 web_fetch 打开搜索结果中的 URL。两者都不需要 DS_KEY，并应在最终答复中引用来源 URL。
 
 如果任务已经可以回答，请直接返回中文最终答复，不要强行调用工具。
 """.strip()

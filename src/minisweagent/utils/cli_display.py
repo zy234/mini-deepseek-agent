@@ -110,6 +110,14 @@ def render_tool_actions(actions: list[dict[str, Any]], *, stream: TextIO | None 
                 stream=stream,
             )
             continue
+        if tool_name == "web_fetch":
+            stream.write(_paint(stream, "URL\n", COLORS["工具"]))
+            _render_preview(
+                str(action.get("url", "")),
+                label=f"工具调用 {index} 的 URL",
+                stream=stream,
+            )
+            continue
         stream.write(_paint(stream, "命令\n", COLORS["工具"]))
         _render_preview(
             str(action.get("command", "")),

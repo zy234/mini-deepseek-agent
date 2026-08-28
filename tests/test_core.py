@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from minisweagent.agents.default import DefaultAgent
-from minisweagent.environments import editor, web_search
+from minisweagent.environments import editor, web_fetch, web_search
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.exceptions import CommandNotApproved, Submitted
@@ -282,6 +282,47 @@ def test_bing_rss_parser_returns_structured_sources(monkeypatch):
     assert results[0].source_engine == "bing_rss"
 
 
+def test_web_fetch_extracts_title_date_and_visible_content(monkeypatch):
+    payload = """<!doctype html><html><head><title>测试文章</title>
+    <meta property="article:published_time" content="2026-08-28T10:00:00+08:00">
+    <style>.hidden { display: none }</style></head><body>
+    <h1>测试文章</h1><p>这是正文内容。</p><script>alert('ignore')</script>
+    </body></html>"""
+    monkeypatch.setattr(
+        web_fetch,
+        "_http_get",
+        lambda _url, *, timeout: (payload, "text/html", "utf-8"),
+    )
+
+    result = web_fetch.execute_web_fetch("https://example.test/article?utm_source=test", timeout=2)
+
+    assert result["status"] == "success"
+    assert result["extra"]["page"]["title"] == "测试文章"
+    assert result["extra"]["page"]["published_at"] == "2026-08-28T10:00:00+08:00"
+    assert "这是正文内容。" in result["stdout"]
+    assert "alert" not in result["stdout"]
+    assert result["extra"]["page"]["content_type"] == "text/html"
+
+
+def test_web_fetch_rejects_non_http_urls():
+    result = web_fetch.execute_web_fetch("file:///tmp/article.html", timeout=2)
+
+    assert result["status"] == "error"
+    assert result["extra"]["error_code"] == "WEB_INVALID_ARGUMENT"
+
+
+def test_web_fetch_reports_network_errors(monkeypatch):
+    def fail(_url, *, timeout):
+        raise web_fetch.WebFetchError("网页网络请求失败：连接超时", "WEB_FETCH_NETWORK_ERROR")
+
+    monkeypatch.setattr(web_fetch, "_http_get", fail)
+    result = web_fetch.execute_web_fetch("https://example.test/article", timeout=2)
+
+    assert result["status"] == "error"
+    assert result["extra"]["error_code"] == "WEB_FETCH_NETWORK_ERROR"
+    assert "连接超时" in result["stderr"]
+
+
 def test_html_parser_reports_changed_result_structure():
     with pytest.raises(web_search.EngineFailure) as exc_info:
         web_search._html_results(
@@ -460,6 +501,33 @@ def test_web_search_action_rejects_empty_query():
         parse_toolcall_actions([tool_call], format_error_template="{{ error }}")
 
     assert "queries 每一项都必须是非空字符串" in exc_info.value.messages[0]["content"]
+
+
+def test_web_fetch_action_parses_url():
+    tool_call = SimpleNamespace(
+        id="fetch_1",
+        function=SimpleNamespace(name="web_fetch", arguments='{"url":"https://example.test/article"}'),
+    )
+
+    assert parse_toolcall_actions([tool_call], format_error_template="{{ error }}") == [
+        {
+            "tool": "web_fetch",
+            "url": "https://example.test/article",
+            "tool_call_id": "fetch_1",
+        }
+    ]
+
+
+def test_web_fetch_action_rejects_empty_url():
+    tool_call = SimpleNamespace(
+        id="fetch_1",
+        function=SimpleNamespace(name="web_fetch", arguments='{"url":"  "}'),
+    )
+
+    with pytest.raises(Exception) as exc_info:
+        parse_toolcall_actions([tool_call], format_error_template="{{ error }}")
+
+    assert "web_fetch 的 url 必须是非空字符串" in exc_info.value.messages[0]["content"]
 
 
 def test_editor_action_requires_operation_specific_fields():
@@ -1000,7 +1068,7 @@ def test_deepseek_model_streams_and_emits_configured_tool_calls(monkeypatch, cap
     assert captured["extra_body"] == {"thinking": {"type": "enabled"}}
     assert captured["tools"][0]["function"]["name"] == "bash"
     assert [tool["function"]["name"] for tool in captured["tools"]] == [
-        "bash", "str_replace_editor", "web_search"
+        "bash", "str_replace_editor", "web_search", "web_fetch"
     ]
     assert message["extra"]["actions"] == [
         {"tool": "bash", "command": "printf MODEL_OK", "tool_call_id": "call_1"}
