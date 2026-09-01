@@ -101,9 +101,24 @@ WEB_FETCH_TOOL = {
     },
 }
 TOOL_DEFINITIONS = [BASH_TOOL, EDITOR_TOOL, WEB_SEARCH_TOOL, WEB_FETCH_TOOL]
+TOOL_DEFINITIONS_BY_NAME = {tool["function"]["name"]: tool for tool in TOOL_DEFINITIONS}
+
+
+def get_tool_definitions(names: list[str] | None) -> list[dict]:
+    """按角色配置缩小工具集合；未配置时保留全部工具。"""
+    if names is None:
+        return TOOL_DEFINITIONS
+    unknown = set(names) - set(TOOL_DEFINITIONS_BY_NAME)
+    if unknown:
+        raise ValueError(f"未知工具：{', '.join(sorted(unknown))}")
+    return [TOOL_DEFINITIONS_BY_NAME[name] for name in names]
 
 def parse_toolcall_actions(
-    tool_calls: list, *, format_error_template: str, template_kwargs: dict | None = None
+    tool_calls: list,
+    *,
+    format_error_template: str,
+    template_kwargs: dict | None = None,
+    allowed_tools: set[str] | None = None,
 ) -> list[dict]:
     """Parse tool calls from the response. Raises FormatError if unknown tool or invalid args.
 
@@ -136,6 +151,8 @@ def parse_toolcall_actions(
         tool_name = tool_call.function.name
         if tool_name not in {"bash", "str_replace_editor", "web_search", "web_fetch"}:
             error_msg += f"未知工具：{tool_name}。"
+        elif allowed_tools is not None and tool_name not in allowed_tools:
+            error_msg += f"当前 Agent 不允许使用工具：{tool_name}。"
         if not isinstance(args, dict):
             error_msg += f"{tool_name} 工具参数必须是对象。"
         elif tool_name == "bash":

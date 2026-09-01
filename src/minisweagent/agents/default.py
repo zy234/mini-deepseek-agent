@@ -8,6 +8,7 @@ import sys
 import time
 import traceback
 from pathlib import Path
+from typing import Literal
 
 from jinja2 import StrictUndefined, Template
 from pydantic import BaseModel
@@ -39,6 +40,12 @@ class AgentConfig(BaseModel):
     """Local ISO-8601 start time assigned to a CLI session."""
     session_cwd: str = ""
     """Current directory from which the CLI session was started."""
+    agent_name: str = "default"
+    """本次运行选择的角色名称。"""
+    flow: Literal["iterative", "single_shot"] = "iterative"
+    """角色使用的执行流程。"""
+    tools: list[str] | None = None
+    """模型可见的工具；None 表示全部宿主工具。"""
 
 
 class DefaultAgent:
@@ -170,7 +177,8 @@ class DefaultAgent:
             )
         self.n_calls += 1
         self._turn_calls += 1
-        message = self.model.query(self.messages)
+        kwargs = {"tools": self.config.tools} if self.config.tools is not None else {}
+        message = self.model.query(self.messages, **kwargs)
         self.add_messages(message)
         return message
 

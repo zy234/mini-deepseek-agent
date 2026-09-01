@@ -26,6 +26,39 @@ console = Console(highlight=False)
 app = typer.Typer(add_completion=False)
 
 
+def _select_agent_name(profiles: dict, requested: str | None) -> str:
+    """校验指定角色，或在交互终端显示简单的编号选择。"""
+    if not profiles:
+        raise ValueError("配置中没有 agents")
+    if requested:
+        if requested not in profiles:
+            raise ValueError(f"未知 Agent：{requested}；可选值：{', '.join(profiles)}")
+        return requested
+    if not sys.stdin.isatty():
+        raise ValueError("非交互运行必须使用 --agent 指定角色")
+
+    console.print("[bold]选择 Agent[/bold]")
+    names = list(profiles)
+    for index, name in enumerate(names, 1):
+        description = profiles[name].get("description", "")
+        suffix = f" - {description}" if description else ""
+        console.print(f"  {index}. {name}{suffix}")
+    while True:
+        choice = terminal_prompt("Agent: ").strip()
+        if choice in profiles:
+            return choice
+        if choice.isdigit() and 1 <= int(choice) <= len(names):
+            return names[int(choice) - 1]
+        console.print("请输入角色名称或列表中的编号。")
+
+
+def _get_agent_settings(settings: dict, agent_name: str) -> dict:
+    """将公共 Agent 配置与所选角色配置合并。"""
+    profile = dict(settings["agents"][agent_name])
+    profile.pop("description", None)
+    return recursive_merge(settings.get("agent", {}), profile, {"agent_name": agent_name})
+
+
 def _new_session_record() -> tuple[Path, str, str]:
     """为一次 CLI 会话生成可排序且低碰撞的轨迹路径和元数据。"""
     started_at = datetime.now().astimezone()
@@ -82,6 +115,9 @@ def main(
     config: Path = typer.Option(
         DEFAULT_CONFIG_FILE, "-c", "--config", help="Agent YAML configuration."
     ),
+    agent_name: str | None = typer.Option(
+        None, "--agent", help="Agent 角色；交互终端省略时显示选择列表。"
+    ),
     output: Path | None = typer.Option(
         None, "-o", "--output", help="Save the trajectory JSON here."
     ),
@@ -92,24 +128,27 @@ def main(
 ) -> Any:
     """Run DeepSeek V4 Flash with host-owned Bash, editor, and web search tools."""
     settings = get_config_from_spec(config)
-    configured_output = settings.get("agent", {}).get("output_path")
+    agent_name = _select_agent_name(settings.get("agents", {}), agent_name)
+    agent_settings = _get_agent_settings(settings, agent_name)
+    configured_output = agent_settings.get("output_path")
     session_output, session_id, session_started_at = _new_session_record()
-    overrides = {
-        "agent": {
-            "output_path": output or configured_output or session_output,
-            "session_id": session_id,
-            "session_started_at": session_started_at,
-            "session_cwd": str(Path.cwd()),
-            "step_limit": step_limit if step_limit is not None else UNSET,
-        },
-        "environment": {"timeout": timeout if timeout is not None else UNSET},
+    agent_overrides = {
+        "output_path": output or configured_output or session_output,
+        "session_id": session_id,
+        "session_started_at": session_started_at,
+        "session_cwd": str(Path.cwd()),
+        "step_limit": step_limit if step_limit is not None else UNSET,
     }
-    settings = recursive_merge(settings, overrides)
+    agent_settings = recursive_merge(agent_settings, agent_overrides)
+    environment_settings = recursive_merge(
+        settings.get("environment", {}),
+        {"timeout": timeout if timeout is not None else UNSET},
+    )
     task = task or terminal_prompt("Task: ")
 
     model = get_model(settings.get("model", {}))
-    environment = get_environment(settings.get("environment", {}))
-    agent = get_agent(model, environment, settings.get("agent", {}))
+    environment = get_environment(environment_settings)
+    agent = get_agent(model, environment, agent_settings)
     _run_session(agent, task, interactive=sys.stdin.isatty())
     return agent
 

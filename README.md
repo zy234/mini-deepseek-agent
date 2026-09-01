@@ -1,6 +1,6 @@
 # DeepSeek Bash Agent
 
-这是一个从 mini-SWE-agent 精简出来的单模型 Agent 框架：模型固定为 `deepseek-v4-flash`，提供 host-owned 的 `bash`、`str_replace_editor`、`web_search` 和 `web_fetch` 四个工具。网页能力由仓库自带的零 Key 实现提供。
+这是一个从 mini-SWE-agent 精简出来的单模型 Agent 框架：模型固定为 `deepseek-v4-flash`，不同角色可以配置独立的中文 prompt、工具集合和执行流程。宿主提供 `bash`、`str_replace_editor`、`web_search` 和 `web_fetch` 四个工具，网页能力由仓库自带的零 Key 实现提供。
 
 ## 安装
 
@@ -20,19 +20,28 @@ export DS_KEY="your-key"
 ## 运行
 
 ```bash
-mini -t "修复当前项目中的测试失败，并运行相关测试"
+mini
+```
+
+交互终端会先显示 Agent 列表，选择角色后再输入任务。也可以显式指定角色，适合脚本和非交互运行：
+
+```bash
+mini --agent coding -t "修复当前项目中的测试失败，并运行相关测试"
 ```
 
 默认工作目录是启动命令所在目录。可选参数：
 
 ```bash
+mini --agent chat
 mini --config path/to/agent.yaml
 mini --output trajectory.json
 mini --step-limit 20
 mini --timeout 60
 ```
 
-运行期间会流式显示模型思考、回复、工具调用和工具结果。当前请求使用 `tool_choice: auto`，
+`deepseek.yaml` 中的 `agents` 保存角色定义。`iterative` 会持续执行模型、工具、观察循环；`single_shot` 只请求模型一次且不提供工具。新增相同流程的角色只需增加 YAML 配置，不需要新增 Python 类。
+
+运行期间会流式显示模型思考、回复、工具调用和工具结果。有工具的角色使用 `tool_choice: auto`，
 以兼容 DeepSeek thinking mode；模型可以直接回答，只有确实需要本地操作或当前网络信息时才调用工具。
 终端默认按思考、工具调用和工具结果分段显示；Bash、文件编辑、网页搜索和网页抓取调用会显示可读的参数，不直接输出粘连的 JSON。每段超过 1000 个字符时只显示摘要，运行期间不会询问是否展开；当前轮结束后输入 `/open` 可主动查看完整内容。该限制只影响 CLI 显示，不影响模型收到的工具结果。DeepSeek SDK 和单次 API 请求的超时均为 60 秒。
 
@@ -67,24 +76,26 @@ Bash 命令通过 `bashlex` 解析为语法树：`ls`、`rg`、`cat`、非原地
 
 ```text
 CLI
- └── DefaultAgent
-      ├── DeepSeekModel
-      │    └── 工具协议：bash、str_replace_editor、web_search、web_fetch
-      ├── LocalEnvironment
-      │    ├── subprocess 执行 Bash
-      │    ├── 工作区内原子文件编辑
-      │    ├── 仓库自带的零 Key 多引擎网页搜索
-      │    └── 仓库自带的网页正文抓取
-      └── .sessions/YYYYMMDD/<session-id>.json
+ ├── Agent 角色选择
+ └── iterative / single_shot
+     ├── DeepSeekModel
+     │    └── 角色允许的工具协议
+     ├── LocalEnvironment
+     │    ├── subprocess 执行 Bash
+     │    ├── 工作区内原子文件编辑
+     │    ├── 仓库自带的零 Key 多引擎网页搜索
+     │    └── 仓库自带的网页正文抓取
+     └── .sessions/YYYYMMDD/<session-id>.json
 ```
 
-- `src/minisweagent/agents/default.py`：维护消息、调用次数、步数限制和完成状态。
+- `src/minisweagent/agents/default.py`：`iterative` 流程，维护消息、调用次数、步数限制和完成状态。
+- `src/minisweagent/agents/single_shot.py`：只进行一次模型调用且不使用工具。
 - `src/minisweagent/models/deepseek_model.py`：通过 OpenAI SDK 请求 DeepSeek，解析四类工具调用。
 - `src/minisweagent/environments/local.py`：在本地工作目录执行 Bash，并捕获输出、返回码和超时。
 - `src/minisweagent/environments/web_search.py`：执行零 Key 多引擎搜索，解析、去重并返回引擎诊断。
 - `src/minisweagent/environments/web_fetch.py`：抓取单个网页并提取标题、发布时间和正文。
 - `src/minisweagent/models/utils/actions_toolcall.py`：定义 Bash、编辑器、网页搜索和网页抓取工具及 tool 结果消息。
-- `src/minisweagent/config/deepseek.yaml`：系统提示词、任务提示词和运行参数。
+- `src/minisweagent/config/deepseek.yaml`：角色 prompt、工具、流程和公共运行参数。
 
 Agent 通过一条 Bash 命令输出完成标记和最终报告：
 

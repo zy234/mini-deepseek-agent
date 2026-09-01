@@ -10,8 +10,8 @@ from openai import OpenAI
 from pydantic import BaseModel, ConfigDict
 
 from minisweagent.models.utils.actions_toolcall import (
-    TOOL_DEFINITIONS,
     format_toolcall_observation_messages,
+    get_tool_definitions,
     parse_toolcall_actions,
 )
 from minisweagent.utils.cli_display import StreamRenderer, render_tool_actions
@@ -65,16 +65,19 @@ class DeepSeekModel:
         # This applies the 60-second limit to SDK connect/read/write/pool operations.
         self.client = OpenAI(api_key=api_key, base_url=BASE_URL, timeout=self.config.api_timeout_seconds)
 
-    def query(self, messages: list[dict[str, Any]], **_kwargs) -> dict:
+    def query(self, messages: list[dict[str, Any]], **kwargs) -> dict:
+        tool_names = kwargs.get("tools")
+        tools = get_tool_definitions(tool_names)
         request = {
             "model": MODEL_NAME,
             "messages": self._api_messages(messages),
-            "tools": TOOL_DEFINITIONS,
-            "tool_choice": "auto",
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
             "stream": True,
         }
+        if tools:
+            request["tools"] = tools
+            request["tool_choice"] = "auto"
         request["extra_body"] = {
             "thinking": {"type": "enabled" if self.config.thinking else "disabled"}
         }
@@ -87,6 +90,7 @@ class DeepSeekModel:
                 tool_calls,
                 format_error_template=self.config.format_error_template,
                 template_kwargs={"finish_reason": finish_reason},
+                allowed_tools=set(tool_names) if tool_names is not None else None,
             )
             if self.config.stream_output:
                 render_tool_actions(actions)

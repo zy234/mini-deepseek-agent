@@ -7,11 +7,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from minisweagent.agents import get_agent
 from minisweagent.agents.default import DefaultAgent
+from minisweagent.agents.single_shot import SingleShotAgent
 from minisweagent.environments import editor, web_fetch, web_search
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.local import LocalEnvironment
-from minisweagent.exceptions import CommandNotApproved, Submitted
+from minisweagent.exceptions import CommandNotApproved, FormatError, Submitted
 from minisweagent.models.deepseek_model import DEFAULT_OBSERVATION_TEMPLATE, DeepSeekModel
 from minisweagent.models.utils.actions_toolcall import (
     format_toolcall_observation_messages,
@@ -849,7 +851,9 @@ def test_local_environment_extracts_submission():
 
 
 class DirectAnswerModel(FakeModel):
-    def query(self, messages):
+    def query(self, messages, **kwargs):
+        self.calls += 1
+        self.query_kwargs = kwargs
         return {"role": "assistant", "content": "直接回答，不需要工具。", "extra": {"actions": []}}
 
 
@@ -862,6 +866,123 @@ def test_agent_can_finish_without_using_bash():
     )
 
     assert agent.run("回答问题") == {"exit_status": "Submitted", "submission": "直接回答，不需要工具。"}
+
+
+def test_get_agent_selects_single_shot_flow():
+    model = DirectAnswerModel()
+    agent = get_agent(
+        model,
+        LocalEnvironment(timeout=5),
+        {
+            "agent_name": "summary",
+            "flow": "single_shot",
+            "tools": [],
+            "system_template": "你是总结助手。",
+            "instance_template": "{{ task }}",
+        },
+    )
+
+    result = agent.run("总结内容")
+
+    assert isinstance(agent, SingleShotAgent)
+    assert result == {"exit_status": "Submitted", "submission": "直接回答，不需要工具。"}
+    assert model.calls == 1
+    assert model.query_kwargs == {"tools": []}
+    assert agent.config.agent_name == "summary"
+
+
+def test_single_shot_rejects_tools():
+    with pytest.raises(ValueError, match="single_shot flow 不支持工具"):
+        get_agent(
+            DirectAnswerModel(),
+            LocalEnvironment(timeout=5),
+            {
+                "flow": "single_shot",
+                "tools": ["bash"],
+                "system_template": "你是助手。",
+                "instance_template": "{{ task }}",
+            },
+        )
+
+
+def test_single_shot_does_not_retry_agent_format_errors():
+    class InvalidModel(FakeModel):
+        def query(self, messages, **kwargs):
+            self.calls += 1
+            raise FormatError({"role": "user", "content": "格式错误"})
+
+    model = InvalidModel()
+    agent = get_agent(
+        model,
+        LocalEnvironment(timeout=5),
+        {
+            "flow": "single_shot",
+            "tools": [],
+            "system_template": "你是助手。",
+            "instance_template": "{{ task }}",
+        },
+    )
+
+    result = agent.run("回答")
+
+    assert result["exit_status"] == "RepeatedFormatError"
+    assert model.calls == 1
+
+
+def test_role_cannot_call_a_hidden_tool():
+    call = SimpleNamespace(
+        id="call_hidden",
+        function=SimpleNamespace(name="web_fetch", arguments='{"url":"https://example.test"}'),
+    )
+
+    with pytest.raises(FormatError) as exc_info:
+        parse_toolcall_actions(
+            [call],
+            format_error_template="{{ error }}",
+            allowed_tools={"bash"},
+        )
+    assert "当前 Agent 不允许使用工具：web_fetch" in exc_info.value.messages[0]["content"]
+
+
+def test_cli_selects_agent_interactively(monkeypatch):
+    profiles = {
+        "default": {"description": "默认角色"},
+        "single_shot": {"description": "单次回答"},
+    }
+    monkeypatch.setattr(mini.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(mini, "terminal_prompt", lambda _label: "2")
+
+    assert mini._select_agent_name(profiles, None) == "single_shot"
+    assert mini._select_agent_name(profiles, "default") == "default"
+
+
+def test_cli_requires_agent_name_when_not_interactive(monkeypatch):
+    monkeypatch.setattr(mini.sys.stdin, "isatty", lambda: False)
+
+    with pytest.raises(ValueError, match="--agent"):
+        mini._select_agent_name({"default": {}}, None)
+
+
+def test_cli_merges_common_and_role_agent_settings():
+    settings = {
+        "agent": {"step_limit": 3, "max_consecutive_format_errors": 2},
+        "agents": {
+            "reviewer": {
+                "description": "审查角色",
+                "flow": "single_shot",
+                "tools": [],
+                "system_template": "你是审查助手。",
+                "instance_template": "{{ task }}",
+            }
+        },
+    }
+
+    merged = mini._get_agent_settings(settings, "reviewer")
+
+    assert merged["agent_name"] == "reviewer"
+    assert merged["step_limit"] == 3
+    assert merged["flow"] == "single_shot"
+    assert "description" not in merged
 
 
 def test_agent_continues_with_existing_conversation():
@@ -1103,6 +1224,22 @@ def test_deepseek_model_accepts_direct_answer(monkeypatch):
     assert message["content"] == "你好，我可以直接回答。"
     assert message["extra"]["actions"] == []
     assert "tool_calls" not in message
+
+
+def test_deepseek_model_omits_tools_for_single_shot(monkeypatch):
+    monkeypatch.setenv("DS_KEY", "test")
+    model = DeepSeekModel(retry_attempts=1, stream_output=False)
+    captured = {}
+
+    def create(**request):
+        captured.update(request)
+        return _FakeTextStream()
+
+    model.client.chat.completions.create = create
+    model.query([{"role": "user", "content": "直接回答"}], tools=[])
+
+    assert "tools" not in captured
+    assert "tool_choice" not in captured
 
 
 def test_deepseek_model_omits_empty_tool_calls_from_followup_request(monkeypatch):
