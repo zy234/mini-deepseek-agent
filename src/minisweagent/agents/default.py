@@ -267,5 +267,5 @@ class DefaultAgent:
         data = self.serialize(*extra_dicts)
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, indent=2))
+            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         return data

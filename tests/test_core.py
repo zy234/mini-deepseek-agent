@@ -84,7 +84,8 @@ def test_new_session_record_uses_current_directory_and_unique_sortable_name(tmp_
 
     path, session_id, started_at = mini._new_session_record()
 
-    assert path.parent == tmp_path / ".sessions"
+    session_day = datetime.fromisoformat(started_at).strftime("%Y%m%d")
+    assert path.parent == tmp_path / ".sessions" / session_day
     assert path.name == f"{session_id}.json"
     assert session_id.startswith("20")
     assert len(session_id.rsplit("-", 1)[-1]) == 8
@@ -954,6 +955,10 @@ def test_cli_session_keeps_context_until_exit(tmp_path, monkeypatch):
         "第一个问题",
         "第二个问题",
     ]
+    saved_text = session_path.read_text(encoding="utf-8")
+    assert "你是助手。" in saved_text
+    assert "第一个问题" in saved_text
+    assert "\\u4f60" not in saved_text
 
 
 class DangerousCommandModel(FakeModel):

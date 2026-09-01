@@ -15,7 +15,7 @@ export DS_KEY="your-key"
 ```
 
 
-未指定 `--output` 且配置未设置 `agent.output_path` 时，每次 CLI 会话会自动保存到当前目录的 `.sessions/`，文件名格式为 `YYYYMMDD-HHMMSS-microseconds-random.json`。轨迹包括会话 ID、开始时间、启动目录、完整消息、工具调用与结果、模型配置、环境配置和最终状态，便于后续排查。显式 `--output` 或 YAML 中的 `agent.output_path` 会覆盖这个默认路径。
+未指定 `--output` 且配置未设置 `agent.output_path` 时，每次 CLI 会话会以 UTF-8 JSON 保存到当前目录的 `.sessions/YYYYMMDD/`，中文直接显示，文件名格式为 `YYYYMMDD-HHMMSS-microseconds-random.json`。轨迹包括会话 ID、开始时间、启动目录、完整消息、工具调用与结果、模型配置、环境配置和最终状态，便于后续排查。显式 `--output` 或 YAML 中的 `agent.output_path` 会覆盖这个默认路径。
 
 ## 运行
 
@@ -75,7 +75,7 @@ CLI
       │    ├── 工作区内原子文件编辑
       │    ├── 仓库自带的零 Key 多引擎网页搜索
       │    └── 仓库自带的网页正文抓取
-      └── .sessions/<session-id>.json
+      └── .sessions/YYYYMMDD/<session-id>.json
 ```
 
 - `src/minisweagent/agents/default.py`：维护消息、调用次数、步数限制和完成状态。

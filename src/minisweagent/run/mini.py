@@ -29,9 +29,11 @@ app = typer.Typer(add_completion=False)
 def _new_session_record() -> tuple[Path, str, str]:
     """为一次 CLI 会话生成可排序且低碰撞的轨迹路径和元数据。"""
     started_at = datetime.now().astimezone()
+    day = started_at.strftime("%Y%m%d")
     timestamp = started_at.strftime("%Y%m%d-%H%M%S-%f")
     session_id = f"{timestamp}-{secrets.token_hex(4)}"
-    return Path.cwd() / ".sessions" / f"{session_id}.json", session_id, started_at.isoformat()
+    path = Path.cwd() / ".sessions" / day / f"{session_id}.json"
+    return path, session_id, started_at.isoformat()
 
 
 def _submission_was_streamed(agent: Any) -> bool:
