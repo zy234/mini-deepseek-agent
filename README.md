@@ -26,13 +26,13 @@ mini
 交互终端会先显示 Agent 列表，选择角色后再输入任务。也可以显式指定角色，适合脚本和非交互运行：
 
 ```bash
-mini --agent coding -t "修复当前项目中的测试失败，并运行相关测试"
+mini --agent interactive -t "修复当前项目中的测试失败，并运行相关测试"
 ```
 
 默认工作目录是启动命令所在目录。可选参数：
 
 ```bash
-mini --agent chat
+mini --agent single_call
 mini --config path/to/agent.yaml
 mini --output trajectory.json
 mini --step-limit 20
