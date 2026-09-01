@@ -1,4 +1,4 @@
-"""Configuration files and utilities for mini-SWE-agent."""
+"""Mini DeepSeek Agent 的配置文件和辅助函数。"""
 
 from pathlib import Path
 

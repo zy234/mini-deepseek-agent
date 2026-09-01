@@ -1,6 +1,6 @@
-# DeepSeek Bash Agent
+# Mini DeepSeek Agent
 
-这是一个从 mini-SWE-agent 精简出来的单模型 Agent 框架：模型固定为 `deepseek-v4-flash`，不同角色可以配置独立的中文 prompt、工具集合和执行流程。宿主提供 `bash`、`str_replace_editor`、`web_search` 和 `web_fetch` 四个工具，网页能力由仓库自带的零 Key 实现提供。
+这是一个围绕 DeepSeek 构建的小型 Agent：模型固定为 `deepseek-v4-flash`，不同角色可以配置独立的中文 prompt、工具集合和执行流程。宿主提供 `bash`、`str_replace_editor`、`web_search` 和 `web_fetch` 四个工具，网页能力由仓库自带的零 Key 实现提供。
 
 ## 安装
 

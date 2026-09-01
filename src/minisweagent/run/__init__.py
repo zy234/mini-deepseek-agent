@@ -1,1 +1,1 @@
-"""Run scripts for mini-SWE-agent."""
+"""Mini DeepSeek Agent 的运行入口。"""

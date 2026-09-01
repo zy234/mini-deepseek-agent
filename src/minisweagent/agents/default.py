@@ -1,6 +1,4 @@
-"""Basic agent class. See https://mini-swe-agent.com/latest/advanced/control_flow/ for visual explanation
-or https://minimal-agent.com for a tutorial on the basic building principles.
-"""
+"""Mini DeepSeek Agent 的基础迭代式 Agent。"""
 
 import json
 import logging
