@@ -1171,6 +1171,22 @@ class _FakeTextStream:
         )
 
 
+class _FakeTruncatedTextStream:
+    def __iter__(self):
+        return iter(
+            [
+                _FakeChunk(
+                    delta=SimpleNamespace(
+                        reasoning_content=None,
+                        content="不完整的回答",
+                        tool_calls=[],
+                    ),
+                    finish_reason="length",
+                )
+            ]
+        )
+
+
 def test_deepseek_model_streams_and_emits_configured_tool_calls(monkeypatch, capsys):
     monkeypatch.setenv("DS_KEY", "test")
     model = DeepSeekModel(retry_attempts=1, thinking=True)
@@ -1189,6 +1205,7 @@ def test_deepseek_model_streams_and_emits_configured_tool_calls(monkeypatch, cap
     )
 
     assert captured["model"] == "deepseek-v4-flash"
+    assert "max_tokens" not in captured
     assert captured["tool_choice"] == "auto"
     assert captured["stream"] is True
     assert captured["timeout"] == 60
@@ -1224,6 +1241,17 @@ def test_deepseek_model_accepts_direct_answer(monkeypatch):
     assert message["content"] == "你好，我可以直接回答。"
     assert message["extra"]["actions"] == []
     assert "tool_calls" not in message
+
+
+def test_deepseek_model_rejects_provider_truncated_response(monkeypatch):
+    monkeypatch.setenv("DS_KEY", "test")
+    model = DeepSeekModel(retry_attempts=1, stream_output=False)
+    model.client.chat.completions.create = lambda **_request: _FakeTruncatedTextStream()
+
+    with pytest.raises(FormatError) as exc_info:
+        model.query([{"role": "user", "content": "长回答"}])
+
+    assert "触达了提供方的输出上限" in exc_info.value.messages[0]["content"]
 
 
 def test_deepseek_model_omits_tools_for_single_shot(monkeypatch):

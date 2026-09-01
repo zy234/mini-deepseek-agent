@@ -30,6 +30,10 @@ DEFAULT_FORMAT_ERROR_TEMPLATE = """
 响应格式无法解析：
 {{ error }}
 
+{% if finish_reason | default("") in ["length", "max_tokens"] %}
+模型响应触达了提供方的输出上限，内容可能不完整。请压缩内容后重新完整回答。
+{% endif %}
+
 如果确实需要操作，请使用 bash 工具，并传入如下 JSON 参数：
 {"command": "要执行的命令", "workdir": "可选工作目录", "timeout": 30}
 
@@ -44,7 +48,6 @@ DEFAULT_FORMAT_ERROR_TEMPLATE = """
 class DeepSeekModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    max_tokens: int = 4096
     temperature: float = 0.0
     thinking: bool = False
     retry_attempts: int = 3
@@ -71,7 +74,6 @@ class DeepSeekModel:
         request = {
             "model": MODEL_NAME,
             "messages": self._api_messages(messages),
-            "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
             "stream": True,
         }
@@ -84,6 +86,12 @@ class DeepSeekModel:
 
         response = self._request(request)
         content, reasoning_content, tool_calls, finish_reason, usage = self._consume_stream(response)
+        if finish_reason in {"length", "max_tokens"}:
+            parse_toolcall_actions(
+                [],
+                format_error_template=self.config.format_error_template,
+                template_kwargs={"finish_reason": finish_reason},
+            )
         actions = []
         if tool_calls:
             actions = parse_toolcall_actions(

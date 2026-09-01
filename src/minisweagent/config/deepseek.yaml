@@ -58,7 +58,6 @@ environment:
     MANPAGER: cat
     LESS: -R
 model:
-  max_tokens: 4096
   temperature: 0
   thinking: true
   api_timeout_seconds: 60
