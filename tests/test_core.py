@@ -19,6 +19,7 @@ from minisweagent.models.utils.actions_toolcall import (
 )
 from minisweagent.run import mini
 from minisweagent.utils.cli_display import (
+    StreamRenderer,
     clear_recent_full_blocks,
     render_block,
     render_recent_full_blocks,
@@ -1155,6 +1156,26 @@ def test_cli_render_block_only_expands_on_explicit_open(capsys):
     expanded = capsys.readouterr().out
     assert "完整" in expanded
     assert expanded.count("x") == 1001
+
+
+def test_cli_stream_renderer_prints_full_reply_and_only_truncates_reasoning(capsys):
+    clear_recent_full_blocks()
+    renderer = StreamRenderer(max_chars=1000)
+
+    renderer.write("思考", "t" * 1001)
+    renderer.write("回复", "a" * 1200)
+    renderer.finish()
+
+    output = capsys.readouterr().out
+    assert output.count("t") == 1000
+    assert output.count("a") == 1200
+    assert output.count("已截断") == 1
+
+    assert render_recent_full_blocks() is True
+    expanded = capsys.readouterr().out
+    assert "思考（完整）" in expanded
+    assert expanded.count("t") == 1001
+    assert "回复（完整）" not in expanded
 
 
 def test_cli_renders_each_tool_action_with_parsed_fields(capsys):

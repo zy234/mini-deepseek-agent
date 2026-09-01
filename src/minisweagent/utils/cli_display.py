@@ -165,7 +165,7 @@ def render_recent_full_blocks(*, stream: TextIO | None = None) -> bool:
 
 @dataclass
 class StreamRenderer:
-    """Stream bounded previews while retaining full sections for an explicit later request."""
+    """完整输出最终回复，并为思考内容保留可展开的有界预览。"""
 
     stream: TextIO = field(default_factory=lambda: sys.stdout)
     max_chars: int = MAX_PREVIEW_CHARS
@@ -182,6 +182,10 @@ class StreamRenderer:
                 self.stream.write("\n")
             _separator(label, self.stream)
             self.current_label = label
+        if label != "思考":
+            self.stream.write(text)
+            self.stream.flush()
+            return
         self.sections[label] = self.sections.get(label, "") + text
         rendered = self.rendered_chars.get(label, 0)
         remaining = max(0, self.max_chars - rendered)
