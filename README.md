@@ -45,6 +45,21 @@ mini --timeout 60
 
 项目提供 Bash、文件编辑、网页搜索和网页抓取能力。运行环境直接使用当前用户权限，请勿在不可信目录或任务中运行。
 
+## 架构
+
+```text
+CLI
+ ├── 读取角色配置并选择 Agent
+ └── Agent
+     ├── Flow
+     │   ├── interactive：模型 ↔ 工具 ↔ 观察，循环执行
+     │   └── single_call：模型单次生成结果
+     ├── DeepSeek Model：负责模型请求和响应解析
+     └── Local Environment：负责工具执行和结果反馈
+```
+
+角色配置决定 prompt、可用工具和 Flow；模型负责决策，环境负责执行，Agent 负责维护对话和流程状态。
+
 ## API
 
 - [DeepSeek API](https://api-docs.deepseek.com/)
