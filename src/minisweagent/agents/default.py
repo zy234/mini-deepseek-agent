@@ -43,7 +43,7 @@ class AgentConfig(BaseModel):
     flow: Literal["iterative", "single_shot"] = "iterative"
     """角色使用的执行流程。"""
     tools: list[str] | None = None
-    """模型可见的工具；None 表示全部宿主工具。"""
+    """模型可见的工具；None 表示通用基础工具。"""
 
 
 class DefaultAgent:

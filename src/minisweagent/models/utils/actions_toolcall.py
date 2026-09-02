@@ -100,14 +100,101 @@ WEB_FETCH_TOOL = {
         },
     },
 }
-TOOL_DEFINITIONS = [BASH_TOOL, EDITOR_TOOL, WEB_SEARCH_TOOL, WEB_FETCH_TOOL]
+FINANCIAL_CALC_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "financial_calc",
+        "description": "执行无网络、无账户访问的确定性金融计算。缺少必要数据时返回结构化错误，不补默认财务数字。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["returns", "max_drawdown", "risk_metrics", "dcf", "portfolio_risk"],
+                },
+                "inputs": {
+                    "type": "object",
+                    "description": "计算所需的完整输入；字段随 operation 变化",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["operation", "inputs"],
+            "additionalProperties": False,
+        },
+    },
+}
+MINIQMT_QUOTES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "miniqmt_quotes",
+        "description": "通过宿主绑定的 MiniQMT 查询最多 20 只 A 股的实时行情。不能指定服务地址、账户或凭据。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_codes": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[036][0-9]{5}\\.(SH|SZ)$"},
+                    "minItems": 1,
+                    "maxItems": 20,
+                }
+            },
+            "required": ["stock_codes"],
+            "additionalProperties": False,
+        },
+    },
+}
+MINIQMT_ACCOUNT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "miniqmt_account",
+        "description": "查询宿主绑定的个人账户快照、委托或成交。账户标识由宿主注入，返回结果会脱敏。",
+        "parameters": {
+            "type": "object",
+            "properties": {"view": {"type": "string", "enum": ["snapshot", "orders", "trades"]}},
+            "required": ["view"],
+            "additionalProperties": False,
+        },
+    },
+}
+MINIQMT_TRADE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "miniqmt_trade",
+        "description": "向宿主绑定的个人账户提交或撤销委托。默认 observe 模式会阻断；execute 模式仍需终端人工审批。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["submit", "cancel"]},
+                "inputs": {
+                    "type": "object",
+                    "description": "submit: client_intent_id/stock_code/side/volume/price；cancel: client_intent_id/order_id",
+                    "additionalProperties": True,
+                },
+            },
+            "required": ["operation", "inputs"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+TOOL_DEFINITIONS = [
+    BASH_TOOL,
+    EDITOR_TOOL,
+    WEB_SEARCH_TOOL,
+    WEB_FETCH_TOOL,
+    FINANCIAL_CALC_TOOL,
+    MINIQMT_QUOTES_TOOL,
+    MINIQMT_ACCOUNT_TOOL,
+    MINIQMT_TRADE_TOOL,
+]
 TOOL_DEFINITIONS_BY_NAME = {tool["function"]["name"]: tool for tool in TOOL_DEFINITIONS}
+DEFAULT_TOOL_NAMES = ["bash", "str_replace_editor", "web_search", "web_fetch"]
 
 
 def get_tool_definitions(names: list[str] | None) -> list[dict]:
-    """按角色配置缩小工具集合；未配置时保留全部工具。"""
+    """按角色配置缩小工具集合；未配置时只保留通用基础工具。"""
     if names is None:
-        return TOOL_DEFINITIONS
+        names = DEFAULT_TOOL_NAMES
     unknown = set(names) - set(TOOL_DEFINITIONS_BY_NAME)
     if unknown:
         raise ValueError(f"未知工具：{', '.join(sorted(unknown))}")
@@ -149,7 +236,7 @@ def parse_toolcall_actions(
         except Exception as e:
             error_msg = f"无法解析工具参数：{e}。"
         tool_name = tool_call.function.name
-        if tool_name not in {"bash", "str_replace_editor", "web_search", "web_fetch"}:
+        if tool_name not in TOOL_DEFINITIONS_BY_NAME:
             error_msg += f"未知工具：{tool_name}。"
         elif allowed_tools is not None and tool_name not in allowed_tools:
             error_msg += f"当前 Agent 不允许使用工具：{tool_name}。"
@@ -164,6 +251,14 @@ def parse_toolcall_actions(
             error_msg += _validate_web_search_args(args)
         elif tool_name == "web_fetch":
             error_msg += _validate_web_fetch_args(args)
+        elif tool_name == "financial_calc":
+            error_msg += _validate_financial_calc_args(args)
+        elif tool_name == "miniqmt_quotes":
+            error_msg += _validate_miniqmt_quotes_args(args)
+        elif tool_name == "miniqmt_account":
+            error_msg += _validate_miniqmt_account_args(args)
+        elif tool_name == "miniqmt_trade":
+            error_msg += _validate_miniqmt_trade_args(args)
         if isinstance(args, dict):
             if tool_name == "bash":
                 allowed = {"command", "workdir", "timeout", "description"}
@@ -171,6 +266,14 @@ def parse_toolcall_actions(
                 allowed = {"queries"}
             elif tool_name == "web_fetch":
                 allowed = {"url"}
+            elif tool_name == "financial_calc":
+                allowed = {"operation", "inputs"}
+            elif tool_name == "miniqmt_quotes":
+                allowed = {"stock_codes"}
+            elif tool_name == "miniqmt_account":
+                allowed = {"view"}
+            elif tool_name == "miniqmt_trade":
+                allowed = {"operation", "inputs"}
             else:
                 allowed = {
                     "command",
@@ -211,6 +314,24 @@ def parse_toolcall_actions(
             continue
         if tool_name == "web_fetch":
             action["url"] = args["url"]
+            actions.append(action)
+            continue
+        if tool_name == "financial_calc":
+            action["operation"] = args["operation"]
+            action["inputs"] = args["inputs"]
+            actions.append(action)
+            continue
+        if tool_name == "miniqmt_quotes":
+            action["stock_codes"] = args["stock_codes"]
+            actions.append(action)
+            continue
+        if tool_name == "miniqmt_account":
+            action["view"] = args["view"]
+            actions.append(action)
+            continue
+        if tool_name == "miniqmt_trade":
+            action["operation"] = args["operation"]
+            action["inputs"] = args["inputs"]
             actions.append(action)
             continue
         action["command"] = args["command"]
@@ -264,6 +385,38 @@ def _validate_web_fetch_args(args: dict) -> str:
     url = args.get("url")
     if not isinstance(url, str) or not url.strip():
         return "web_fetch 的 url 必须是非空字符串。"
+    return ""
+
+
+def _validate_financial_calc_args(args: dict) -> str:
+    operation = args.get("operation")
+    if operation not in {"returns", "max_drawdown", "risk_metrics", "dcf", "portfolio_risk"}:
+        return "financial_calc 的 operation 不受支持。"
+    if not isinstance(args.get("inputs"), dict):
+        return "financial_calc 的 inputs 必须是对象。"
+    return ""
+
+
+def _validate_miniqmt_quotes_args(args: dict) -> str:
+    stock_codes = args.get("stock_codes")
+    if not isinstance(stock_codes, list) or not 1 <= len(stock_codes) <= 20:
+        return "miniqmt_quotes 的 stock_codes 必须包含 1 到 20 项。"
+    if any(not isinstance(code, str) or not code.strip() for code in stock_codes):
+        return "miniqmt_quotes 的股票代码必须是非空字符串。"
+    return ""
+
+
+def _validate_miniqmt_account_args(args: dict) -> str:
+    if args.get("view") not in {"snapshot", "orders", "trades"}:
+        return "miniqmt_account 的 view 不受支持。"
+    return ""
+
+
+def _validate_miniqmt_trade_args(args: dict) -> str:
+    if args.get("operation") not in {"submit", "cancel"}:
+        return "miniqmt_trade 的 operation 不受支持。"
+    if not isinstance(args.get("inputs"), dict):
+        return "miniqmt_trade 的 inputs 必须是对象。"
     return ""
 
 

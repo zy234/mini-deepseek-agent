@@ -1,3 +1,4 @@
+import json
 import os
 import platform
 import selectors
@@ -12,6 +13,8 @@ from pydantic import BaseModel, Field
 
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.editor import execute_editor
+from minisweagent.environments.financial_calc import execute_financial_calc
+from minisweagent.environments.miniqmt import MiniQMTClient
 from minisweagent.environments.web_fetch import execute_web_fetch
 from minisweagent.environments.web_search import (
     DEFAULT_SEARCH_ENGINES,
@@ -31,6 +34,7 @@ SENSITIVE_ENV_NAMES = frozenset(
         "AWS_SESSION_TOKEN",
         "GOOGLE_APPLICATION_CREDENTIALS",
         "KUBECONFIG",
+        "MINIQMT_ACCOUNT_ID",
         "SSH_AUTH_SOCK",
     }
 )
@@ -46,6 +50,10 @@ class LocalEnvironmentConfig(BaseModel):
     timeout: float = 30
     web_search_engines: list[str] = Field(default_factory=lambda: list(DEFAULT_SEARCH_ENGINES))
     web_search_max_results: int = Field(default=8, ge=1)
+    miniqmt_bridge_url: str = Field(
+        default_factory=lambda: os.getenv("MINIQMT_BRIDGE_URL", "http://127.0.0.1:8023")
+    )
+    miniqmt_mode: str = Field(default_factory=lambda: os.getenv("MINIQMT_AGENT_MODE", "observe"))
 
 
 class LocalEnvironment:
@@ -59,6 +67,7 @@ class LocalEnvironment:
         """This class executes bash commands directly on the local machine."""
         self.config = config_class(**kwargs)
         self.approval_callback = approval_callback or _prompt_for_approval
+        self._miniqmt: MiniQMTClient | None = None
 
     def execute(self, action: dict, cwd: str = "", *, timeout: float | None = None) -> dict[str, Any]:
         """Execute a command in the local environment and return the result as a dict."""
@@ -71,6 +80,15 @@ class LocalEnvironment:
                 action.get("url", ""),
                 timeout=timeout if timeout is not None else self.config.timeout,
             )
+        if action.get("tool") == "financial_calc":
+            result = execute_financial_calc(action.get("operation", ""), action.get("inputs", {}))
+            return _json_tool_output("financial_calc", result)
+        if action.get("tool") == "miniqmt_quotes":
+            return _json_tool_output("miniqmt_quotes", self._get_miniqmt().quotes(action.get("stock_codes", [])))
+        if action.get("tool") == "miniqmt_account":
+            return _json_tool_output("miniqmt_account", self._get_miniqmt().account(action.get("view", "")))
+        if action.get("tool") == "miniqmt_trade":
+            return self._execute_miniqmt_trade(action)
         command = action.get("command", "")
         cwd = action.get("workdir") or cwd or self.config.cwd or os.getcwd()
         global_timeout = timeout if timeout is not None else self.config.timeout
@@ -161,11 +179,44 @@ class LocalEnvironment:
             max_results=self.config.web_search_max_results,
         )
 
+    def _execute_miniqmt_trade(self, action: dict) -> dict[str, Any]:
+        operation = action.get("operation", "")
+        inputs = action.get("inputs", {})
+        if self.config.miniqmt_mode == "execute":
+            summary = json.dumps(
+                {"tool": "miniqmt_trade", "operation": operation, "inputs": inputs},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            if not self.approval_callback(summary, "个人账户交易操作"):
+                self._stop_for_approval(
+                    summary,
+                    "个人账户交易操作",
+                    hard_denied=False,
+                    subject="工具调用",
+                )
+        return _json_tool_output("miniqmt_trade", self._get_miniqmt().trade(operation, inputs))
+
+    def _get_miniqmt(self) -> MiniQMTClient:
+        if self._miniqmt is None:
+            self._miniqmt = MiniQMTClient(
+                base_url=self.config.miniqmt_bridge_url,
+                timeout=self.config.timeout,
+                mode=self.config.miniqmt_mode,
+            )
+        return self._miniqmt
+
     @staticmethod
-    def _stop_for_approval(command: str, reason: str, *, hard_denied: bool) -> None:
+    def _stop_for_approval(
+        command: str,
+        reason: str,
+        *,
+        hard_denied: bool,
+        subject: str = "Bash 命令",
+    ) -> None:
         status = "CommandBlocked" if hard_denied else "CommandNotApproved"
         prefix = "安全策略禁止执行" if hard_denied else "用户未批准执行"
-        submission = f"{prefix} Bash 命令：{reason}\n{command}"
+        submission = f"{prefix}{subject}：{reason}\n{command}"
         raise CommandNotApproved(
             {
                 "role": "exit",
@@ -199,6 +250,31 @@ class LocalEnvironment:
                 }
             }
         }
+
+
+def _json_tool_output(operation: str, result: dict[str, Any]) -> dict[str, Any]:
+    """将结构化宿主工具结果适配到统一 observation。"""
+    ok = result.get("ok") is True
+    error = result.get("error") if isinstance(result.get("error"), dict) else {}
+    return {
+        "stdout": json.dumps(result, ensure_ascii=False, sort_keys=True),
+        "stderr": "" if ok else str(error.get("detail") or "工具调用失败"),
+        "returncode": 0 if ok else -1,
+        "exit_code": 0 if ok else None,
+        "status": result.get("status", "success" if ok else "error"),
+        "timed_out": False,
+        "signal": None,
+        "termination": None,
+        "stdout_truncated": False,
+        "stderr_truncated": False,
+        "stdout_spill_path": None,
+        "stderr_spill_path": None,
+        "path": None,
+        "operation": operation,
+        "content_hash": result.get("input_hash"),
+        "exception_info": "",
+        "extra": {"error_code": error.get("code")},
+    }
 
 
 def _run(
