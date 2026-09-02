@@ -226,15 +226,15 @@ valuation_engine.py:70-282 确实有 EV/EBITDA、peer comparison、简化 DCF，
 
 映射：web_search({queries}) 发现候选，web_fetch({url}) 核验单篇；observation 保留 URL、标题、发布时间、抓取时间、正文和截断状态；JSON trajectory 保留调用和证据链。
 
-最终输出增加：subject、as_of、data_cutoff、data_sufficiency、conclusion、bull_case、bear_case、risks、counterfactual_checks、confidence、recommendation、claims、tool_errors。claim 至少包含 claim、value、source_url、title、published_at、quote、evidence_type。recommendation 只允许 research_only/watch/insufficient_data，不允许 buy/sell/place_order。
+研究角色最终输出增加：subject、as_of、data_cutoff、data_sufficiency、conclusion、bull_case、bear_case、risks、counterfactual_checks、confidence、recommendation、claims、tool_errors。claim 至少包含 claim、value、source_url、title、published_at、quote、evidence_type。研究角色的 recommendation 只允许 research_only/watch/insufficient_data；组合与交易角色通过独立的 MiniQMT 工具提出、预检或提交操作，不能把研究文本直接当作订单。
 
 新增代码：最终 JSON schema；证据标准化和 URL 去重；截止日期/未来数据检查；empty、network_error、blocked、http_error、parse_error、invalid_argument、stale_or_future_data 分类；缺失关键数据时输出 insufficient，不填正面 fallback 或默认 neutral。
 
-不值得引入：AutoGen 文本派单正则、DataFrame 字符串 contract、任意动态 import、每次建库 RAG、无来源摘要、交易执行工具和完整桌面栈。
+不值得引入：AutoGen 文本派单正则、DataFrame 字符串 contract、任意动态 import、每次建库 RAG、无来源摘要、绕过规则直接调用券商的执行工具和完整桌面栈。
 
-最小顺序：中文 prompt -> web_search/web_fetch 证据流 -> observation 元数据 -> JSON schema -> 截止日期检查 -> 本地 financial_calc；暂不做多 Agent 辩论和复杂 RAG。
+最小顺序：扩展显式工具注册/分发 -> MiniQMT 只读工具 -> 中文研究与组合角色 -> web_search/web_fetch 证据流 -> `financial_calc` -> 研究记录 -> 订单预检 -> 受控交易工具；暂不做复杂 RAG 和 Agent 间自由委派。
 
-# 四、可直接放入 YAML 的 Prompt 草案
+# 四、`financial_research` 角色 Prompt 草案
 
     system_template: |
       你是严谨的中文金融研究助手，只负责研究、证据和风险分析，不下单、不生成交易执行指令。
@@ -256,72 +256,142 @@ valuation_engine.py:70-282 确实有 EV/EBITDA、peer comparison、简化 DCF，
 
 不建议照搬：文本正则协议、DataFrame 字符串结果、自然语言错误、999 天窗口、未来日期匹配、默认估值假设、正面 fallback、动态 import、无来源新闻。
 
-当前项目最小方案：保留 DefaultAgent、DeepSeek tool-call、web_search、web_fetch、结构化 observation、JSON session；新增中文研究 prompt、时间字段、claims 证据字段、反方/风险字段、数据充分性、置信度、错误分类和最终 JSON 校验。
+当前项目最小方案：保留 `DefaultAgent`、DeepSeek tool-call、`LocalEnvironment`、结构化 observation 和 JSON session；显式新增 MiniQMT 查询/行情/计算/记录/交易工具，并通过 YAML 配置研究、组合和交易等独立角色。所有交易工具内部复用相同 SafetyKernel，不能依赖 prompt 实现权限控制。
 
 仍需核验：Desktop 二进制内部是否有未提交的 Lead/Bull/Bear/Judge；PydanticAI 版本真实 tool contract；13 章报告与 Agent 对应关系；数据供应商限流和 FinNLP max_retry 是否实际生效。
 
-# 六、结合 MiniQMT 的个人账户 Agent 方案
+# 六、结合 MiniQMT 的工具化个人账户 Agent 方案
 
 ## 目标与非目标
 
-目标不是把 FinRobot Desktop 搬进 MiniQMT，而是在现有 MiniQMT 宿主边界内增加一个“账户研究与操作助手”：
+目标不是把 FinRobot Desktop 搬进 MiniQMT，而是基于当前 `DefaultAgent + DeepSeek tool-call + LocalEnvironment + YAML profile` 扩展一个或多个可独立运行的金融 Agent。账户、行情、研究、计算、委托和成交能力全部以 host-owned 工具提供：
 
-- 读取指定账户的资产、现金、持仓、可卖数量、委托和成交，生成每日账户快照。
-- 使用 FinRobot 风格的基本面、估值、风险和牛熊论证，为持仓和候选标的生成带证据的研究记录。
-- 将研究结果转换为受策略和账户风险规则约束的 `OrderIntent`，由 MiniQMT 决定数量、价格、T+1、是否允许提交以及最终执行。
-- 对资产变化、订单状态、成交回报和研究结论进行可追溯记录，支持人工复核和回测复现。
+- Agent 调用账户工具读取资产、现金、持仓和可卖数量，而不是由 CLI 预先拼接上下文。
+- Agent 调用行情、网页和确定性计算工具完成基本面、估值、风险及牛熊研究。
+- Agent 调用委托预检、提交、撤单、委托查询和成交查询工具管理账户。
+- 每个工具内部校验账户范围、数据时间、交易制度、仓位、审批、幂等和审计，模型不能绕过。
+- 单 Agent 可独立完成完整闭环；多个 Agent 也能以不同 YAML profile 独立启动，通过版本化记录衔接。
 
-第一阶段不做自动转账、融资融券、期权、跨券商账户聚合或模型直接下单。所谓“自动”应分为三档：`observe`（只读分析）、`propose`（生成待审批意图）、`auto_execute`（通过已启用的宿主风控后自动提交）。默认只能使用前两档。
+第一阶段不做自动转账、融资融券、期权或跨券商账户聚合。所谓“模型下单”是调用受控的 `miniqmt_order_submit` 工具；该工具不是裸 Bridge 代理，它必须在内部执行完整规则并可能拒绝调用。运行模式分为 `observe`（不暴露写工具）、`propose`（提交工具只生成待审批记录）、`auto_execute`（规则通过后允许发给 Bridge），默认使用 `observe`。
 
 ## 现有 MiniQMT 能力与接入点
 
 已存在的接口足以支撑一个窄版本账户 Agent，不需要引入 FinRobot 的 FastAPI/React/Tauri 全栈：
 
-| 需求 | 当前 MiniQMT 接口/数据 | 接入原则 |
-|---|---|---|
-| 现金与总资产 | `LiveStrategyEnvironment.account()`、`GET /portfolio/assets` | 只传脱敏快照给模型；查询失败不能当作 0 元 |
-| 持仓与 T+1 | `position()`、`GET /portfolio/positions`、`can_use_volume` | 卖出数量由宿主校验，Agent 只能提出方向/目标权重 |
-| 行情与历史 | `market_snapshot()`、`daily_history()`、分钟缓存 | 所有数据带 `source_day`，严格早于执行日 |
-| 委托与成交 | `GET /trading/orders`、`GET /trading/trades`、Bridge SSE | 统一成事件；未知结果不自动重试 |
-| 下单 | `OrderIntent` -> `OrderRequest` -> `ExecutionRequest` -> Bridge | Agent 无账户句柄、无 `order_stock` 工具 |
-| 并发与幂等 | 账户 lease、`decision_id`、`execution_id`、本地订单表 | 每个建议和执行尝试均可去重、可审计 |
-| 回测 | `StrategyEnvironment` 与日级回测服务 | 研究输入和实盘输入复用同一快照格式 |
+| 需求 | 建议工具 | 当前 MiniQMT 接口/数据 | 工具内部规则 |
+|---|---|---|---|
+| 现金与总资产 | `miniqmt_account_snapshot` | `GET /portfolio/assets` | 绑定配置账户，脱敏，查询失败不能当作 0 元 |
+| 持仓与 T+1 | `miniqmt_positions` | `GET /portfolio/positions`、`can_use_volume` | 规范股票代码和数值，保留可卖数量及快照时间 |
+| 实时行情 | `miniqmt_quotes` | Bridge/主后端批量行情接口 | 限制代码数量，标明行情时间、停牌和陈旧状态 |
+| 历史行情 | `miniqmt_market_history` | `market_snapshot()`、`daily_history()` | `end_day <= as_of`；回测时严格早于执行日 |
+| 市场概览 | `miniqmt_market_snapshot` | 股票池、指数、日特征 | 一次批量返回紧凑截面，禁止逐股全图调用 |
+| 委托与成交 | `miniqmt_orders`、`miniqmt_trades` | `GET /trading/orders`、`GET /trading/trades` | 统一状态和事件 ID，不把查询失败表示为空列表 |
+| 下单预检 | `miniqmt_order_preview` | `OrderIntent` -> `OrderRequest` | 只计算可执行量、价格范围和阻断理由，不提交 |
+| 下单 | `miniqmt_order_submit` | `ExecutionRequest` -> Bridge | 模式、审批、lease、T+1、限额、幂等均通过才提交 |
+| 撤单 | `miniqmt_order_cancel` | `POST /trading/orders/{id}/cancel` | 只允许当前绑定账户且处于可撤状态的委托 |
+| 计算与记录 | `financial_calc`、`research_record_*` | 本地确定性代码、JSONL/SQLite | 公式版本、输入 hash、原子写入和敏感字段过滤 |
+| 回测 | `miniqmt_backtest_run/status/result` | 日级回测服务 | 固定策略画像和点时数据，真实账户模式禁用 |
 
-需要补齐的是账户 Agent 专用的“研究记录”和“快照校验”，不是另造交易环境。当前 `AccountSnapshot` 只有现金和 `raw`，实现时应在外层记录 `total_asset`、持仓市值、负债（如有）、快照时间和查询状态，避免修改基础策略契约来塞入不稳定券商字段。
+需要补齐的是一组显式 MiniQMT 工具和共用的安全内核，不是另造交易环境。当前 `AccountSnapshot` 只有现金和 `raw`，工具适配层应输出稳定字段：`total_asset`、持仓市值、负债（如有）、快照时间、来源和查询状态；不把不稳定券商 `raw` 原样交给模型。
 
 ## 推荐架构
 
 ```text
-MiniQMT Bridge / 本地行情
+mini --agent portfolio_manager
         |
         v
-AccountSnapshot + MarketSnapshot（宿主生成，带 as_of/source_day/hash）
-        |
-        +--> deterministic financial_calc
-        |       收益、回撤、集中度、估值、风险限额
-        |
-        +--> research agent（FinRobot 角色 prompt）
-        |       基本面 / 新闻 / 估值 / 风险 / bull-bear / summary
+DefaultAgent <--> DeepSeek tool-call
         |
         v
-ResearchRecord（JSON，claims + evidence + warnings）
+LocalEnvironment 显式工具分发
         |
-        v
-PolicyGate（宿主确定性规则）
-        |
-        +--> observe / propose
-        +--> auto_execute --> OrderIntent --> MiniQMT 执行链
+        +--> MiniQMTReadTools  --> 主后端 / Bridge / 行情缓存
+        +--> FinancialTools    --> 确定性计算 / web_search / web_fetch
+        +--> RecordTools       --> ResearchRecord / DecisionRecord
+        +--> MiniQMTWriteTools --> SafetyKernel --> MiniQMT 执行链
+                                      |
+                                      +--> accepted
+                                      +--> blocked
+                                      +--> approval_required
+                                      +--> unknown（禁止自动重试）
 ```
 
-模型只处理序列化快照、计算结果和已核验的网页证据。`financial_calc` 负责数值计算；模型不能自行重算账户余额、补齐缺失现金流或把搜索摘要当成事实。账户查询和下单仍由 MiniQMT 宿主完成。
+模型通过工具处理结构化快照、计算结果和网页证据。`financial_calc` 负责数值计算；模型不能自行补齐缺失现金流或把搜索摘要当成事实。账户查询和交易提交都表现为模型可调用工具，但真正读写 MiniQMT、持有 API key、选择绑定账户和执行安全规则的仍是宿主代码。
+
+## 当前框架的最小改造点
+
+保持当前显式结构，不增加 provider 抽象、动态类加载或 LangGraph：
+
+1. 在 `actions_toolcall.py` 增加固定的 MiniQMT/金融工具 schema，并把硬编码工具名和逐工具参数检查扩展为显式表。
+2. 在 `LocalEnvironment.execute()` 增加逐工具分发；MiniQMT HTTP、认证、规范化和安全规则放入新的 `environments/miniqmt.py`，确定性计算放入 `environments/financial_calc.py`。
+3. `deepseek.yaml` 增加独立角色。每个角色通过 `tools` 白名单获得最小能力集合；`single_shot` 仍不允许工具。
+4. 敏感配置由环境读取，例如 `MINIQMT_BASE_URL`、`MINIQMT_API_KEY`、`MINIQMT_ACCOUNT_ID`、`MINIQMT_AGENT_MODE`。API key 不进入 tool schema、prompt、trajectory 或错误正文。
+5. MiniQMT 工具统一返回 JSON observation，至少包含 `ok`、`status`、`as_of`、`source`、`data`、`warnings`、`error`、`audit_id`；不使用自然语言字符串混合成功和失败。
+6. 保持当前一次运行一个角色的 CLI 语义。多个 Agent 分别以 `mini --agent <role>` 启动，先通过持久化记录协作，不增加隐式 Agent delegation。
+
+## 工具设计原则
+
+- **所有外部能力工具化**：账户、行情、财务、新闻、计算、记录、回测和交易都不能由 prompt 假装已经存在。
+- **能力和权限分离**：tool schema 描述 Agent 能提出什么；SafetyKernel 决定当前账户、模式和状态下能否执行。
+- **工具内确定性安全**：重要规则必须是 Python 校验，不能只写在 system prompt 中。
+- **读写工具分离**：只读角色根本看不到 submit/cancel；交易角色即使看到写工具，也可能被工具内部规则拒绝。
+- **参数窄化**：模型传股票、方向、目标权重/数量提示和理由；账户 ID、API key、profile hash、最终价格/数量由工具绑定或计算。
+- **结构化失败**：`empty`、`blocked`、`approval_required`、`network_error`、`http_error`、`parse_error`、`stale_data`、`unknown` 分开返回。
+- **可重放**：写工具在执行前保存规范化输入、快照 hash、规则版本、决策 ID 和审批模式；相同幂等键不能重复下单。
+
+## 关键工具契约草案
+
+查询工具应按用途设计参数，避免一个万能 `miniqmt_request(method, path, body)` 绕开校验：
+
+```text
+miniqmt_account_snapshot() -> 资产、现金、持仓汇总、快照时间、查询状态
+miniqmt_positions(stock_codes?) -> 持仓数量、可卖数量、成本、市值、浮动盈亏
+miniqmt_quotes(stock_codes[]) -> 最新价、涨跌停、停牌状态、行情时间
+miniqmt_market_history(stock_codes[], start_day, end_day, fields[]) -> 点时历史数据
+miniqmt_orders(status?, since?) -> 规范化委托状态
+miniqmt_trades(since?) -> 规范化成交事件
+```
+
+`miniqmt_order_preview` 和 `miniqmt_order_submit` 共享同一个窄输入：
+
+```json
+{
+  "stock_code": "600000.SH",
+  "side": "SELL",
+  "target_weight": 0.05,
+  "quantity_hint": null,
+  "limit_price_hint": null,
+  "reason": "组合集中度超过限额",
+  "research_record_id": "research-...",
+  "client_intent_id": "intent-..."
+}
+```
+
+`target_weight` 与 `quantity_hint` 最多提供一个，均只是意图；最终数量由工具读取最新账户/持仓/行情后确定。输入不得包含 `account_id`、API key、`mode`、`approved`、`skip_checks`、最终券商订单字段或任意 HTTP 参数。审批状态和运行模式只能由宿主配置及持久化审批记录获得。
+
+写工具输出统一为：
+
+```json
+{
+  "ok": false,
+  "status": "approval_required",
+  "audit_id": "audit-...",
+  "decision_id": "sha256:...",
+  "resolved_order": {"stock_code": "600000.SH", "side": "SELL", "volume": 500},
+  "rules": [{"name": "t_plus_one", "passed": true, "detail": "可卖 1000 股"}],
+  "error": null
+}
+```
+
+`ok` 表示这次工具调用按其语义完成，不应把 `approval_required`、`blocked` 或 `unknown` 包装成普通成功。工具 observation 必须足够让模型解释阻断原因，但不得包含 API key、完整账户号或 Bridge 原始异常中的敏感请求头。
 
 ## FinRobot 能力迁移矩阵
 
 | FinRobot 能力 | 迁移方式 | 不能照搬的部分 |
 |---|---|---|
-| Leader/worker 分工 | 先用一个 `financial_research` 角色分阶段调用；需要时再拆成基本面、估值、风险三个 prompt | AutoGen 文本 `[name] order` 正则和 `TERMINATE` 标记 |
+| Leader/worker 分工 | 先配置多个可独立运行的角色；用记录工具传递版本化产物，需要自动编排时再做显式 workflow | AutoGen 文本 `[name] order` 正则和 `TERMINATE` 标记 |
 | Equity Research 八角色 | 保留职责和输出字段，合并为可配置阶段，避免一次请求制造八份无证据长文 | 无工具却要求“搜索”、无 URL/日期的自然语言结果 |
-| Bull/Bear/Judge | 对同一 `ResearchRecord` 生成独立 `bull_case`、`bear_case`，由宿主或 summary 阶段裁决 | 直接让辩论结果产生订单 |
+| Bull/Bear/Judge | 独立角色读取同一 `ResearchRecord`，分别写入 bull/bear/review 记录；组合角色综合后才能调用交易预检 | 用聊天文本隐式传递状态或跳过安全工具直接下单 |
 | DCF、可比公司、风险指标 | 作为本地 `financial_calc` 的确定性函数，输出公式版本、输入 hash、警告 | 缺数据时使用 EBITDA*0.6、默认 WACC/增长率或其它隐含数字 |
 | 新闻、SEC、RAG | 复用当前 `web_search` -> `web_fetch`，保存 URL、标题、发布时间、quote、抓取时间 | 不保存来源的摘要、动态 import 和无质量阈值 RAG |
 | 回测 | 使用 MiniQMT 日级事件回测复验建议，不引入 Backtrader 作为第二套撮合器 | 美股数据源和无成本/滑点的结果字符串 |
@@ -351,7 +421,7 @@ PolicyGate（宿主确定性规则）
     "max_drawdown": -0.08,
     "warnings": []
   },
-  "recommendation": "research_only",
+  "recommendation": "watch",
   "proposed_intents": [],
   "claims": [],
   "tool_errors": []
@@ -363,68 +433,151 @@ PolicyGate（宿主确定性规则）
 - 账户 ID 只用于宿主查数和审计，给模型的记录使用 hash 或内部别名；日志不得记录交易密钥。
 - `account`、`calculations`、`claims` 和 `tool_errors` 均区分缺失、空结果、网络失败、阻断、HTTP 错误和解析错误。
 - `claims` 至少包含 `claim`、`source_url`、`title`、`published_at`、`quote`、`evidence_type`；没有证据的判断标记为假设。
-- `proposed_intents` 只允许 `BUY`/`SELL`、目标权重或数量提示、理由和研究记录 ID，不允许账户 ID、券商订单号或执行方法。
-- `recommendation` 仅允许 `research_only`、`watch`、`insufficient_data`；是否自动执行由独立 PolicyGate 决定。
+- `proposed_intents` 只允许 `BUY`/`SELL`、目标权重或数量提示、理由和研究记录 ID，不允许 API key、券商客户端或执行方法。
+- 研究记录本身不等于订单。组合或交易角色必须把建议显式传给 `miniqmt_order_preview`，再根据返回的安全结论决定是否调用 `miniqmt_order_submit`。
+
+写工具的调用和结果另存 `account-action/v1`：
+
+```json
+{
+  "schema": "account-action/v1",
+  "audit_id": "...",
+  "tool": "miniqmt_order_submit",
+  "mode": "propose",
+  "stock_code": "600000.SH",
+  "side": "SELL",
+  "requested": {"target_weight": 0.05},
+  "resolved": {"price_type": "LATEST", "volume": 500},
+  "decision_id": "sha256:...",
+  "research_record_id": "...",
+  "status": "approval_required",
+  "rules": [{"name": "t_plus_one", "passed": true}],
+  "created_at": "2026-09-02T10:30:00+08:00"
+}
+```
+
+`accepted` 只表示 Bridge 明确接受，不表示成交；`unknown` 表示提交结果不可确认，工具必须冻结相同幂等键并要求后续通过查询工具核对。
+
+## 独立 Agent 角色
+
+第一版建议提供三个独立 profile，而不是实现 Agent 间自由委派：
+
+| 角色 | 主要职责 | 工具集合 |
+|---|---|---|
+| `financial_research` | 市场/个股资料、估值、风险、牛熊论证和证据记录 | `miniqmt_market_*`、`miniqmt_quotes`、`financial_calc`、`web_search`、`web_fetch`、`research_record_*` |
+| `portfolio_manager` | 查看账户与持仓，计算组合风险，形成调仓建议并预检 | 上述工具 + `miniqmt_account_snapshot`、`miniqmt_positions`、`miniqmt_orders`、`miniqmt_trades`、`miniqmt_order_preview` |
+| `account_trader` | 执行已研究/已批准的订单，查询状态和撤单 | 账户/订单查询 + `research_record_get`、`miniqmt_order_preview`、`miniqmt_order_submit`、`miniqmt_order_cancel` |
+
+需要单 Agent 时再增加 `financial_manager`，暴露上述完整工具集合并使用严格 system prompt；安全性不能依赖该 prompt，而依赖每个工具内部相同的 SafetyKernel。多个角色对同一账户写操作时必须共享 MiniQMT 账户 lease 和幂等存储。
+
+对应当前配置结构的草案：
+
+```yaml
+agents:
+  financial_research:
+    description: 金融资料、估值与风险研究
+    flow: iterative
+    tools:
+      - miniqmt_market_snapshot
+      - miniqmt_market_history
+      - miniqmt_quotes
+      - financial_calc
+      - web_search
+      - web_fetch
+      - research_record_get
+      - research_record_put
+
+  portfolio_manager:
+    description: 个人账户分析与调仓预检
+    flow: iterative
+    tools:
+      - miniqmt_account_snapshot
+      - miniqmt_positions
+      - miniqmt_orders
+      - miniqmt_trades
+      - miniqmt_quotes
+      - financial_calc
+      - research_record_get
+      - research_record_put
+      - miniqmt_order_preview
+
+  account_trader:
+    description: 执行已研究并通过安全规则的账户操作
+    flow: iterative
+    tools:
+      - miniqmt_account_snapshot
+      - miniqmt_positions
+      - miniqmt_orders
+      - miniqmt_trades
+      - research_record_get
+      - miniqmt_order_preview
+      - miniqmt_order_submit
+      - miniqmt_order_cancel
+```
+
+这些 profile 是独立入口，不是同一会话内的动态子 Agent。自动化运行由一个很薄的宿主调度器按交易日/订单事件启动指定角色，并把上一步 `record_id` 放进任务；研究、查询、记录和交易仍全部通过工具完成。
 
 ## 账户管理生命周期
 
-1. **开盘前快照**：宿主查询账户资产、持仓、未完成委托和前一交易日行情，检查查询时间、字段完整性和内部一致性。快照失败则只生成诊断，不生成新买入。
-2. **市场级研究**：对股票池做一次批量筛选，再对已有持仓和实际候选做个股研究；不对 5000 多只股票逐一调用完整 LLM 图。
-3. **组合分析**：`financial_calc` 计算现金占比、单票/行业集中度、回撤、波动、换手和风险限额；LLM 解释数值并提出待核验假设。
-4. **建议与反方检查**：输出持仓继续持有/减仓/观察的理由、`bull_case`、`bear_case`、触发条件和数据充分性。缺关键数据时必须 `insufficient_data`。
-5. **策略意图**：若用户启用策略，Agent 只能返回窄 `OrderIntent`。MiniQMT 再校验股票池、T+1、涨跌停/停牌证据、单票上限、现金、日内买入额度和冷却时间。
-6. **审批与提交**：`observe` 保存建议；`propose` 写入待审批信号；`auto_execute` 需要配置显式开启、账户 lease、策略画像一致和 PolicyGate 全部通过，之后才创建 `ExecutionRequest`。
-7. **成交和复盘**：Bridge SSE/查询结果归一化为订单事件，未知结果标记 `unknown` 且人工核验；收盘保存资产曲线、成交归因、研究记录 ID 和当时快照 hash。
+1. **开盘前快照**：Agent 调用 `miniqmt_account_snapshot`、`miniqmt_positions` 和 `miniqmt_orders`；工具检查查询时间、字段完整性和内部一致性。快照失败则交易工具锁定新买入。
+2. **市场级研究**：Agent 调用 `miniqmt_market_snapshot` 做一次批量截面，再对已有持仓和实际候选调用行情/研究工具；不对 5000 多只股票逐一运行完整 Agent。
+3. **组合分析**：Agent 把工具返回的稳定数据传给 `financial_calc`，计算现金占比、集中度、回撤、波动、换手和风险限额。
+4. **建议与反方检查**：Agent 使用 `research_record_put` 保存继续持有/减仓/观察理由、牛熊论证、触发条件和数据充分性。
+5. **订单预检**：组合或交易 Agent 调用 `miniqmt_order_preview`；工具解析目标权重/数量提示并返回最终可执行量、价格类型和全部规则结果。
+6. **审批与提交**：交易 Agent 调用 `miniqmt_order_submit`。`observe` 返回 blocked；`propose` 返回 approval_required；`auto_execute` 在 lease、画像、审批和规则通过后才提交 Bridge。
+7. **成交和复盘**：Agent 调用委托/成交查询工具跟踪状态；工具把 Bridge 结果归一化为事件。`unknown` 结果不自动重试，收盘记录资产曲线、成交归因和快照 hash。
 
-## 风控闸门（必须由宿主实现）
+## SafetyKernel（必须在工具内部调用）
 
-- **账户范围**：允许的账户 ID、策略 profile hash 和运行主机固定配置；Agent 输入不允许动态指定账户。
+- **账户范围**：账户 ID、策略 profile hash 和运行主机固定配置；默认 tool schema 不接受账户 ID，多账户模式只接受配置中的逻辑别名。
 - **数据完整性**：资产、持仓、委托、成交不是原子查询；时间戳不一致或明显矛盾时跳过周期。
 - **仓位约束**：最大总仓位、单票/行业权重、现金下限、单日买入金额和订单数量上限。
 - **交易制度**：A 股 T+1、可用持仓、整手数量、价格精度、涨跌停、停牌和交易日校验。
 - **状态安全**：相同 `decision_id` 不重复执行；提交超时或结果未知绝不自动重发；成交 ID 缺失时停止有状态自动交易。
 - **模型失败**：格式错误、工具失败、来源晚于 `as_of`、低数据充分性或牛熊冲突时降级为观察，不使用正面 fallback。
-- **人工控制**：提供全局 kill switch、单账户暂停、单票黑名单和每次自动提交的审计事件。
+- **人工控制**：提供全局 kill switch、单账户暂停、单票黑名单和每次写工具调用的审计事件。
+- **权限最小化**：运行角色的工具白名单和工具内部模式双重校验；不能只靠隐藏工具名或 prompt 禁止。
 
 ## 分阶段迁移计划
 
-### M0：研究记录，不碰交易
+### M0：MiniQMT 只读工具和研究 Agent
 
-新增 `account-research/v1` schema、快照脱敏/哈希、`financial_calc`（收益、回撤、集中度、组合风险）和 FinRobot 风格中文 prompt。只读 `/portfolio/assets`、`/portfolio/positions`，输出 JSON/JSONL 研究记录。
+新增账户、持仓、委托、成交、行情、历史、市场截面等只读工具，以及 `account-research/v1`、快照脱敏/哈希、`financial_calc` 和记录工具。配置 `financial_research` 与 `portfolio_manager` 两个可独立运行角色。
 
 验收：mock 账户数据、空账户、字段缺失、查询异常、重复日期、未来数据和计算极值均有测试；记录不包含账户密钥或完整账户号。
 
-### M1：建议接入现有策略
+### M1：订单预检和建议闭环
 
-让研究记录挂到现有 candidate manifest 和 `OrderRequest.diagnostics`，使用一次市场级候选研究；只允许 `research_only`/`watch`，不调用真实下单接口。回测输入和实盘输入使用同一快照编码。
+增加 `miniqmt_order_preview`，让研究记录挂到 candidate manifest 和 `OrderRequest.diagnostics`。预检工具返回完整规则结果，但不提交订单；回测输入和实盘输入使用同一快照编码。
 
 验收：历史日期回放不泄漏执行日数据；候选代码过滤、来源日和研究记录 ID 可追溯；Agent 故障不会影响已有持仓的正常风控处理。
 
-### M2：人工审批执行
+### M2：受控交易工具的 propose 模式
 
-把合格建议写入待审批信号，复用现有 `strategy_live_signals`、`strategy_live_orders` 和账户日视图。审批接口只接受宿主生成的 signal ID，不能接受模型拼装的券商字段。
+增加 `miniqmt_order_submit`、`miniqmt_order_cancel` 和 `account_trader` 角色。submit 在 `propose` 模式只写入待审批信号，复用现有 `strategy_live_signals`、`strategy_live_orders` 和账户日视图；审批只接受宿主生成的 signal ID。
 
 验收：审批过期、重复审批、账户 lease 冲突、撤单和部分成交均可重放；未知 Bridge 结果不会重复报单。
 
 ### M3：小额自动执行
 
-每账户单独显式开启 `auto_execute`，先只允许减仓/风控类 SELL 或极小额 BUY；PolicyGate 全通过后才进入现有 `StrategyLiveMixin` 执行链。该阶段仍不允许 Agent 直接调用 `GET/POST /trading`。
+每账户单独显式开启 `auto_execute`，先只允许减仓/风控类 SELL 或极小额 BUY。Agent 仍调用同一个 `miniqmt_order_submit`，由工具内部 SafetyKernel 决定是提交、阻断还是要求审批；Agent 不直接构造 HTTP 请求。
 
 验收：先用 paper/backtest，再用模拟 Bridge；连续运行日志、kill switch、限额和人工核验流程通过演练后，才考虑扩大范围。
 
 ## 不建议的迁移方式
 
 - 复制 FinRobot 的 AutoGen、PydanticAI、Backtrader 和桌面 UI，造成第二套 Agent、账户和撮合生命周期。
-- 把 `AccountSnapshot.raw` 原样拼到 prompt，泄漏账户标识并让模型依赖不稳定券商字段。
-- 让模型输出完整券商订单 JSON，或把 `order_stock` 暴露为模型工具。
+- 把 `AccountSnapshot.raw` 原样返回给模型，泄漏账户标识并让模型依赖不稳定券商字段。
+- 把裸 `order_stock` 或通用 HTTP 请求暴露为工具；交易工具必须使用窄参数并强制经过 SafetyKernel。
 - 用估值默认参数填充缺失财务数据，再把结果当成个人账户的自动交易依据。
 - 为全市场每只股票启动一次多 Agent 研究；应先用本地硬过滤和一次市场级研究缩小范围。
 
 ## 待确认事项
 
-1. 个人账户 Agent 的首个运行模式是否固定为 `propose`，以及自动执行是否仅限 SELL/风控单。
+1. 首个交付是否同时包含 `financial_research`、`portfolio_manager` 两个只读角色，还是先交付一个完整只读 `financial_manager`。
 2. MiniQMT Bridge 是否能提供稳定的账户快照版本号、成交 `trade_id` 和停牌/涨跌停字段；不能提供时必须保守降级。
 3. 账户研究记录保存在现有 MiniQMT SQLite 还是独立 append-only JSONL；建议先 JSONL + hash，稳定后再建表索引。
 4. 研究数据供应商和网页抓取是否允许进入实盘运行；网络失败时应只保留本地行情和账户风险分析。
+5. `propose` 的人工审批入口和有效期，以及 M3 是否先只允许 SELL/风控单。
 
 本分支当前只提交调研与迁移规格，不修改 `miniqmt-portfolio` 交易代码，也不打开真实账户自动交易。
