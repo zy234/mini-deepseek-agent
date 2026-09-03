@@ -231,7 +231,7 @@ def _redact(value: Any) -> Any:
         result = {}
         for key, item in value.items():
             normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
-            if normalized_key.endswith(("accountid", "accountno", "accountnumber")):
+            if normalized_key.endswith(("accountid", "accountno", "accountnumber", "secuaccount")):
                 result["account_id_hash"] = _account_hash(str(item))
             else:
                 result[key] = _redact(item)
