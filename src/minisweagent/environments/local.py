@@ -80,6 +80,8 @@ class LocalEnvironment:
         self.approval_callback = approval_callback or _prompt_for_approval
         self._miniqmt: MiniQMTClient | None = None
         self._agent_call_count = 0
+        # 主 Agent 的交接阶段由宿主记录，避免模型跳过研究或组合风控直接交易。
+        self._agent_call_roles: list[str] = []
 
     def execute(self, action: dict, cwd: str = "", *, timeout: float | None = None) -> dict[str, Any]:
         """Execute a command in the local environment and return the result as a dict."""
@@ -259,6 +261,9 @@ class LocalEnvironment:
                 "agent_call",
                 {"ok": False, "status": "configuration_error", "error": {"code": "missing_role_profile", "detail": f"未配置子 Agent：{role}"}},
             )
+        phase_error = self._validate_agent_call_phase(role)
+        if phase_error is not None:
+            return _json_tool_output("agent_call", phase_error)
         self._agent_call_count += 1
         try:
             # 延迟导入避免 agents -> environments 的循环依赖。
@@ -287,6 +292,19 @@ class LocalEnvironment:
             )
             child_agent = get_agent(child_model, child_environment, child_settings)
             result = child_agent.run(task)
+            if result.get("exit_status") != "Submitted":
+                return _json_tool_output(
+                    "agent_call",
+                    {
+                        "ok": False,
+                        "status": "error",
+                        "error": {
+                            "code": result.get("exit_status", "child_agent_incomplete"),
+                            "detail": "子 Agent 未提交完整结果，不能把该阶段视为完成",
+                        },
+                    },
+                )
+            self._agent_call_roles.append(role)
             return _json_tool_output(
                 "agent_call",
                 {
@@ -322,6 +340,28 @@ class LocalEnvironment:
                     "error": {"code": type(error).__name__, "detail": f"子 Agent 执行失败：{error}"},
                 },
             )
+
+    def _validate_agent_call_phase(self, role: str) -> dict[str, Any] | None:
+        """检查账户管理工作流的最小顺序，交易权限仍由交易工具再次校验。"""
+        if role == "portfolio_manager" and "financial_research" not in self._agent_call_roles:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "error": {
+                    "code": "workflow_order",
+                    "detail": "必须先完成 financial_research，再调用 portfolio_manager",
+                },
+            }
+        if role == "account_trader" and "portfolio_manager" not in self._agent_call_roles:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "error": {
+                    "code": "workflow_order",
+                    "detail": "必须先完成 portfolio_manager，再调用 account_trader",
+                },
+            }
+        return None
 
     def _get_miniqmt(self) -> MiniQMTClient:
         if self._miniqmt is None:

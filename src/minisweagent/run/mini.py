@@ -176,9 +176,16 @@ def _account_cycle(settings: dict, task: str, *, close_review: bool = False) -> 
         },
     )
     if close_review:
-        task = f"收盘复盘模式（只读，不得下单）：{task}"
+        task = (
+            f"收盘复盘模式（只读，不得下单），交易日 {started.date().isoformat()}；"
+            f"必须以 account_journal.previous 中前一交易日收盘记录为基准：{task}"
+        )
     else:
-        task = f"自主账户观察周期 {cycle_id}：{task}"
+        task = (
+            f"自主账户交易周期 {cycle_id}，交易日 {started.date().isoformat()}；"
+            "先以 account_journal.previous 的前一交易日收盘作为研究基准，再研究今日方案："
+            f"{task}"
+        )
     model = get_model(settings.get("model", {}))
     environment = get_environment(environment_settings)
     agent = get_agent(model, environment, agent_settings)

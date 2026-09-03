@@ -123,6 +123,37 @@ def test_local_environment_captures_output_and_completion():
     assert result["timed_out"] is False
 
 
+def test_financial_manager_agent_call_order_is_host_enforced():
+    env = LocalEnvironment(timeout=5)
+
+    blocked_portfolio = env._validate_agent_call_phase("portfolio_manager")
+    assert blocked_portfolio["status"] == "blocked"
+    assert blocked_portfolio["error"]["code"] == "workflow_order"
+
+    env._agent_call_roles.append("financial_research")
+    assert env._validate_agent_call_phase("portfolio_manager") is None
+    assert env._validate_agent_call_phase("account_trader")["error"]["code"] == "workflow_order"
+
+    env._agent_call_roles.append("portfolio_manager")
+    assert env._validate_agent_call_phase("account_trader") is None
+
+
+def test_financial_agent_profiles_describe_daily_handoff():
+    settings = mini.get_config_from_spec(mini.DEFAULT_CONFIG_FILE)
+    research = settings["agents"]["financial_research"]["system_template"]
+    portfolio = settings["agents"]["portfolio_manager"]["system_template"]
+    trader = settings["agents"]["account_trader"]["system_template"]
+    manager = settings["agents"]["financial_manager"]["system_template"]
+
+    assert "buy_candidates" in research
+    assert "previous_close_as_of" in research
+    assert "selected_candidates" in portfolio
+    assert "risk_check" in trader
+    assert "financial_research" in manager
+    assert "portfolio_manager" in manager
+    assert "account_trader" in manager
+
+
 def test_web_search_is_standalone_without_ds_key_and_deduplicates(monkeypatch):
     calls = []
 

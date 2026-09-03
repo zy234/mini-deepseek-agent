@@ -53,7 +53,9 @@ mini --timeout 60
 mini --agent financial_manager -t "先查看我的账户和持仓，再分析风险；不要下单"
 ```
 
-主 Agent 不直接接触 MiniQMT 工具。宿主只允许委派到固定角色，每次运行最多调用 4 次；子 Agent 使用独立上下文且不能继续委派。交易权限和风险规则由 `miniqmt_trade` 工具内部强制执行。
+主 Agent 不直接接触 MiniQMT 工具。宿主只允许委派到固定角色，每次运行最多调用 4 次；子 Agent 使用独立上下文且不能继续委派。账户管理周期的交接顺序固定为 `financial_research -> portfolio_manager -> account_trader`：研究角色以昨日收盘为基准产出今日 `buy_candidates`，组合经理结合账户形成 `selected/rejected` 和 `order_plan`，交易角色只对组合方案做 `risk_check` 和下单判断。宿主会阻止跳过研究或组合阶段的委派，交易权限和风险规则仍由 `miniqmt_trade` 工具内部强制执行。
+
+研究候选不是订单。`financial_research` 必须给出 `research_as_of`、`previous_close_as_of`、`data_cutoff`、`data_sufficiency`、`buy_candidates` 和缺失数据；`portfolio_manager` 必须说明每个候选为何选入、缩减或拒绝，并将现金、集中度、T+1 和未完成委托纳入取舍；只有完整的 `order_plan` 才能交给 `account_trader`。任何数据不足、风险检查失败或 `unknown` 结果都会降级为 HOLD 并写入每日账本。
 
 自主账户循环使用下面的显式入口。交易日 09:20 至 11:30、13:00 至 15:00 每 10 分钟创建一套全新的 Agent/模型/环境，不继承上轮消息；只读取 `.sessions/account-manager/journals/YYYY-MM-DD.md` 和实时工具结果。15:10 自动创建新的只读上下文完成收盘复盘。
 
