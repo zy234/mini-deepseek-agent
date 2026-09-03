@@ -79,6 +79,16 @@ mini --install-account-schedule
 
 项目提供 Bash、文件编辑、网页搜索和网页抓取能力。运行环境直接使用当前用户权限，请勿在不可信目录或任务中运行。
 
+网页正文默认先走轻量 HTTP 抓取；正文缺失、软拦截或质量不足时，可选用 Playwright 渲染动态页面：
+
+```bash
+python3 -m pip install -e '.[browser]'
+python3 -m playwright install chromium
+```
+
+设置 `MSWEA_WEB_FETCH_BROWSER=0` 可关闭浏览器降级。模拟运行由宿主设置带时区的
+`MSWEA_WEB_AS_OF`（例如 `2026-09-03T10:30:00+08:00`）；已知晚于截止时间的搜索结果会被删除，时间不明的搜索候选只返回无标题、无摘要的 URL 供 `web_fetch` 核验。正文只有在发布时间明确且不晚于截止时间时才返回，只有日期而没有盘中时刻的当天文章也会被拒绝，避免未来信息进入 Agent。
+
 MiniQMT 工具直接连接 Bridge，默认地址为 `http://127.0.0.1:8023`（可用 `MINIQMT_BRIDGE_URL` 修改），个人账户由宿主环境绑定：
 
 ```bash

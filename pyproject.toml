@@ -33,6 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "ruff"]
+browser = ["playwright>=1.55,<2"]
 
 [project.urls]
 Repository = "https://github.com/zhaoyu29/mini-deepseek-agent"

@@ -14,6 +14,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any
 
+from minisweagent.environments.web_time import cutoff_status, parse_web_time, require_cutoff
+
 DEFAULT_MAX_QUERIES = 4
 DEFAULT_MAX_RESULTS = 8
 DEFAULT_SEARCH_ENGINES = ("bing_rss", "baidu_html", "sogou_html", "duckduckgo")
@@ -46,6 +48,7 @@ class SearchResult:
     snippet: str
     source_engine: str
     fetched_at: str
+    published_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -66,10 +69,12 @@ def execute_web_search(
     timeout: float,
     engines: list[str] | None = None,
     max_results: int = DEFAULT_MAX_RESULTS,
+    as_of: str = "",
 ) -> dict[str, Any]:
     """并发调用仓库内置搜索引擎并转换为 Agent 工具结果。"""
     try:
         _validate_queries(queries, DEFAULT_MAX_QUERIES)
+        cutoff = require_cutoff(as_of) if as_of else None
         selected_engines = list(dict.fromkeys(engines or DEFAULT_SEARCH_ENGINES))
         unknown_engines = [name for name in selected_engines if name not in ENGINE_SEARCHERS]
         if unknown_engines:
@@ -81,22 +86,53 @@ def execute_web_search(
         sources: list[dict[str, str]] = []
         attempts: list[SearchAttempt] = []
         seen_urls: set[str] = set()
+        time_filter = {"accepted": 0, "future": 0, "unknown": 0, "ambiguous": 0, "irrelevant": 0}
         request_timeout = max(1.0, min(float(timeout), 10.0))
+        candidate_limit = max_results if cutoff is None else max_results * 3
         for query in dict.fromkeys(item.strip() for item in queries):
             engine_results, query_attempts = _search_query(
                 query,
                 selected_engines,
                 timeout=request_timeout,
-                limit=max_results,
+                limit=candidate_limit,
             )
             attempts.extend(query_attempts)
             for result in engine_results:
+                if cutoff is not None and not _is_relevant_result(query, result):
+                    time_filter["irrelevant"] += 1
+                    continue
                 normalized_url = _normalize_url(result.url)
                 if not normalized_url or normalized_url in seen_urls:
                     continue
                 seen_urls.add(normalized_url)
                 source = asdict(result)
                 source["url"] = normalized_url
+                if cutoff is not None:
+                    source["fetched_at"] = cutoff.isoformat()
+                published = parse_web_time(source.get("published_at", ""))
+                if published is None:
+                    published = parse_web_time(_find_date(f"{source['title']} {source['snippet']}"))
+                if cutoff is not None:
+                    status = cutoff_status(published, cutoff)
+                    time_filter[status] += 1
+                    if status == "future":
+                        continue
+                    if status == "accepted":
+                        source["published_at"] = published.isoformat() if published else ""
+                        source["published_at_precision"] = published.precision if published else "unknown"
+                        source["as_of_status"] = "accepted"
+                    else:
+                        # 候选 URL 可继续核验，但未校验的标题和摘要不能泄露给模拟 Agent。
+                        source["title"] = ""
+                        source["snippet"] = ""
+                        source["published_at"] = ""
+                        source["published_at_precision"] = "unknown"
+                        source["as_of_status"] = "requires_fetch"
+                elif published is not None:
+                    source["published_at"] = published.isoformat()
+                    source["published_at_precision"] = published.precision
+                elif not source["published_at"]:
+                    source.pop("published_at")
                 sources.append(source)
                 if len(sources) >= max_results:
                     break
@@ -105,13 +141,27 @@ def execute_web_search(
 
         attempt_dicts = [asdict(attempt) for attempt in attempts]
         if sources:
-            return _success_result(_format_sources(sources, attempts), sources, attempt_dicts)
+            return _success_result(
+                _format_sources(sources, attempts, as_of=as_of, time_filter=time_filter),
+                sources,
+                attempt_dicts,
+                as_of=as_of,
+                time_filter=time_filter,
+            )
         if attempts and all(attempt.status not in {"success", "empty"} for attempt in attempts):
             message = "网页搜索引擎均不可用。" + _format_diagnostics(attempts)
             return _error_result(message, "WEB_SEARCH_UNAVAILABLE", attempt_dicts)
-        return _success_result(_format_sources([], attempts), [], attempt_dicts)
+        return _success_result(
+            _format_sources([], attempts, as_of=as_of, time_filter=time_filter),
+            [],
+            attempt_dicts,
+            as_of=as_of,
+            time_filter=time_filter,
+        )
     except WebSearchError as error:
         return _error_result(str(error), error.code, [])
+    except ValueError as error:
+        return _error_result(str(error), "WEB_INVALID_CUTOFF", [])
     except Exception as error:  # pragma: no cover - defensive host boundary
         return _error_result(f"网页搜索失败：{error}", "WEB_SEARCH_ERROR", [])
 
@@ -188,6 +238,7 @@ def _search_bing_rss(query: str, timeout: float, limit: int) -> list[SearchResul
                 snippet=_clean_text(item.findtext("description") or ""),
                 source_engine="bing_rss",
                 fetched_at=fetched_at,
+                published_at=(item.findtext("pubDate") or "").strip(),
             )
         )
         if len(results) >= limit:
@@ -251,6 +302,7 @@ def _search_duckduckgo(query: str, timeout: float, limit: int) -> list[SearchRes
             snippet=result.snippet,
             source_engine=result.source_engine,
             fetched_at=result.fetched_at,
+            published_at=result.published_at,
         )
         for result in results
     ]
@@ -384,23 +436,75 @@ def _validate_queries(queries: list[str], max_queries: int) -> None:
         raise WebSearchError("queries 中每一项都必须是非空字符串。", "WEB_INVALID_ARGUMENT")
 
 
-def _format_sources(sources: list[dict[str, str]], attempts: list[SearchAttempt]) -> str:
+def _format_sources(
+    sources: list[dict[str, str]],
+    attempts: list[SearchAttempt],
+    *,
+    as_of: str = "",
+    time_filter: dict[str, int] | None = None,
+) -> str:
     if not sources:
-        return "未找到搜索结果。" + _format_diagnostics(attempts)
+        message = "未找到搜索结果。"
+        if as_of:
+            message = "没有找到发布时间可确认且不晚于模拟截止时间的搜索结果。"
+        return message + _format_time_filter(as_of, time_filter) + _format_diagnostics(attempts)
     lines = ["搜索结果："]
     for index, source in enumerate(sources, 1):
-        title = source["title"] or source["url"]
+        requires_fetch = source.get("as_of_status") == "requires_fetch"
+        title = source["title"] or f"待核验候选 {index}"
         details = " | ".join(
             value
-            for value in (source["snippet"], source["source_engine"], source["fetched_at"])
+            for value in (
+                "发布时间未知，必须使用 web_fetch 核验" if requires_fetch else source["snippet"],
+                source.get("published_at", ""),
+                source["source_engine"],
+                source["fetched_at"],
+            )
             if value
         )
         lines.append(f"{index}. [{title}]({source['url']})" + (f" - {details}" if details else ""))
     failed_attempts = [attempt for attempt in attempts if attempt.status not in {"success", "empty"}]
     if failed_attempts:
         lines.append(_format_diagnostics(failed_attempts).lstrip())
+    if as_of:
+        lines.append(_format_time_filter(as_of, time_filter).strip())
     lines.append("请在最终答复中引用相关 URL，并自行核验内容和发布时间。")
     return "\n".join(lines)
+
+
+def _format_time_filter(as_of: str, counts: dict[str, int] | None) -> str:
+    if not as_of:
+        return ""
+    values = counts or {}
+    return (
+        f" 点时过滤：as_of={as_of}，保留 {values.get('accepted', 0)}，"
+        f"未来 {values.get('future', 0)}，时间未知 {values.get('unknown', 0)}，"
+        f"盘中时间不明确 {values.get('ambiguous', 0)}，跑题 {values.get('irrelevant', 0)}；"
+        "未知和不明确项仅返回脱敏 URL 待核验。"
+    )
+
+
+def _find_date(text: str) -> str:
+    match = re.search(
+        r"(?<!\d)(20\d{2}[-年/]\d{1,2}[-月/]\d{1,2}(?:日)?"
+        r"(?:[ T]+\d{1,2}:\d{2}(?::\d{2})?)?)(?!\d)",
+        text,
+    )
+    return match.group(1) if match else ""
+
+
+def _is_relevant_result(query: str, result: SearchResult) -> bool:
+    """用查询中的第一个有效主体词过滤搜索引擎明显跑题结果。"""
+    tokens = [token.strip("，,。；;：:()（）[]【】") for token in query.split()]
+    meaningful = [
+        token
+        for token in tokens
+        if len(token) >= 2 and not re.fullmatch(r"20\d{2}(?:年\d{1,2}月?)?", token)
+    ]
+    if not meaningful:
+        return True
+    haystack = f"{result.title} {result.snippet}".lower()
+    return meaningful[0].lower() in haystack
 
 
 def _format_diagnostics(attempts: list[SearchAttempt]) -> str:
@@ -423,6 +527,9 @@ def _success_result(
     text: str,
     sources: list[dict[str, str]],
     attempts: list[dict[str, Any]],
+    *,
+    as_of: str = "",
+    time_filter: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     return {
         "stdout": text,
@@ -441,7 +548,12 @@ def _success_result(
         "operation": "web_search",
         "content_hash": None,
         "exception_info": "",
-        "extra": {"sources": sources, "attempts": attempts},
+        "extra": {
+            "sources": sources,
+            "attempts": attempts,
+            "as_of": as_of,
+            "time_filter": time_filter or {},
+        },
     }
 
 

@@ -55,6 +55,11 @@ class LocalEnvironmentConfig(BaseModel):
     timeout: float = 30
     web_search_engines: list[str] = Field(default_factory=lambda: list(DEFAULT_SEARCH_ENGINES))
     web_search_max_results: int = Field(default=8, ge=1)
+    web_as_of: str = Field(default_factory=lambda: os.getenv("MSWEA_WEB_AS_OF", "").strip())
+    web_fetch_browser_enabled: bool = Field(
+        default_factory=lambda: os.getenv("MSWEA_WEB_FETCH_BROWSER", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
     miniqmt_bridge_url: str = Field(
         default_factory=lambda: os.getenv("MINIQMT_BRIDGE_URL", "http://127.0.0.1:8023")
     )
@@ -95,6 +100,8 @@ class LocalEnvironment:
             return execute_web_fetch(
                 action.get("url", ""),
                 timeout=timeout if timeout is not None else self.config.timeout,
+                as_of=self.config.web_as_of,
+                browser_enabled=self.config.web_fetch_browser_enabled,
             )
         if action.get("tool") == "financial_calc":
             result = execute_financial_calc(action.get("operation", ""), action.get("inputs", {}))
@@ -199,6 +206,7 @@ class LocalEnvironment:
             timeout=search_timeout,
             engines=self.config.web_search_engines,
             max_results=self.config.web_search_max_results,
+            as_of=self.config.web_as_of,
         )
 
     def _execute_miniqmt_trade(self, action: dict) -> dict[str, Any]:
@@ -307,6 +315,8 @@ class LocalEnvironment:
                 timeout=self.config.timeout,
                 web_search_engines=list(self.config.web_search_engines),
                 web_search_max_results=self.config.web_search_max_results,
+                web_as_of=self.config.web_as_of,
+                web_fetch_browser_enabled=self.config.web_fetch_browser_enabled,
                 miniqmt_bridge_url=self.config.miniqmt_bridge_url,
                 miniqmt_mode="observe" if self.config.account_review_mode else self.config.miniqmt_mode,
                 account_journal_dir=self.config.account_journal_dir,

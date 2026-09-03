@@ -65,7 +65,7 @@ WEB_SEARCH_TOOL = {
     "type": "function",
     "function": {
         "name": "web_search",
-        "description": "使用仓库自带的零 Key 多引擎能力搜索当前网络信息。返回去重后的来源 URL、标题、抓取时间和摘要；最终答复应引用相关 URL。",
+        "description": "使用仓库自带的零 Key 多引擎能力搜索网络信息。返回去重后的 URL、标题、摘要、来源、抓取时间和可识别的发布时间；模拟模式会隐藏截止时间之后的结果，时间不明候选只返回脱敏 URL，必须再用 web_fetch 核验。搜索摘要不能作为最终事实。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -86,7 +86,7 @@ WEB_FETCH_TOOL = {
     "type": "function",
     "function": {
         "name": "web_fetch",
-        "description": "打开 web_search 返回的一个 URL，提取页面标题、可识别的发布时间和正文文本。仅用于查看具体来源，不要批量抓取。",
+        "description": "打开 web_search 返回的一个 URL，先用 HTTP 提取正文，质量不足时可由宿主降级到浏览器渲染；返回来源、标题、发布时间、正文、抓取引擎和质量诊断。模拟模式会阻断晚于截止时间或发布时间不明的正文。",
         "parameters": {
             "type": "object",
             "properties": {
