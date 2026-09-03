@@ -30,6 +30,7 @@ tests/test_core.py                               核心功能测试
 - 优先采用显式构造，不要增加工厂或兼容性垫片。
 - 配置保存在 `deepseek.yaml`；密钥从 `DS_KEY` 读取。
 - 永远不要序列化或记录 `DS_KEY`。
+- GitHub API Token 由用户在 `~/.zshrc` 中导出为 `GITHUB_TOKEN`；非交互命令创建 PR 时需通过交互 `zsh` 加载，但不得打印、序列化或记录其值。
 - 代码注释应用中文，清楚的解释为什么这么开发。
 - 使用 `pytest` 编写测试，使用 `ruff` 做静态检查。
 - 模型请求使用 mock client 测试；只有明确的 smoke test 才允许发起真实 DeepSeek 请求。
