@@ -57,12 +57,23 @@ mini --agent financial_manager -t "先查看我的账户和持仓，再分析风
 
 研究候选不是订单。`financial_research` 必须给出 `research_as_of`、`previous_close_as_of`、`data_cutoff`、`data_sufficiency`、`buy_candidates` 和缺失数据；`portfolio_manager` 必须说明每个候选为何选入、缩减或拒绝，并将现金、集中度、T+1 和未完成委托纳入取舍；只有完整的 `order_plan` 才能交给 `account_trader`。任何数据不足、风险检查失败或 `unknown` 结果都会降级为 HOLD 并写入每日账本。
 
-自主账户循环使用下面的显式入口。交易日 08:30 创建盘前上下文，由研究 Agent 结合新闻、昨日收盘和账户持仓生成候选，组合经理确认取舍后通过 `account_monitor` 写入显式监控计划。09:20 至 11:30、13:00 至 15:00 由宿主轮询计划；触发买卖点时只创建 `account_trader` 上下文做当前行情和账户风控，不重新研究。交易 Agent 可在成交或拒绝后更新对应监控计划。15:10 自动创建新的只读上下文完成收盘复盘并清理已失效计划。
+自主账户循环使用下面的显式入口。交易日 09:20 创建盘前上下文，由研究 Agent 结合当前行情、新闻、昨日收盘和账户持仓生成候选，组合经理确认取舍后通过 `account_monitor` 写入显式监控计划。09:30 至 11:30、13:00 至 15:00 由宿主轮询计划；触发买卖点时只创建 `account_trader` 上下文做当前行情和账户风控，不重新研究。12:50 追加一次午盘前复核，重新检查上午行情和新闻并更新下午计划。交易 Agent 可在成交或拒绝后更新对应监控计划。15:10 自动创建新的只读上下文完成收盘复盘并清理已失效计划。
 
 ```bash
 mini --account-loop
+mini --account-day
 mini --close-review
 ```
+
+`--account-day` 运行一个交易日后退出，适合由 macOS `launchd` 在开盘日 09:20 启动；`--account-loop` 适合常驻服务，二者都使用相同的盘前、午盘前、盘中监控和收盘复盘流程。
+
+在 macOS 上安装工作日自动任务（任务会从当前工作目录 `.env` 读取 `DS_KEY`、MiniQMT Bridge 和账户配置）：
+
+```bash
+mini --install-account-schedule
+```
+
+该任务每天 09:20 启动 `--account-day`，12:50 执行午盘前复核，15:10 复盘后退出；日志位于 `.sessions/account-manager/logs/`。卸载可执行 `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.minisweagent.account-day.plist`。
 
 循环入口使用 `auto_execute`，不请求逐笔人工审批。重复启动会被状态目录中的运行锁拒绝。需要立即停止所有写操作时设置 `MINIQMT_KILL_SWITCH=1`；状态目录可通过 `MINIQMT_AGENT_STATE_DIR` 调整。
 

@@ -3,8 +3,10 @@
 
 import json
 import os
+import plistlib
 import re
 import secrets
+import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -141,6 +143,7 @@ def _account_cycle(
     *,
     close_review: bool = False,
     premarket: bool = False,
+    midday_review: bool = False,
 ) -> None:
     """每次创建全新 Agent；跨轮状态只从每日账本和状态库恢复。"""
     started = datetime.now(TRADING_TZ)
@@ -163,7 +166,7 @@ def _account_cycle(
     environment_settings = recursive_merge(
         settings.get("environment", {}),
         {
-            "miniqmt_mode": "observe" if close_review or premarket else "auto_execute",
+            "miniqmt_mode": "observe" if close_review or premarket or midday_review else "auto_execute",
             "account_journal_dir": str(journal_dir),
             "account_cycle_id": cycle_id,
             "account_review_mode": close_review,
@@ -185,9 +188,15 @@ def _account_cycle(
     )
     if premarket:
         task = (
-            f"盘前分析模式（只读，不得下单），交易日 {started.date().isoformat()}；"
+            f"09:20 盘前分析模式（只读，不得下单），交易日 {started.date().isoformat()}；"
             "必须以 account_journal.previous 中前一交易日收盘记录为基准，结合今日新闻和账户持仓完成研究、组合取舍，"
             f"并将后续行情触发计划写入 account_monitor：{task}"
+        )
+    elif midday_review:
+        task = (
+            f"12:50 午盘前计划复核模式（只读，不得下单），交易日 {started.date().isoformat()}；"
+            "先读取 account_journal.today 和 account_monitor 当前计划，再结合上午收盘行情、上午新增新闻和最新账户状态，"
+            f"重新调用研究与组合 Agent；保留、修改或撤销计划后，用 account_monitor replace 写入完整新计划：{task}"
         )
     elif close_review:
         task = (
@@ -309,10 +318,11 @@ def _account_loop_slot(now: datetime) -> tuple[str, str] | None:
     if now.weekday() >= 5:
         return None
     current = now.time()
-    # 允许服务在 08:30 后才启动时补做一次盘前分析，09:20 后进入行情监控。
-    if clock_time(8, 30) <= current < clock_time(9, 20):
+    if clock_time(9, 20) <= current < clock_time(9, 30):
         return "premarket", now.date().isoformat()
-    trading = clock_time(9, 20) <= current <= clock_time(11, 30) or clock_time(13, 0) <= current <= clock_time(15, 0)
+    if clock_time(12, 50) <= current < clock_time(13, 0):
+        return "midday", now.date().isoformat()
+    trading = clock_time(9, 30) <= current <= clock_time(11, 30) or clock_time(13, 0) <= current <= clock_time(15, 0)
     if trading:
         return "monitor", now.date().isoformat()
     if current >= clock_time(15, 10):
@@ -338,6 +348,47 @@ def _acquire_account_loop_lock() -> Any:
     return handle
 
 
+def _install_account_schedule(config: Path) -> Path:
+    """安装 macOS 工作日 09:20 启动的账户日任务。"""
+    if sys.platform != "darwin":
+        raise RuntimeError("--install-account-schedule 仅支持 macOS launchd")
+    working_directory = Path.cwd().resolve()
+    state_dir = Path(os.getenv("MINIQMT_AGENT_STATE_DIR", ".sessions/account-manager"))
+    if not state_dir.is_absolute():
+        state_dir = working_directory / state_dir
+    state_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = state_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    plist_path = Path.home() / "Library" / "LaunchAgents" / "com.minisweagent.account-day.plist"
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "Label": "com.minisweagent.account-day",
+        "ProgramArguments": [
+            sys.executable,
+            "-m",
+            "minisweagent.run.mini",
+            "--account-day",
+            "--config",
+            str(config.resolve()),
+        ],
+        "WorkingDirectory": str(working_directory),
+        "StartCalendarInterval": [
+            {"Weekday": weekday, "Hour": 9, "Minute": 20} for weekday in range(1, 6)
+        ],
+        "RunAtLoad": False,
+        "ProcessType": "Background",
+        "ThrottleInterval": 30,
+        "StandardOutPath": str(logs_dir / "account-day.out.log"),
+        "StandardErrorPath": str(logs_dir / "account-day.err.log"),
+    }
+    plist_path.write_bytes(plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=False))
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", domain, str(plist_path)], check=False, capture_output=True)
+    subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True)
+    console.print(f"已安装账户日定时任务：{plist_path}")
+    return plist_path
+
+
 @app.command()
 def main(
     task: str | None = typer.Option(None, "-t", "--task", help="Task for the agent."),
@@ -355,21 +406,29 @@ def main(
     ),
     timeout: int | None = typer.Option(None, "--timeout", min=1, help="Bash timeout in seconds."),
     account_loop: bool = typer.Option(False, "--account-loop", help="运行盘前分析、盘中行情监控触发交易和收盘复盘。"),
+    account_day: bool = typer.Option(False, "--account-day", help="运行一个交易日并在收盘复盘后退出，供定时任务使用。"),
+    install_account_schedule: bool = typer.Option(False, "--install-account-schedule", help="安装 macOS 工作日 09:20 自动运行的账户日定时任务。"),
     close_review: bool = typer.Option(False, "--close-review", help="运行一次只读收盘复盘。"),
 ) -> Any:
     """Run DeepSeek V4 Flash with host-owned Bash, editor, and web search tools."""
     _load_dotenv()
     settings = get_config_from_spec(config)
-    if account_loop or close_review:
-        if account_loop and close_review:
-            raise typer.BadParameter("--account-loop 与 --close-review 不能同时使用")
+    if install_account_schedule:
+        if account_loop or account_day or close_review:
+            raise typer.BadParameter("--install-account-schedule 不能与账户运行参数同时使用")
+        _install_account_schedule(config)
+        return None
+    if account_loop or account_day or close_review:
+        if sum((account_loop, account_day, close_review)) > 1:
+            raise typer.BadParameter("--account-loop、--account-day 与 --close-review 不能同时使用")
         cycle_task = task or "观察账户、行情和未完成委托，判断是否需要交易并记录本轮完整决策。"
         if close_review:
             _account_cycle(settings, cycle_task, close_review=True)
             return None
         loop_lock = _acquire_account_loop_lock()
-        console.print("账户管理循环已启动：08:30 盘前分析，交易时段轮询监控计划并触发交易，15:10 收盘复盘。")
+        console.print("账户管理循环已启动：09:20 盘前分析，12:50 午盘前复核，盘中监控触发交易，15:10 收盘复盘。")
         premarket_day = ""
+        midday_day = ""
         review_day = ""
         journal_dir = Path(os.getenv("MINIQMT_AGENT_STATE_DIR", ".sessions/account-manager"))
         if not journal_dir.is_absolute():
@@ -383,6 +442,10 @@ def main(
                     if kind == "premarket" and day_key != premarket_day:
                         premarket_day = day_key
                         _account_cycle(settings, cycle_task, premarket=True)
+                    elif kind == "midday" and day_key != midday_day:
+                        midday_day = day_key
+                        midday_task = "复核上午行情、新闻、成交和账户变化，判断是否保留、修改或撤销下午监控计划。"
+                        _account_cycle(settings, midday_task, midday_review=True)
                     elif kind == "monitor":
                         for event in _poll_market_monitor(settings, journal_dir):
                             _run_trade_trigger(settings, event, journal_dir)
@@ -391,6 +454,8 @@ def main(
                         review_task = "核对当日成交、收益、滑点、决策偏差、监控触发、监控更新和踩坑，并写出下一交易日观察计划。"
                         _account_cycle(settings, review_task, close_review=True)
                         MarketMonitor(journal_dir).clear()
+                        if account_day:
+                            return None
                 # 轮询频率由宿主控制，不保留任何 Agent 上下文。
                 time.sleep(10)
         finally:

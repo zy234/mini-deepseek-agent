@@ -186,12 +186,16 @@ def test_market_monitor_persists_plans_and_emits_each_trigger_once(tmp_path):
 
 def test_account_loop_schedules_premarket_monitoring_and_close_review():
     tz = mini.TRADING_TZ
-    assert mini._account_loop_slot(datetime(2026, 9, 3, 8, 30, tzinfo=tz)) == (
+    assert mini._account_loop_slot(datetime(2026, 9, 3, 9, 20, tzinfo=tz)) == (
         "premarket",
         "2026-09-03",
     )
-    assert mini._account_loop_slot(datetime(2026, 9, 3, 9, 25, tzinfo=tz)) == (
+    assert mini._account_loop_slot(datetime(2026, 9, 3, 9, 35, tzinfo=tz)) == (
         "monitor",
+        "2026-09-03",
+    )
+    assert mini._account_loop_slot(datetime(2026, 9, 3, 12, 50, tzinfo=tz)) == (
+        "midday",
         "2026-09-03",
     )
     assert mini._account_loop_slot(datetime(2026, 9, 3, 15, 10, tzinfo=tz)) == (
