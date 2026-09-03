@@ -10,7 +10,7 @@ import pytest
 from minisweagent.agents import get_agent
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.agents.single_shot import SingleShotAgent
-from minisweagent.environments import editor, market_monitor, web_fetch, web_search
+from minisweagent.environments import account_journal, editor, market_monitor, web_fetch, web_search
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.exceptions import CommandNotApproved, FormatError, Submitted
@@ -202,6 +202,15 @@ def test_account_loop_schedules_premarket_monitoring_and_close_review():
         "review",
         "2026-09-03-close",
     )
+
+
+def test_account_journal_reads_observation_todo(tmp_path):
+    todo = tmp_path / "observation-todo.md"
+    todo.write_text("明日核对现金和监控计划", encoding="utf-8")
+
+    result = account_journal.read_account_journal(tmp_path)
+
+    assert result["data"]["observation_todo"] == "明日核对现金和监控计划"
 
 
 def test_web_search_is_standalone_without_ds_key_and_deduplicates(monkeypatch):

@@ -24,8 +24,9 @@ RECORD_FIELDS = {
 
 
 def read_account_journal(directory: str | Path) -> dict[str, Any]:
-    """读取当日记录和最近一次收盘复盘，作为新会话的唯一持久记忆。"""
+    """读取当日记录、收盘复盘和待观测清单，作为新会话的持久记忆。"""
     journal_dir = Path(directory).expanduser().resolve() / "journals"
+    todo_path = journal_dir.parent / "observation-todo.md"
     today = datetime.now(TRADING_TZ).date().isoformat()
     today_path = journal_dir / f"{today}.md"
     previous_paths = sorted(path for path in journal_dir.glob("*.md") if path.name < today_path.name)
@@ -36,6 +37,7 @@ def read_account_journal(directory: str | Path) -> dict[str, Any]:
             "date": today,
             "today": _read_tail(today_path, MAX_JOURNAL_READ_CHARS),
             "previous": _read_tail(previous_path, 12_000) if previous_path else "",
+            "observation_todo": _read_tail(todo_path, 12_000),
         },
     )
 
