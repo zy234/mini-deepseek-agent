@@ -2,6 +2,7 @@
 """Run the single-model DeepSeek Bash agent."""
 
 import os
+import re
 import secrets
 import sys
 from datetime import datetime
@@ -24,6 +25,25 @@ DEFAULT_CONFIG_FILE = Path(
 )
 console = Console(highlight=False)
 app = typer.Typer(add_completion=False)
+
+
+def _load_dotenv(path: Path | None = None) -> None:
+    """读取当前目录的简单 .env；已有 shell 环境变量优先。"""
+    env_path = path or Path.cwd() / ".env"
+    if not env_path.is_file():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$", line)
+        if not match:
+            continue
+        key, value = match.groups()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
 
 
 def _select_agent_name(profiles: dict, requested: str | None) -> str:
@@ -127,6 +147,7 @@ def main(
     timeout: int | None = typer.Option(None, "--timeout", min=1, help="Bash timeout in seconds."),
 ) -> Any:
     """Run DeepSeek V4 Flash with host-owned Bash, editor, and web search tools."""
+    _load_dotenv()
     settings = get_config_from_spec(config)
     agent_name = _select_agent_name(settings.get("agents", {}), agent_name)
     agent_settings = _get_agent_settings(settings, agent_name)
