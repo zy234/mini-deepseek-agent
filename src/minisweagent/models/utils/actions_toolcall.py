@@ -160,7 +160,7 @@ MINIQMT_TRADE_TOOL = {
     "type": "function",
     "function": {
         "name": "miniqmt_trade",
-        "description": "向宿主绑定的个人账户提交或撤销委托。默认 observe 模式会阻断；execute 模式仍需终端人工审批。",
+        "description": "向宿主绑定的个人账户提交或撤销委托。observe 阻断，execute 人工审批，auto_execute 通过宿主安全规则后自动执行。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -172,6 +172,45 @@ MINIQMT_TRADE_TOOL = {
                 },
             },
             "required": ["operation", "inputs"],
+            "additionalProperties": False,
+        },
+    },
+}
+ACCOUNT_JOURNAL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "account_journal",
+        "description": "读取账户管理每日记录，或追加本轮结构化观点、决策、操作、后续观察和踩坑。路径和时间由宿主决定。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["read", "append"]},
+                "record": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["BUY", "SELL", "CANCEL", "HOLD", "REVIEW"]},
+                        "market_view": {"type": "string"},
+                        "account_risk": {"type": "string"},
+                        "decision": {"type": "string"},
+                        "follow_up": {"type": "string"},
+                        "orders": {"type": "array", "items": {"type": "string"}},
+                        "pitfalls": {"type": "array", "items": {"type": "string"}},
+                        "tool_errors": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": [
+                        "action",
+                        "market_view",
+                        "account_risk",
+                        "decision",
+                        "follow_up",
+                        "orders",
+                        "pitfalls",
+                        "tool_errors",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["operation"],
             "additionalProperties": False,
         },
     },
@@ -210,6 +249,7 @@ TOOL_DEFINITIONS = [
     MINIQMT_QUOTES_TOOL,
     MINIQMT_ACCOUNT_TOOL,
     MINIQMT_TRADE_TOOL,
+    ACCOUNT_JOURNAL_TOOL,
     AGENT_CALL_TOOL,
 ]
 TOOL_DEFINITIONS_BY_NAME = {tool["function"]["name"]: tool for tool in TOOL_DEFINITIONS}
@@ -284,6 +324,8 @@ def parse_toolcall_actions(
             error_msg += _validate_miniqmt_account_args(args)
         elif tool_name == "miniqmt_trade":
             error_msg += _validate_miniqmt_trade_args(args)
+        elif tool_name == "account_journal":
+            error_msg += _validate_account_journal_args(args)
         elif tool_name == "agent_call":
             error_msg += _validate_agent_call_args(args)
         if isinstance(args, dict):
@@ -301,6 +343,8 @@ def parse_toolcall_actions(
                 allowed = {"view"}
             elif tool_name == "miniqmt_trade":
                 allowed = {"operation", "inputs"}
+            elif tool_name == "account_journal":
+                allowed = {"operation", "record"}
             elif tool_name == "agent_call":
                 allowed = {"role", "task"}
             else:
@@ -361,6 +405,12 @@ def parse_toolcall_actions(
         if tool_name == "miniqmt_trade":
             action["operation"] = args["operation"]
             action["inputs"] = args["inputs"]
+            actions.append(action)
+            continue
+        if tool_name == "account_journal":
+            action["operation"] = args["operation"]
+            if "record" in args:
+                action["record"] = args["record"]
             actions.append(action)
             continue
         if tool_name == "agent_call":
@@ -463,6 +513,17 @@ def _validate_miniqmt_trade_args(args: dict) -> str:
         return "miniqmt_trade 的 operation 不受支持。"
     if not isinstance(args.get("inputs"), dict):
         return "miniqmt_trade 的 inputs 必须是对象。"
+    return ""
+
+
+def _validate_account_journal_args(args: dict) -> str:
+    operation = args.get("operation")
+    if operation not in {"read", "append"}:
+        return "account_journal 的 operation 必须是 read 或 append。"
+    if operation == "read" and "record" in args:
+        return "account_journal read 不能包含 record。"
+    if operation == "append" and not isinstance(args.get("record"), dict):
+        return "account_journal append 必须包含 record 对象。"
     return ""
 
 

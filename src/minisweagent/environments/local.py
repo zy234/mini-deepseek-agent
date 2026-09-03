@@ -11,6 +11,10 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from minisweagent.environments.account_journal import (
+    append_account_cycle,
+    read_account_journal,
+)
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.editor import execute_editor
 from minisweagent.environments.financial_calc import execute_financial_calc
@@ -54,6 +58,9 @@ class LocalEnvironmentConfig(BaseModel):
         default_factory=lambda: os.getenv("MINIQMT_BRIDGE_URL", "http://127.0.0.1:8023")
     )
     miniqmt_mode: str = Field(default_factory=lambda: os.getenv("MINIQMT_AGENT_MODE", "observe"))
+    account_journal_dir: str = ".sessions/account-manager"
+    account_cycle_id: str = Field(default_factory=lambda: f"manual-{time.time_ns()}")
+    account_review_mode: bool = False
     agent_profiles: dict[str, dict[str, Any]] = Field(default_factory=dict)
     agent_common_config: dict[str, Any] = Field(default_factory=dict)
     agent_model_config: dict[str, Any] = Field(default_factory=dict)
@@ -94,6 +101,8 @@ class LocalEnvironment:
             return _json_tool_output("miniqmt_account", self._get_miniqmt().account(action.get("view", "")))
         if action.get("tool") == "miniqmt_trade":
             return self._execute_miniqmt_trade(action)
+        if action.get("tool") == "account_journal":
+            return self._execute_account_journal(action)
         if action.get("tool") == "agent_call":
             return self._execute_agent_call(action)
         command = action.get("command", "")
@@ -204,6 +213,26 @@ class LocalEnvironment:
                 )
         return _json_tool_output("miniqmt_trade", self._get_miniqmt().trade(operation, inputs))
 
+    def _execute_account_journal(self, action: dict) -> dict[str, Any]:
+        operation = action.get("operation", "")
+        if operation == "read":
+            result = read_account_journal(self.config.account_journal_dir)
+        elif operation == "append":
+            result = append_account_cycle(
+                self.config.account_journal_dir,
+                self.config.account_cycle_id,
+                action.get("record"),
+            )
+        else:
+            result = {
+                "ok": False,
+                "status": "error",
+                "operation": None,
+                "data": None,
+                "error": {"code": "invalid_argument", "detail": "account_journal 只支持 read 或 append"},
+            }
+        return _json_tool_output("account_journal", result)
+
     def _execute_agent_call(self, action: dict) -> dict[str, Any]:
         """在宿主侧运行固定子 Agent，避免模型自行获得账户工具或递归编排能力。"""
         role = action.get("role", "")
@@ -250,7 +279,10 @@ class LocalEnvironment:
                 web_search_engines=list(self.config.web_search_engines),
                 web_search_max_results=self.config.web_search_max_results,
                 miniqmt_bridge_url=self.config.miniqmt_bridge_url,
-                miniqmt_mode=self.config.miniqmt_mode,
+                miniqmt_mode="observe" if self.config.account_review_mode else self.config.miniqmt_mode,
+                account_journal_dir=self.config.account_journal_dir,
+                account_cycle_id=self.config.account_cycle_id,
+                account_review_mode=self.config.account_review_mode,
                 approval_callback=self.approval_callback,
             )
             child_agent = get_agent(child_model, child_environment, child_settings)
@@ -297,6 +329,8 @@ class LocalEnvironment:
                 base_url=self.config.miniqmt_bridge_url,
                 timeout=self.config.timeout,
                 mode=self.config.miniqmt_mode,
+                state_dir=self.config.account_journal_dir,
+                cycle_id=self.config.account_cycle_id,
             )
         return self._miniqmt
 

@@ -45,7 +45,7 @@ mini --timeout 60
 - `financial_research`：查询行情、核验网页证据并执行确定性金融计算，不访问账户。
 - `portfolio_manager`：只读查询个人账户、行情和组合风险，不执行交易。
 - `account_trader`：查询个人账户和行情，按宿主安全配置提交或撤销委托。
-- `financial_manager`：主 Agent，只能通过 `agent_call` 按顺序调用上述三个金融子 Agent，综合结果管理账户。
+- `financial_manager`：自主账户管理主 Agent，通过固定金融子 Agent 完成观察、研究和交易，并维护每日账本。
 
 账户管理主 Agent 用法：
 
@@ -53,7 +53,16 @@ mini --timeout 60
 mini --agent financial_manager -t "先查看我的账户和持仓，再分析风险；不要下单"
 ```
 
-主 Agent 不直接接触 MiniQMT 工具。宿主只允许委派到固定角色，每次运行最多调用 4 次；子 Agent 使用独立上下文且不能继续委派。交易是否允许、是否需要人工审批以及 `observe`/`execute` 模式，仍由 `miniqmt_trade` 工具内部强制执行。
+主 Agent 不直接接触 MiniQMT 工具。宿主只允许委派到固定角色，每次运行最多调用 4 次；子 Agent 使用独立上下文且不能继续委派。交易权限和风险规则由 `miniqmt_trade` 工具内部强制执行。
+
+自主账户循环使用下面的显式入口。交易日 09:20 至 11:30、13:00 至 15:00 每 10 分钟创建一套全新的 Agent/模型/环境，不继承上轮消息；只读取 `.sessions/account-manager/journals/YYYY-MM-DD.md` 和实时工具结果。15:10 自动创建新的只读上下文完成收盘复盘。
+
+```bash
+mini --account-loop
+mini --close-review
+```
+
+循环入口使用 `auto_execute`，不请求逐笔人工审批。重复启动会被状态目录中的运行锁拒绝。需要立即停止所有写操作时设置 `MINIQMT_KILL_SWITCH=1`；状态目录可通过 `MINIQMT_AGENT_STATE_DIR` 调整。
 
 项目提供 Bash、文件编辑、网页搜索和网页抓取能力。运行环境直接使用当前用户权限，请勿在不可信目录或任务中运行。
 
@@ -66,7 +75,21 @@ export MINIQMT_AGENT_MODE="observe"         # 默认值，禁止提交和撤单
 mini --agent portfolio_manager
 ```
 
-需要交易时显式设置 `MINIQMT_AGENT_MODE=execute` 并启动 `account_trader`。每次交易仍会在终端请求人工审批，单笔数量默认不超过 10000 股，可由宿主通过 `MINIQMT_MAX_ORDER_VOLUME` 收紧或调整。账户号和 API key 不进入模型参数、会话记录或 Bash 子进程；`accepted` 只表示接口接受委托，不表示成交。提交结果为 `unknown` 时禁止自动重试，必须先查询委托和成交。
+直接运行 `account_trader` 时，`MINIQMT_AGENT_MODE=observe` 禁止交易，`execute` 保留逐笔终端审批，`auto_execute` 则免审批但仍执行全部宿主规则。账户循环会显式使用 `auto_execute`。
+
+默认安全限制如下，可由宿主环境变量进一步收紧：
+
+- `MINIQMT_MAX_ORDER_VOLUME=10000`：所有订单的绝对股数上限。
+- `MINIQMT_MAX_BUY_VOLUME` / `MINIQMT_MAX_SELL_VOLUME`：买卖方向股数上限，默认继承绝对上限。
+- `MINIQMT_MAX_BUY_NOTIONAL=20000`：单笔买入金额上限；买入必须使用固定限价。
+- `MINIQMT_MAX_DAILY_BUY_NOTIONAL=50000`：单日累计买入金额上限。
+- `MINIQMT_MAX_ORDERS_PER_CYCLE=2` / `MINIQMT_MAX_ORDERS_PER_DAY=8`：写操作次数上限。
+- `MINIQMT_MIN_CASH_RATIO=0.10`：买入后的最低现金比例。
+- `MINIQMT_MAX_QUOTE_AGE_SECONDS=30` / `MINIQMT_MAX_PRICE_DEVIATION_BPS=50`：行情新鲜度和限价偏离上限。
+
+卖出前工具会重新查询持仓成本、可卖数量和最新价。盈利时允许卖出；浮亏小于 10% 时禁止卖出；浮亏达到或超过 10% 时作为止损允许卖出。字段缺失、非交易时段、账户或行情异常、重复意图、次数超限及 `unknown` 状态都会阻断后续提交。意图和工具结果持久化在状态目录中，清空上下文或重启进程不会解除冻结。
+
+账户号和 API key 不进入模型参数、账本、会话记录或 Bash 子进程；`accepted` 只表示接口接受委托，不表示成交。提交结果为 `unknown` 时禁止自动重试，必须先查询委托和成交。
 
 金融 Agent 调研记录见 [`docs/financial-agents/`](docs/financial-agents/README.md)，其中每个候选仓库都有独立的架构分析、许可证/依赖注意事项和迁移实现建议。
 

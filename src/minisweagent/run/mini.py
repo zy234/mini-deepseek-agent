@@ -5,7 +5,9 @@ import os
 import re
 import secrets
 import sys
-from datetime import datetime
+import time
+from datetime import datetime, timedelta, timezone
+from datetime import time as clock_time
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,7 @@ from rich.console import Console
 from minisweagent.agents import get_agent
 from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
+from minisweagent.environments.account_journal import append_cycle_fallback
 from minisweagent.models import get_model
 from minisweagent.utils.cli_display import clear_recent_full_blocks, render_recent_full_blocks
 from minisweagent.utils.serialize import UNSET, recursive_merge
@@ -25,6 +28,7 @@ DEFAULT_CONFIG_FILE = Path(
 )
 console = Console(highlight=False)
 app = typer.Typer(add_completion=False)
+TRADING_TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
 
 
 def _load_dotenv(path: Path | None = None) -> None:
@@ -129,6 +133,102 @@ def _run_session(agent: Any, task: str, *, interactive: bool) -> None:
         _print_result(result, submission_streamed=_submission_was_streamed(agent))
 
 
+def _account_cycle(settings: dict, task: str, *, close_review: bool = False) -> None:
+    """每次创建全新 Agent；跨轮状态只从每日账本和状态库恢复。"""
+    started = datetime.now(TRADING_TZ)
+    cycle_id = f"{started.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
+    agent_name = "financial_manager"
+    agent_settings = _get_agent_settings(settings, agent_name)
+    session_output, session_id, session_started_at = _new_session_record()
+    agent_settings = recursive_merge(
+        agent_settings,
+        {
+            "output_path": session_output,
+            "session_id": session_id,
+            "session_started_at": session_started_at,
+            "session_cwd": str(Path.cwd()),
+        },
+    )
+    journal_dir = Path(os.getenv("MINIQMT_AGENT_STATE_DIR", ".sessions/account-manager"))
+    if not journal_dir.is_absolute():
+        journal_dir = Path.cwd() / journal_dir
+    environment_settings = recursive_merge(
+        settings.get("environment", {}),
+        {
+            "miniqmt_mode": "observe" if close_review else "auto_execute",
+            "account_journal_dir": str(journal_dir),
+            "account_cycle_id": cycle_id,
+            "account_review_mode": close_review,
+        },
+    )
+    child_roles = {"financial_research", "portfolio_manager", "account_trader"}
+    agent_profiles = {
+        role: dict(settings["agents"][role])
+        for role in child_roles
+        if role in settings.get("agents", {})
+    }
+    environment_settings = recursive_merge(
+        environment_settings,
+        {
+            "agent_profiles": agent_profiles,
+            "agent_common_config": settings.get("agent", {}),
+            "agent_model_config": settings.get("model", {}),
+        },
+    )
+    if close_review:
+        task = f"收盘复盘模式（只读，不得下单）：{task}"
+    else:
+        task = f"自主账户观察周期 {cycle_id}：{task}"
+    model = get_model(settings.get("model", {}))
+    environment = get_environment(environment_settings)
+    agent = get_agent(model, environment, agent_settings)
+    try:
+        result = agent.run(task)
+    except Exception as exc:
+        result = {
+            "exit_status": type(exc).__name__,
+            "submission": f"账户管理周期异常：{type(exc).__name__}: {exc}",
+        }
+    append_cycle_fallback(
+        environment.config.account_journal_dir,
+        cycle_id,
+        result.get("submission", ""),
+        result.get("exit_status", "unknown"),
+    )
+    _print_result(result, submission_streamed=_submission_was_streamed(agent))
+
+
+def _account_loop_slot(now: datetime) -> tuple[str, str] | None:
+    if now.weekday() >= 5:
+        return None
+    current = now.time()
+    trading = clock_time(9, 20) <= current <= clock_time(11, 30) or clock_time(13, 0) <= current <= clock_time(15, 0)
+    if trading:
+        slot_minute = now.minute // 10 * 10
+        return "trade", f"{now.date().isoformat()}-{now.hour:02d}{slot_minute:02d}"
+    if current >= clock_time(15, 10):
+        return "review", f"{now.date().isoformat()}-close"
+    return None
+
+
+def _acquire_account_loop_lock() -> Any:
+    try:
+        import fcntl
+    except ImportError as exc:
+        raise RuntimeError("当前系统不支持账户管理循环所需的文件锁") from exc
+    directory = Path(os.getenv("MINIQMT_AGENT_STATE_DIR", ".sessions/account-manager"))
+    if not directory.is_absolute():
+        directory = Path.cwd() / directory
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = (directory / "account-loop.lock").open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise RuntimeError("已有账户管理循环持有当前状态目录的运行锁") from exc
+    return handle
+
+
 @app.command()
 def main(
     task: str | None = typer.Option(None, "-t", "--task", help="Task for the agent."),
@@ -145,10 +245,34 @@ def main(
         None, "--step-limit", min=0, help="Maximum model calls; 0 disables."
     ),
     timeout: int | None = typer.Option(None, "--timeout", min=1, help="Bash timeout in seconds."),
+    account_loop: bool = typer.Option(False, "--account-loop", help="每 10 分钟以全新上下文运行账户管理 Agent。"),
+    close_review: bool = typer.Option(False, "--close-review", help="运行一次只读收盘复盘。"),
 ) -> Any:
     """Run DeepSeek V4 Flash with host-owned Bash, editor, and web search tools."""
     _load_dotenv()
     settings = get_config_from_spec(config)
+    if account_loop or close_review:
+        if account_loop and close_review:
+            raise typer.BadParameter("--account-loop 与 --close-review 不能同时使用")
+        cycle_task = task or "观察账户、行情和未完成委托，判断是否需要交易并记录本轮完整决策。"
+        if close_review:
+            _account_cycle(settings, cycle_task, close_review=True)
+            return None
+        loop_lock = _acquire_account_loop_lock()
+        console.print("账户管理循环已启动：交易时段每 10 分钟使用全新上下文，15:10 执行只读复盘。")
+        last_slot = ""
+        try:
+            while True:
+                now = datetime.now(TRADING_TZ)
+                scheduled = _account_loop_slot(now)
+                if scheduled and scheduled[1] != last_slot:
+                    kind, last_slot = scheduled
+                    review_task = "核对当日成交、收益、滑点、决策偏差、踩坑，并写出下一交易日观察计划。"
+                    _account_cycle(settings, review_task if kind == "review" else cycle_task, close_review=kind == "review")
+                # 只等待调度，不保留任何 Agent 上下文。
+                time.sleep(10)
+        finally:
+            loop_lock.close()
     agent_name = _select_agent_name(settings.get("agents", {}), agent_name)
     agent_settings = _get_agent_settings(settings, agent_name)
     configured_output = agent_settings.get("output_path")
