@@ -57,7 +57,7 @@ mini --agent financial_manager -t "先查看我的账户和持仓，再分析风
 
 研究候选不是订单。`financial_research` 必须给出 `research_as_of`、`previous_close_as_of`、`data_cutoff`、`data_sufficiency`、`buy_candidates` 和缺失数据；`portfolio_manager` 必须说明每个候选为何选入、缩减或拒绝，并将现金、集中度、T+1 和未完成委托纳入取舍；只有完整的 `order_plan` 才能交给 `account_trader`。任何数据不足、风险检查失败或 `unknown` 结果都会降级为 HOLD 并写入每日账本。
 
-自主账户循环使用下面的显式入口。交易日 09:20 至 11:30、13:00 至 15:00 每 10 分钟创建一套全新的 Agent/模型/环境，不继承上轮消息；只读取 `.sessions/account-manager/journals/YYYY-MM-DD.md` 和实时工具结果。15:10 自动创建新的只读上下文完成收盘复盘。
+自主账户循环使用下面的显式入口。交易日 08:30 创建盘前上下文，由研究 Agent 结合新闻、昨日收盘和账户持仓生成候选，组合经理确认取舍后通过 `account_monitor` 写入显式监控计划。09:20 至 11:30、13:00 至 15:00 由宿主轮询计划；触发买卖点时只创建 `account_trader` 上下文做当前行情和账户风控，不重新研究。交易 Agent 可在成交或拒绝后更新对应监控计划。15:10 自动创建新的只读上下文完成收盘复盘并清理已失效计划。
 
 ```bash
 mini --account-loop

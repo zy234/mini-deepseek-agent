@@ -18,6 +18,7 @@ from minisweagent.environments.account_journal import (
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.editor import execute_editor
 from minisweagent.environments.financial_calc import execute_financial_calc
+from minisweagent.environments.market_monitor import MarketMonitor
 from minisweagent.environments.miniqmt import MiniQMTClient
 from minisweagent.environments.web_fetch import execute_web_fetch
 from minisweagent.environments.web_search import (
@@ -79,6 +80,7 @@ class LocalEnvironment:
         self.config = config_class(**kwargs)
         self.approval_callback = approval_callback or _prompt_for_approval
         self._miniqmt: MiniQMTClient | None = None
+        self._market_monitor: MarketMonitor | None = None
         self._agent_call_count = 0
         # 主 Agent 的交接阶段由宿主记录，避免模型跳过研究或组合风控直接交易。
         self._agent_call_roles: list[str] = []
@@ -105,6 +107,8 @@ class LocalEnvironment:
             return self._execute_miniqmt_trade(action)
         if action.get("tool") == "account_journal":
             return self._execute_account_journal(action)
+        if action.get("tool") == "account_monitor":
+            return self._execute_account_monitor(action)
         if action.get("tool") == "agent_call":
             return self._execute_agent_call(action)
         command = action.get("command", "")
@@ -234,6 +238,26 @@ class LocalEnvironment:
                 "error": {"code": "invalid_argument", "detail": "account_journal 只支持 read 或 append"},
             }
         return _json_tool_output("account_journal", result)
+
+    def _execute_account_monitor(self, action: dict) -> dict[str, Any]:
+        monitor = self._market_monitor or MarketMonitor(self.config.account_journal_dir)
+        self._market_monitor = monitor
+        operation = action.get("operation", "")
+        if operation == "read":
+            result = monitor.read()
+        elif operation == "replace":
+            result = monitor.replace(action.get("plans"))
+        elif operation == "clear":
+            result = monitor.clear()
+        else:
+            result = {
+                "ok": False,
+                "status": "error",
+                "operation": None,
+                "data": None,
+                "error": {"code": "invalid_argument", "detail": "account_monitor 只支持 read、replace 或 clear"},
+            }
+        return _json_tool_output("account_monitor", result)
 
     def _execute_agent_call(self, action: dict) -> dict[str, Any]:
         """在宿主侧运行固定子 Agent，避免模型自行获得账户工具或递归编排能力。"""

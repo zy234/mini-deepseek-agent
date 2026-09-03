@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the single-model DeepSeek Bash agent."""
 
+import json
 import os
 import re
 import secrets
@@ -18,7 +19,8 @@ from rich.console import Console
 from minisweagent.agents import get_agent
 from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
-from minisweagent.environments.account_journal import append_cycle_fallback
+from minisweagent.environments.account_journal import append_account_cycle, append_cycle_fallback
+from minisweagent.environments.market_monitor import MarketMonitor
 from minisweagent.models import get_model
 from minisweagent.utils.cli_display import clear_recent_full_blocks, render_recent_full_blocks
 from minisweagent.utils.serialize import UNSET, recursive_merge
@@ -133,7 +135,13 @@ def _run_session(agent: Any, task: str, *, interactive: bool) -> None:
         _print_result(result, submission_streamed=_submission_was_streamed(agent))
 
 
-def _account_cycle(settings: dict, task: str, *, close_review: bool = False) -> None:
+def _account_cycle(
+    settings: dict,
+    task: str,
+    *,
+    close_review: bool = False,
+    premarket: bool = False,
+) -> None:
     """每次创建全新 Agent；跨轮状态只从每日账本和状态库恢复。"""
     started = datetime.now(TRADING_TZ)
     cycle_id = f"{started.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
@@ -155,7 +163,7 @@ def _account_cycle(settings: dict, task: str, *, close_review: bool = False) -> 
     environment_settings = recursive_merge(
         settings.get("environment", {}),
         {
-            "miniqmt_mode": "observe" if close_review else "auto_execute",
+            "miniqmt_mode": "observe" if close_review or premarket else "auto_execute",
             "account_journal_dir": str(journal_dir),
             "account_cycle_id": cycle_id,
             "account_review_mode": close_review,
@@ -175,7 +183,13 @@ def _account_cycle(settings: dict, task: str, *, close_review: bool = False) -> 
             "agent_model_config": settings.get("model", {}),
         },
     )
-    if close_review:
+    if premarket:
+        task = (
+            f"盘前分析模式（只读，不得下单），交易日 {started.date().isoformat()}；"
+            "必须以 account_journal.previous 中前一交易日收盘记录为基准，结合今日新闻和账户持仓完成研究、组合取舍，"
+            f"并将后续行情触发计划写入 account_monitor：{task}"
+        )
+    elif close_review:
         task = (
             f"收盘复盘模式（只读，不得下单），交易日 {started.date().isoformat()}；"
             f"必须以 account_journal.previous 中前一交易日收盘记录为基准：{task}"
@@ -205,14 +219,102 @@ def _account_cycle(settings: dict, task: str, *, close_review: bool = False) -> 
     _print_result(result, submission_streamed=_submission_was_streamed(agent))
 
 
+def _run_trade_trigger(settings: dict, event: dict[str, Any], journal_dir: Path) -> dict[str, Any]:
+    """行情触发后只启动 account_trader，不重新调用研究或组合 Agent。"""
+    role = "account_trader"
+    profile = dict(settings["agents"][role])
+    profile.pop("description", None)
+    session_output, session_id, session_started_at = _new_session_record()
+    cycle_id = f"trigger-{event['plan']['plan_id']}-{secrets.token_hex(4)}"
+    agent_settings = recursive_merge(
+        settings.get("agent", {}),
+        profile,
+        {
+            "agent_name": role,
+            "output_path": session_output,
+            "session_id": session_id,
+            "session_started_at": session_started_at,
+            "session_cwd": str(Path.cwd()),
+        },
+    )
+    environment_settings = recursive_merge(
+        settings.get("environment", {}),
+        {
+            "miniqmt_mode": "auto_execute",
+            "account_journal_dir": str(journal_dir),
+            "account_cycle_id": cycle_id,
+            "account_review_mode": False,
+        },
+    )
+    task = (
+        "行情监控触发交易审核，不需要重新研究或调用其他 Agent。"
+        f"触发计划：{json.dumps(event['plan'], ensure_ascii=False, sort_keys=True)}；"
+        f"当前行情：stock_code={event['stock_code']}，price={event['price']}，quote_at={event['quote_at']}。"
+        f"本次交易使用稳定 client_intent_id=monitor-{event['plan']['plan_id']}。"
+        "请查询账户和当前行情，独立完成 risk_check；只有风险通过才提交原 order，"
+        "交易后如需新的止盈、止损或撤单条件，读取现有监控计划并用 account_monitor replace 更新。"
+    )
+    try:
+        model = get_model({**settings.get("model", {}), "stream_output": False})
+        environment = get_environment(environment_settings)
+        agent = get_agent(model, environment, agent_settings)
+        result = agent.run(task)
+    except Exception as exc:
+        result = {"exit_status": type(exc).__name__, "submission": f"交易触发处理异常：{type(exc).__name__}: {exc}"}
+    action = event["plan"].get("side", "HOLD")
+    append_account_cycle(
+        journal_dir,
+        cycle_id,
+        {
+            "action": action if action in {"BUY", "SELL"} else "HOLD",
+            "market_view": f"监控触发 {event['stock_code']} @ {event['price']}",
+            "account_risk": "由 account_trader 基于触发时账户和行情重新检查",
+            "decision": result.get("submission", ""),
+            "follow_up": "按 account_monitor 中未触发计划继续监控；交易结果未知时先查询委托和成交。",
+            "orders": [json.dumps(event["plan"].get("order", {}), ensure_ascii=False, sort_keys=True)],
+            "pitfalls": [],
+            "tool_errors": [] if result.get("exit_status") == "Submitted" else [result.get("exit_status", "unknown")],
+        },
+    )
+    _print_result(result, submission_streamed=False)
+    return result
+
+
+def _poll_market_monitor(settings: dict, journal_dir: Path) -> list[dict[str, Any]]:
+    """轮询显式监控条件，返回本轮触发事件。"""
+    monitor = MarketMonitor(journal_dir)
+    current = monitor.read()
+    if not current["ok"]:
+        console.print(f"[bold]行情监控状态失败：{current['error']['detail']}[/bold]")
+        return []
+    if not current["data"].get("plans"):
+        return []
+    environment_settings = recursive_merge(
+        settings.get("environment", {}),
+        {"account_journal_dir": str(journal_dir), "miniqmt_mode": "observe"},
+    )
+    try:
+        environment = get_environment(environment_settings)
+        result = monitor.poll(environment._get_miniqmt())
+    except Exception as exc:
+        console.print(f"[bold]行情监控异常：{type(exc).__name__}[/bold]")
+        return []
+    if not result["ok"]:
+        console.print(f"[bold]行情监控失败：{result['error']['detail']}[/bold]")
+        return []
+    return result["data"].get("events", [])
+
+
 def _account_loop_slot(now: datetime) -> tuple[str, str] | None:
     if now.weekday() >= 5:
         return None
     current = now.time()
+    # 允许服务在 08:30 后才启动时补做一次盘前分析，09:20 后进入行情监控。
+    if clock_time(8, 30) <= current < clock_time(9, 20):
+        return "premarket", now.date().isoformat()
     trading = clock_time(9, 20) <= current <= clock_time(11, 30) or clock_time(13, 0) <= current <= clock_time(15, 0)
     if trading:
-        slot_minute = now.minute // 10 * 10
-        return "trade", f"{now.date().isoformat()}-{now.hour:02d}{slot_minute:02d}"
+        return "monitor", now.date().isoformat()
     if current >= clock_time(15, 10):
         return "review", f"{now.date().isoformat()}-close"
     return None
@@ -252,7 +354,7 @@ def main(
         None, "--step-limit", min=0, help="Maximum model calls; 0 disables."
     ),
     timeout: int | None = typer.Option(None, "--timeout", min=1, help="Bash timeout in seconds."),
-    account_loop: bool = typer.Option(False, "--account-loop", help="每 10 分钟以全新上下文运行账户管理 Agent。"),
+    account_loop: bool = typer.Option(False, "--account-loop", help="运行盘前分析、盘中行情监控触发交易和收盘复盘。"),
     close_review: bool = typer.Option(False, "--close-review", help="运行一次只读收盘复盘。"),
 ) -> Any:
     """Run DeepSeek V4 Flash with host-owned Bash, editor, and web search tools."""
@@ -266,17 +368,30 @@ def main(
             _account_cycle(settings, cycle_task, close_review=True)
             return None
         loop_lock = _acquire_account_loop_lock()
-        console.print("账户管理循环已启动：交易时段每 10 分钟使用全新上下文，15:10 执行只读复盘。")
-        last_slot = ""
+        console.print("账户管理循环已启动：08:30 盘前分析，交易时段轮询监控计划并触发交易，15:10 收盘复盘。")
+        premarket_day = ""
+        review_day = ""
+        journal_dir = Path(os.getenv("MINIQMT_AGENT_STATE_DIR", ".sessions/account-manager"))
+        if not journal_dir.is_absolute():
+            journal_dir = Path.cwd() / journal_dir
         try:
             while True:
                 now = datetime.now(TRADING_TZ)
                 scheduled = _account_loop_slot(now)
-                if scheduled and scheduled[1] != last_slot:
-                    kind, last_slot = scheduled
-                    review_task = "核对当日成交、收益、滑点、决策偏差、踩坑，并写出下一交易日观察计划。"
-                    _account_cycle(settings, review_task if kind == "review" else cycle_task, close_review=kind == "review")
-                # 只等待调度，不保留任何 Agent 上下文。
+                if scheduled:
+                    kind, day_key = scheduled
+                    if kind == "premarket" and day_key != premarket_day:
+                        premarket_day = day_key
+                        _account_cycle(settings, cycle_task, premarket=True)
+                    elif kind == "monitor":
+                        for event in _poll_market_monitor(settings, journal_dir):
+                            _run_trade_trigger(settings, event, journal_dir)
+                    elif kind == "review" and day_key != review_day:
+                        review_day = day_key
+                        review_task = "核对当日成交、收益、滑点、决策偏差、监控触发、监控更新和踩坑，并写出下一交易日观察计划。"
+                        _account_cycle(settings, review_task, close_review=True)
+                        MarketMonitor(journal_dir).clear()
+                # 轮询频率由宿主控制，不保留任何 Agent 上下文。
                 time.sleep(10)
         finally:
             loop_lock.close()
