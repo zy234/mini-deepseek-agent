@@ -20,7 +20,7 @@ from minisweagent.environments.web_search import (
     DEFAULT_SEARCH_ENGINES,
     execute_web_search,
 )
-from minisweagent.exceptions import CommandNotApproved, Submitted
+from minisweagent.exceptions import CommandNotApproved, InterruptAgentFlow, Submitted
 from minisweagent.utils.serialize import recursive_merge
 
 SENSITIVE_ENV_NAMES = frozenset(
@@ -54,6 +54,10 @@ class LocalEnvironmentConfig(BaseModel):
         default_factory=lambda: os.getenv("MINIQMT_BRIDGE_URL", "http://127.0.0.1:8023")
     )
     miniqmt_mode: str = Field(default_factory=lambda: os.getenv("MINIQMT_AGENT_MODE", "observe"))
+    agent_profiles: dict[str, dict[str, Any]] = Field(default_factory=dict)
+    agent_common_config: dict[str, Any] = Field(default_factory=dict)
+    agent_model_config: dict[str, Any] = Field(default_factory=dict)
+    agent_call_limit: int = Field(default=4, ge=1, le=20)
 
 
 class LocalEnvironment:
@@ -68,6 +72,7 @@ class LocalEnvironment:
         self.config = config_class(**kwargs)
         self.approval_callback = approval_callback or _prompt_for_approval
         self._miniqmt: MiniQMTClient | None = None
+        self._agent_call_count = 0
 
     def execute(self, action: dict, cwd: str = "", *, timeout: float | None = None) -> dict[str, Any]:
         """Execute a command in the local environment and return the result as a dict."""
@@ -89,6 +94,8 @@ class LocalEnvironment:
             return _json_tool_output("miniqmt_account", self._get_miniqmt().account(action.get("view", "")))
         if action.get("tool") == "miniqmt_trade":
             return self._execute_miniqmt_trade(action)
+        if action.get("tool") == "agent_call":
+            return self._execute_agent_call(action)
         command = action.get("command", "")
         cwd = action.get("workdir") or cwd or self.config.cwd or os.getcwd()
         global_timeout = timeout if timeout is not None else self.config.timeout
@@ -196,6 +203,93 @@ class LocalEnvironment:
                     subject="工具调用",
                 )
         return _json_tool_output("miniqmt_trade", self._get_miniqmt().trade(operation, inputs))
+
+    def _execute_agent_call(self, action: dict) -> dict[str, Any]:
+        """在宿主侧运行固定子 Agent，避免模型自行获得账户工具或递归编排能力。"""
+        role = action.get("role", "")
+        task = action.get("task", "")
+        allowed_roles = {"financial_research", "portfolio_manager", "account_trader"}
+        if role not in allowed_roles:
+            return _json_tool_output(
+                "agent_call",
+                {"ok": False, "status": "invalid_argument", "error": {"code": "unknown_role", "detail": "不允许的子 Agent 角色"}},
+            )
+        if not isinstance(task, str) or not task.strip() or len(task) > 12000:
+            return _json_tool_output(
+                "agent_call",
+                {"ok": False, "status": "invalid_argument", "error": {"code": "invalid_task", "detail": "子 Agent 任务必须是 1 到 12000 个字符"}},
+            )
+        if self._agent_call_count >= self.config.agent_call_limit:
+            return _json_tool_output(
+                "agent_call",
+                {"ok": False, "status": "blocked", "error": {"code": "agent_call_limit", "detail": "已达到本次主 Agent 的子 Agent 调用上限"}},
+            )
+        profile = self.config.agent_profiles.get(role)
+        if not isinstance(profile, dict):
+            return _json_tool_output(
+                "agent_call",
+                {"ok": False, "status": "configuration_error", "error": {"code": "missing_role_profile", "detail": f"未配置子 Agent：{role}"}},
+            )
+        self._agent_call_count += 1
+        try:
+            # 延迟导入避免 agents -> environments 的循环依赖。
+            from minisweagent.agents import get_agent
+            from minisweagent.models import get_model
+
+            child_model_config = dict(self.config.agent_model_config)
+            child_model_config["stream_output"] = False
+            child_model = get_model(child_model_config)
+            child_settings = recursive_merge(self.config.agent_common_config, dict(profile))
+            child_settings.pop("description", None)
+            child_settings["agent_name"] = role
+            child_settings["output_path"] = None
+            child_environment = LocalEnvironment(
+                cwd=self.config.cwd,
+                env=dict(self.config.env),
+                timeout=self.config.timeout,
+                web_search_engines=list(self.config.web_search_engines),
+                web_search_max_results=self.config.web_search_max_results,
+                miniqmt_bridge_url=self.config.miniqmt_bridge_url,
+                miniqmt_mode=self.config.miniqmt_mode,
+                approval_callback=self.approval_callback,
+            )
+            child_agent = get_agent(child_model, child_environment, child_settings)
+            result = child_agent.run(task)
+            return _json_tool_output(
+                "agent_call",
+                {
+                    "ok": True,
+                    "status": "success",
+                    "data": {
+                        "role": role,
+                        "exit_status": result.get("exit_status", "unknown"),
+                        "submission": result.get("submission", ""),
+                        "api_calls": child_agent.n_calls,
+                    },
+                },
+            )
+        except InterruptAgentFlow as error:
+            message = error.messages[-1] if error.messages else {}
+            extra = message.get("extra", {})
+            status = extra.get("exit_status", type(error).__name__)
+            detail = message.get("content", str(error))
+            return _json_tool_output(
+                "agent_call",
+                {
+                    "ok": False,
+                    "status": "blocked" if isinstance(error, CommandNotApproved) else "error",
+                    "error": {"code": status, "detail": detail},
+                },
+            )
+        except Exception as error:
+            return _json_tool_output(
+                "agent_call",
+                {
+                    "ok": False,
+                    "status": "error",
+                    "error": {"code": type(error).__name__, "detail": f"子 Agent 执行失败：{error}"},
+                },
+            )
 
     def _get_miniqmt(self) -> MiniQMTClient:
         if self._miniqmt is None:

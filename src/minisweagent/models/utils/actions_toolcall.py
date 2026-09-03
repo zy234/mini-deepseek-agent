@@ -176,6 +176,30 @@ MINIQMT_TRADE_TOOL = {
         },
     },
 }
+AGENT_CALL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "agent_call",
+        "description": "调用一个固定的金融子 Agent 获取研究、账户组合分析或受控交易结果。子 Agent 使用独立上下文，不能继续委派其他 Agent。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "enum": ["financial_research", "portfolio_manager", "account_trader"],
+                },
+                "task": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 12000,
+                    "description": "交给子 Agent 的明确任务；不要包含凭据或账户标识",
+                },
+            },
+            "required": ["role", "task"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 TOOL_DEFINITIONS = [
     BASH_TOOL,
@@ -186,6 +210,7 @@ TOOL_DEFINITIONS = [
     MINIQMT_QUOTES_TOOL,
     MINIQMT_ACCOUNT_TOOL,
     MINIQMT_TRADE_TOOL,
+    AGENT_CALL_TOOL,
 ]
 TOOL_DEFINITIONS_BY_NAME = {tool["function"]["name"]: tool for tool in TOOL_DEFINITIONS}
 DEFAULT_TOOL_NAMES = ["bash", "str_replace_editor", "web_search", "web_fetch"]
@@ -259,6 +284,8 @@ def parse_toolcall_actions(
             error_msg += _validate_miniqmt_account_args(args)
         elif tool_name == "miniqmt_trade":
             error_msg += _validate_miniqmt_trade_args(args)
+        elif tool_name == "agent_call":
+            error_msg += _validate_agent_call_args(args)
         if isinstance(args, dict):
             if tool_name == "bash":
                 allowed = {"command", "workdir", "timeout", "description"}
@@ -274,6 +301,8 @@ def parse_toolcall_actions(
                 allowed = {"view"}
             elif tool_name == "miniqmt_trade":
                 allowed = {"operation", "inputs"}
+            elif tool_name == "agent_call":
+                allowed = {"role", "task"}
             else:
                 allowed = {
                     "command",
@@ -334,6 +363,11 @@ def parse_toolcall_actions(
             action["inputs"] = args["inputs"]
             actions.append(action)
             continue
+        if tool_name == "agent_call":
+            action["role"] = args["role"]
+            action["task"] = args["task"]
+            actions.append(action)
+            continue
         action["command"] = args["command"]
         keys = ("workdir", "timeout", "description") if tool_name == "bash" else (
             "path", "file_text", "old_str", "new_str", "insert_line", "view_range", "expected_hash"
@@ -385,6 +419,18 @@ def _validate_web_fetch_args(args: dict) -> str:
     url = args.get("url")
     if not isinstance(url, str) or not url.strip():
         return "web_fetch 的 url 必须是非空字符串。"
+    return ""
+
+
+def _validate_agent_call_args(args: dict) -> str:
+    role = args.get("role")
+    if role not in {"financial_research", "portfolio_manager", "account_trader"}:
+        return "agent_call 的 role 必须是 financial_research、portfolio_manager 或 account_trader。"
+    task = args.get("task")
+    if not isinstance(task, str) or not task.strip():
+        return "agent_call 的 task 必须是非空字符串。"
+    if len(task) > 12000:
+        return "agent_call 的 task 不能超过 12000 个字符。"
     return ""
 
 

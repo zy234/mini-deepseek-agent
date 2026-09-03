@@ -45,6 +45,15 @@ mini --timeout 60
 - `financial_research`：查询行情、核验网页证据并执行确定性金融计算，不访问账户。
 - `portfolio_manager`：只读查询个人账户、行情和组合风险，不执行交易。
 - `account_trader`：查询个人账户和行情，按宿主安全配置提交或撤销委托。
+- `financial_manager`：主 Agent，只能通过 `agent_call` 按顺序调用上述三个金融子 Agent，综合结果管理账户。
+
+账户管理主 Agent 用法：
+
+```bash
+mini --agent financial_manager -t "先查看我的账户和持仓，再分析风险；不要下单"
+```
+
+主 Agent 不直接接触 MiniQMT 工具。宿主只允许委派到固定角色，每次运行最多调用 4 次；子 Agent 使用独立上下文且不能继续委派。交易是否允许、是否需要人工审批以及 `observe`/`execute` 模式，仍由 `miniqmt_trade` 工具内部强制执行。
 
 项目提供 Bash、文件编辑、网页搜索和网页抓取能力。运行环境直接使用当前用户权限，请勿在不可信目录或任务中运行。
 
@@ -72,6 +81,7 @@ CLI
      │   └── single_call：模型单次生成结果
      ├── DeepSeek Model：负责模型请求和响应解析
      └── Local Environment：负责工具执行和结果反馈
+         └── financial_manager -> agent_call -> financial_research / portfolio_manager / account_trader
 ```
 
 角色配置决定 prompt、可用工具和 Flow；模型负责决策，环境负责执行，Agent 负责维护对话和流程状态。

@@ -165,6 +165,21 @@ def main(
         settings.get("environment", {}),
         {"timeout": timeout if timeout is not None else UNSET},
     )
+    if agent_name == "financial_manager":
+        # 主 Agent 的委派配置由宿主注入；子 Agent 不会继承这两个字段。
+        child_roles = {"financial_research", "portfolio_manager", "account_trader"}
+        environment_settings = recursive_merge(
+            environment_settings,
+            {
+                "agent_profiles": {
+                    role: settings["agents"][role]
+                    for role in child_roles
+                    if role in settings.get("agents", {})
+                },
+                "agent_common_config": settings.get("agent", {}),
+                "agent_model_config": settings.get("model", {}),
+            },
+        )
     task = task or terminal_prompt("Task: ")
 
     model = get_model(settings.get("model", {}))

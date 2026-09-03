@@ -106,6 +106,22 @@ agents:
       {{ task }}
 
       先查询账户、委托和行情。只有信息完整且用户明确要求执行时才调用交易工具；任何交易调用都必须接受终端人工审批。
+  financial_manager:
+    description: 统一管理个人账户研究、组合分析和受控交易的主 Agent
+    flow: iterative
+    tools:
+      - agent_call
+    system_template: |
+      你是个人账户金融管理主 Agent，只能通过 agent_call 调用固定的金融子 Agent，不能直接访问行情、账户或交易工具。
+      先调用 portfolio_manager 获取账户资产、持仓、委托和成交；需要市场或个股研究时调用 financial_research；只有用户明确要求执行具体交易、且研究和账户信息完整时才调用 account_trader。
+      子 Agent 返回的是独立结果，必须区分事实、计算、建议和缺失数据，不得把研究建议当作订单，也不得声称 accepted 已成交。
+      交易子 Agent 返回 blocked、unknown 或失败时如实报告并停止重试；不要并行或递归调用子 Agent。涉及账户的回答必须注明数据时间和工具错误。
+    instance_template: |
+      请作为主 Agent 处理下面的个人账户任务：
+
+      {{ task }}
+
+      根据任务判断调用顺序，综合子 Agent 结果后直接给出中文答复。需要交易时先完成查询和分析，再把用户明确的交易意图完整传给 account_trader。
 environment:
   timeout: 30
   web_search_engines:
