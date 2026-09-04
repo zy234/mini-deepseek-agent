@@ -53,20 +53,49 @@ mini --timeout 60
 mini --agent financial_manager -t "先查看我的账户和持仓，再分析风险；不要下单"
 ```
 
-主 Agent 不直接接触 MiniQMT 工具。宿主只允许委派到固定角色，每次运行最多调用 4 次；子 Agent 使用独立上下文且不能继续委派。交易权限和风险规则由 `miniqmt_trade` 工具内部强制执行。
+主 Agent 不直接接触 MiniQMT 工具。宿主只允许委派到固定角色，每次运行最多调用 4 次；子 Agent 使用独立上下文且不能继续委派。账户管理周期的交接顺序固定为 `financial_research -> portfolio_manager -> account_trader`：研究角色以昨日收盘为基准产出今日 `buy_candidates`，组合经理结合账户形成 `selected/rejected` 和 `order_plan`，交易角色只对组合方案做 `risk_check` 和下单判断。宿主会阻止跳过研究或组合阶段的委派，交易权限和风险规则仍由 `miniqmt_trade` 工具内部强制执行。
 
-自主账户循环使用下面的显式入口。交易日 09:20 至 11:30、13:00 至 15:00 每 10 分钟创建一套全新的 Agent/模型/环境，不继承上轮消息；只读取 `.sessions/account-manager/journals/YYYY-MM-DD.md` 和实时工具结果。15:10 自动创建新的只读上下文完成收盘复盘。
+研究候选不是订单。`financial_research` 必须给出 `research_as_of`、`previous_close_as_of`、`data_cutoff`、`data_sufficiency`、`buy_candidates` 和缺失数据；`portfolio_manager` 必须说明每个候选为何选入、缩减或拒绝，并将现金、集中度、T+1 和未完成委托纳入取舍；只有完整的 `order_plan` 才能交给 `account_trader`。任何数据不足、风险检查失败或 `unknown` 结果都会降级为 HOLD 并写入每日账本。
+
+自主账户循环使用下面的显式入口。交易日 09:20 创建盘前上下文，由研究 Agent 结合当前行情、新闻、昨日收盘和账户持仓生成候选，组合经理确认取舍后通过 `account_monitor` 写入显式监控计划。09:30 至 11:30、13:00 至 15:00 由宿主轮询计划；触发买卖点时只创建 `account_trader` 上下文做当前行情和账户风控，不重新研究。12:50 追加一次午盘前复核，重新检查上午行情和新闻并更新下午计划。交易 Agent 可在成交或拒绝后更新对应监控计划。15:10 自动创建新的只读上下文完成收盘复盘并清理已失效计划。
 
 ```bash
 mini --account-loop
+mini --account-day
 mini --close-review
 ```
+
+`--account-day` 运行一个交易日后退出，适合由 macOS `launchd` 在开盘日 09:20 启动；`--account-loop` 适合常驻服务，二者都使用相同的盘前、午盘前、盘中监控和收盘复盘流程。
+
+在 macOS 上安装工作日自动任务（任务会从当前工作目录 `.env` 读取 `DS_KEY`、MiniQMT Bridge 和账户配置）：
+
+```bash
+mini --install-account-schedule
+```
+
+该任务每天 09:20 启动 `--account-day`，12:50 执行午盘前复核，15:10 复盘后退出；日志位于 `.sessions/account-manager/logs/`。卸载可执行 `launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.minisweagent.account-day.plist`。
 
 循环入口使用 `auto_execute`，不请求逐笔人工审批。重复启动会被状态目录中的运行锁拒绝。需要立即停止所有写操作时设置 `MINIQMT_KILL_SWITCH=1`；状态目录可通过 `MINIQMT_AGENT_STATE_DIR` 调整。
 
 项目提供 Bash、文件编辑、网页搜索和网页抓取能力。运行环境直接使用当前用户权限，请勿在不可信目录或任务中运行。
 
+网页正文默认先走轻量 HTTP 抓取；正文缺失、软拦截或质量不足时，可选用 Playwright 渲染动态页面：
+
+```bash
+python3 -m pip install -e '.[browser]'
+python3 -m playwright install chromium
+```
+
+设置 `MSWEA_WEB_FETCH_BROWSER=0` 可关闭浏览器降级。模拟运行由宿主设置带时区的
+`MSWEA_WEB_AS_OF`（例如 `2026-09-03T10:30:00+08:00`）；已知晚于截止时间的搜索结果会被删除，时间不明的搜索候选只返回无标题、无摘要的 URL 供 `web_fetch` 核验。正文只有在发布时间明确且不晚于截止时间时才返回，只有日期而没有盘中时刻的当天文章也会被拒绝，避免未来信息进入 Agent。
+
 MiniQMT 工具直接连接 Bridge，默认地址为 `http://127.0.0.1:8023`（可用 `MINIQMT_BRIDGE_URL` 修改），个人账户由宿主环境绑定：
+
+账户收盘复盘生成的 `observation-todo.md` 是给用户查看的提醒，不会注入 Agent 的 `account_journal` 工具结果，也不会被当作任务指令。可用下面命令查看：
+
+```bash
+mini --show-observation-todo
+```
 
 ```bash
 export MINIQMT_ACCOUNT_ID="your-account-id"

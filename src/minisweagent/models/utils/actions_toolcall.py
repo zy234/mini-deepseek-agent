@@ -65,7 +65,7 @@ WEB_SEARCH_TOOL = {
     "type": "function",
     "function": {
         "name": "web_search",
-        "description": "使用仓库自带的零 Key 多引擎能力搜索当前网络信息。返回去重后的来源 URL、标题、抓取时间和摘要；最终答复应引用相关 URL。",
+        "description": "使用仓库自带的零 Key 多引擎能力搜索网络信息。返回去重后的 URL、标题、摘要、来源、抓取时间和可识别的发布时间；模拟模式会隐藏截止时间之后的结果，时间不明候选只返回脱敏 URL，必须再用 web_fetch 核验。搜索摘要不能作为最终事实。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -86,7 +86,7 @@ WEB_FETCH_TOOL = {
     "type": "function",
     "function": {
         "name": "web_fetch",
-        "description": "打开 web_search 返回的一个 URL，提取页面标题、可识别的发布时间和正文文本。仅用于查看具体来源，不要批量抓取。",
+        "description": "打开 web_search 返回的一个 URL，先用 HTTP 提取正文，质量不足时可由宿主降级到浏览器渲染；返回来源、标题、发布时间、正文、抓取引擎和质量诊断。模拟模式会阻断晚于截止时间或发布时间不明的正文。",
         "parameters": {
             "type": "object",
             "properties": {
@@ -215,6 +215,48 @@ ACCOUNT_JOURNAL_TOOL = {
         },
     },
 }
+ACCOUNT_MONITOR_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "account_monitor",
+        "description": "读取、替换或清理宿主持久化的股票行情监控计划。只保存显式触发条件，不会自行下单。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "operation": {"type": "string", "enum": ["read", "replace", "clear"]},
+                "plans": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 20,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "plan_id": {"type": "string"},
+                            "stock_code": {"type": "string", "pattern": "^[036][0-9]{5}\\.(SH|SZ)$"},
+                            "side": {"type": "string", "enum": ["BUY", "SELL"]},
+                            "trigger": {
+                                "type": "object",
+                                "properties": {
+                                    "type": {"type": "string", "enum": ["price_lte", "price_gte", "change_pct_lte", "change_pct_gte"]},
+                                    "value": {"type": "number"},
+                                    "baseline": {"type": "number"},
+                                },
+                                "required": ["type", "value"],
+                                "additionalProperties": False,
+                            },
+                            "order": {"type": "object", "additionalProperties": True},
+                            "note": {"type": "string"},
+                        },
+                        "required": ["plan_id", "stock_code", "side", "trigger"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["operation"],
+            "additionalProperties": False,
+        },
+    },
+}
 AGENT_CALL_TOOL = {
     "type": "function",
     "function": {
@@ -250,6 +292,7 @@ TOOL_DEFINITIONS = [
     MINIQMT_ACCOUNT_TOOL,
     MINIQMT_TRADE_TOOL,
     ACCOUNT_JOURNAL_TOOL,
+    ACCOUNT_MONITOR_TOOL,
     AGENT_CALL_TOOL,
 ]
 TOOL_DEFINITIONS_BY_NAME = {tool["function"]["name"]: tool for tool in TOOL_DEFINITIONS}
@@ -326,6 +369,8 @@ def parse_toolcall_actions(
             error_msg += _validate_miniqmt_trade_args(args)
         elif tool_name == "account_journal":
             error_msg += _validate_account_journal_args(args)
+        elif tool_name == "account_monitor":
+            error_msg += _validate_account_monitor_args(args)
         elif tool_name == "agent_call":
             error_msg += _validate_agent_call_args(args)
         if isinstance(args, dict):
@@ -345,6 +390,8 @@ def parse_toolcall_actions(
                 allowed = {"operation", "inputs"}
             elif tool_name == "account_journal":
                 allowed = {"operation", "record"}
+            elif tool_name == "account_monitor":
+                allowed = {"operation", "plans"}
             elif tool_name == "agent_call":
                 allowed = {"role", "task"}
             else:
@@ -411,6 +458,12 @@ def parse_toolcall_actions(
             action["operation"] = args["operation"]
             if "record" in args:
                 action["record"] = args["record"]
+            actions.append(action)
+            continue
+        if tool_name == "account_monitor":
+            action["operation"] = args["operation"]
+            if "plans" in args:
+                action["plans"] = args["plans"]
             actions.append(action)
             continue
         if tool_name == "agent_call":
@@ -524,6 +577,17 @@ def _validate_account_journal_args(args: dict) -> str:
         return "account_journal read 不能包含 record。"
     if operation == "append" and not isinstance(args.get("record"), dict):
         return "account_journal append 必须包含 record 对象。"
+    return ""
+
+
+def _validate_account_monitor_args(args: dict) -> str:
+    operation = args.get("operation")
+    if operation not in {"read", "replace", "clear"}:
+        return "account_monitor 的 operation 必须是 read、replace 或 clear。"
+    if operation == "replace" and not isinstance(args.get("plans"), list):
+        return "account_monitor replace 必须包含 plans 数组。"
+    if operation != "replace" and "plans" in args:
+        return f"account_monitor {operation} 不能包含 plans。"
     return ""
 
 

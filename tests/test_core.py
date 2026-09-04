@@ -10,7 +10,7 @@ import pytest
 from minisweagent.agents import get_agent
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.agents.single_shot import SingleShotAgent
-from minisweagent.environments import editor, web_fetch, web_search
+from minisweagent.environments import account_journal, editor, market_monitor, web_fetch, web_search
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.exceptions import CommandNotApproved, FormatError, Submitted
@@ -121,6 +121,96 @@ def test_local_environment_captures_output_and_completion():
     assert result["returncode"] == 0
     assert result["status"] == "success"
     assert result["timed_out"] is False
+
+
+def test_financial_manager_agent_call_order_is_host_enforced():
+    env = LocalEnvironment(timeout=5)
+
+    blocked_portfolio = env._validate_agent_call_phase("portfolio_manager")
+    assert blocked_portfolio["status"] == "blocked"
+    assert blocked_portfolio["error"]["code"] == "workflow_order"
+
+    env._agent_call_roles.append("financial_research")
+    assert env._validate_agent_call_phase("portfolio_manager") is None
+    assert env._validate_agent_call_phase("account_trader")["error"]["code"] == "workflow_order"
+
+    env._agent_call_roles.append("portfolio_manager")
+    assert env._validate_agent_call_phase("account_trader") is None
+
+
+def test_financial_agent_profiles_describe_daily_handoff():
+    settings = mini.get_config_from_spec(mini.DEFAULT_CONFIG_FILE)
+    research = settings["agents"]["financial_research"]["system_template"]
+    portfolio = settings["agents"]["portfolio_manager"]["system_template"]
+    trader = settings["agents"]["account_trader"]["system_template"]
+    manager = settings["agents"]["financial_manager"]["system_template"]
+
+    assert "buy_candidates" in research
+    assert "previous_close_as_of" in research
+    assert "selected_candidates" in portfolio
+    assert "risk_check" in trader
+    assert "financial_research" in manager
+    assert "portfolio_manager" in manager
+    assert "account_trader" in manager
+
+
+def test_market_monitor_persists_plans_and_emits_each_trigger_once(tmp_path):
+    monitor = market_monitor.MarketMonitor(tmp_path)
+    plan = {
+        "plan_id": "buy-600000",
+        "stock_code": "600000.SH",
+        "side": "BUY",
+        "trigger": {"type": "price_lte", "value": 10},
+        "order": {"volume": 100},
+    }
+    assert monitor.replace([plan])["ok"] is True
+
+    class FakeQuoteClient:
+        def quotes(self, stock_codes):
+            assert stock_codes == ["600000.SH"]
+            return {
+                "ok": True,
+                "data": {
+                    "ticks": {
+                        "600000.SH": {"last_price": 9.5, "time": "2026-09-03T10:00:00+08:00"}
+                    }
+                },
+            }
+
+    first = monitor.poll(FakeQuoteClient())
+    assert [event["stock_code"] for event in first["data"]["events"]] == ["600000.SH"]
+    second = monitor.poll(FakeQuoteClient())
+    assert second["data"]["events"] == []
+    assert json.loads((tmp_path / "market-monitor.json").read_text())["plans"][0]["fired"] is True
+
+
+def test_account_loop_schedules_premarket_monitoring_and_close_review():
+    tz = mini.TRADING_TZ
+    assert mini._account_loop_slot(datetime(2026, 9, 3, 9, 20, tzinfo=tz)) == (
+        "premarket",
+        "2026-09-03",
+    )
+    assert mini._account_loop_slot(datetime(2026, 9, 3, 9, 35, tzinfo=tz)) == (
+        "monitor",
+        "2026-09-03",
+    )
+    assert mini._account_loop_slot(datetime(2026, 9, 3, 12, 50, tzinfo=tz)) == (
+        "midday",
+        "2026-09-03",
+    )
+    assert mini._account_loop_slot(datetime(2026, 9, 3, 15, 10, tzinfo=tz)) == (
+        "review",
+        "2026-09-03-close",
+    )
+
+
+def test_account_journal_reads_observation_todo(tmp_path):
+    todo = tmp_path / "observation-todo.md"
+    todo.write_text("明日核对现金和监控计划", encoding="utf-8")
+
+    result = account_journal.read_account_journal(tmp_path)
+
+    assert result["data"]["observation_todo"] == "明日核对现金和监控计划"
 
 
 def test_web_search_is_standalone_without_ds_key_and_deduplicates(monkeypatch):

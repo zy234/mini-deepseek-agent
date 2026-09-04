@@ -18,6 +18,7 @@ from minisweagent.environments.account_journal import (
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.editor import execute_editor
 from minisweagent.environments.financial_calc import execute_financial_calc
+from minisweagent.environments.market_monitor import MarketMonitor
 from minisweagent.environments.miniqmt import MiniQMTClient
 from minisweagent.environments.web_fetch import execute_web_fetch
 from minisweagent.environments.web_search import (
@@ -54,6 +55,11 @@ class LocalEnvironmentConfig(BaseModel):
     timeout: float = 30
     web_search_engines: list[str] = Field(default_factory=lambda: list(DEFAULT_SEARCH_ENGINES))
     web_search_max_results: int = Field(default=8, ge=1)
+    web_as_of: str = Field(default_factory=lambda: os.getenv("MSWEA_WEB_AS_OF", "").strip())
+    web_fetch_browser_enabled: bool = Field(
+        default_factory=lambda: os.getenv("MSWEA_WEB_FETCH_BROWSER", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
     miniqmt_bridge_url: str = Field(
         default_factory=lambda: os.getenv("MINIQMT_BRIDGE_URL", "http://127.0.0.1:8023")
     )
@@ -79,7 +85,10 @@ class LocalEnvironment:
         self.config = config_class(**kwargs)
         self.approval_callback = approval_callback or _prompt_for_approval
         self._miniqmt: MiniQMTClient | None = None
+        self._market_monitor: MarketMonitor | None = None
         self._agent_call_count = 0
+        # 主 Agent 的交接阶段由宿主记录，避免模型跳过研究或组合风控直接交易。
+        self._agent_call_roles: list[str] = []
 
     def execute(self, action: dict, cwd: str = "", *, timeout: float | None = None) -> dict[str, Any]:
         """Execute a command in the local environment and return the result as a dict."""
@@ -91,6 +100,8 @@ class LocalEnvironment:
             return execute_web_fetch(
                 action.get("url", ""),
                 timeout=timeout if timeout is not None else self.config.timeout,
+                as_of=self.config.web_as_of,
+                browser_enabled=self.config.web_fetch_browser_enabled,
             )
         if action.get("tool") == "financial_calc":
             result = execute_financial_calc(action.get("operation", ""), action.get("inputs", {}))
@@ -103,6 +114,8 @@ class LocalEnvironment:
             return self._execute_miniqmt_trade(action)
         if action.get("tool") == "account_journal":
             return self._execute_account_journal(action)
+        if action.get("tool") == "account_monitor":
+            return self._execute_account_monitor(action)
         if action.get("tool") == "agent_call":
             return self._execute_agent_call(action)
         command = action.get("command", "")
@@ -193,6 +206,7 @@ class LocalEnvironment:
             timeout=search_timeout,
             engines=self.config.web_search_engines,
             max_results=self.config.web_search_max_results,
+            as_of=self.config.web_as_of,
         )
 
     def _execute_miniqmt_trade(self, action: dict) -> dict[str, Any]:
@@ -217,6 +231,9 @@ class LocalEnvironment:
         operation = action.get("operation", "")
         if operation == "read":
             result = read_account_journal(self.config.account_journal_dir)
+            # 待观测清单是用户的提醒，不是模型上下文或可执行指令。
+            if result.get("ok") and isinstance(result.get("data"), dict):
+                result = {**result, "data": {key: value for key, value in result["data"].items() if key != "observation_todo"}}
         elif operation == "append":
             result = append_account_cycle(
                 self.config.account_journal_dir,
@@ -232,6 +249,26 @@ class LocalEnvironment:
                 "error": {"code": "invalid_argument", "detail": "account_journal 只支持 read 或 append"},
             }
         return _json_tool_output("account_journal", result)
+
+    def _execute_account_monitor(self, action: dict) -> dict[str, Any]:
+        monitor = self._market_monitor or MarketMonitor(self.config.account_journal_dir)
+        self._market_monitor = monitor
+        operation = action.get("operation", "")
+        if operation == "read":
+            result = monitor.read()
+        elif operation == "replace":
+            result = monitor.replace(action.get("plans"))
+        elif operation == "clear":
+            result = monitor.clear()
+        else:
+            result = {
+                "ok": False,
+                "status": "error",
+                "operation": None,
+                "data": None,
+                "error": {"code": "invalid_argument", "detail": "account_monitor 只支持 read、replace 或 clear"},
+            }
+        return _json_tool_output("account_monitor", result)
 
     def _execute_agent_call(self, action: dict) -> dict[str, Any]:
         """在宿主侧运行固定子 Agent，避免模型自行获得账户工具或递归编排能力。"""
@@ -259,6 +296,9 @@ class LocalEnvironment:
                 "agent_call",
                 {"ok": False, "status": "configuration_error", "error": {"code": "missing_role_profile", "detail": f"未配置子 Agent：{role}"}},
             )
+        phase_error = self._validate_agent_call_phase(role)
+        if phase_error is not None:
+            return _json_tool_output("agent_call", phase_error)
         self._agent_call_count += 1
         try:
             # 延迟导入避免 agents -> environments 的循环依赖。
@@ -278,6 +318,8 @@ class LocalEnvironment:
                 timeout=self.config.timeout,
                 web_search_engines=list(self.config.web_search_engines),
                 web_search_max_results=self.config.web_search_max_results,
+                web_as_of=self.config.web_as_of,
+                web_fetch_browser_enabled=self.config.web_fetch_browser_enabled,
                 miniqmt_bridge_url=self.config.miniqmt_bridge_url,
                 miniqmt_mode="observe" if self.config.account_review_mode else self.config.miniqmt_mode,
                 account_journal_dir=self.config.account_journal_dir,
@@ -287,6 +329,19 @@ class LocalEnvironment:
             )
             child_agent = get_agent(child_model, child_environment, child_settings)
             result = child_agent.run(task)
+            if result.get("exit_status") != "Submitted":
+                return _json_tool_output(
+                    "agent_call",
+                    {
+                        "ok": False,
+                        "status": "error",
+                        "error": {
+                            "code": result.get("exit_status", "child_agent_incomplete"),
+                            "detail": "子 Agent 未提交完整结果，不能把该阶段视为完成",
+                        },
+                    },
+                )
+            self._agent_call_roles.append(role)
             return _json_tool_output(
                 "agent_call",
                 {
@@ -322,6 +377,28 @@ class LocalEnvironment:
                     "error": {"code": type(error).__name__, "detail": f"子 Agent 执行失败：{error}"},
                 },
             )
+
+    def _validate_agent_call_phase(self, role: str) -> dict[str, Any] | None:
+        """检查账户管理工作流的最小顺序，交易权限仍由交易工具再次校验。"""
+        if role == "portfolio_manager" and "financial_research" not in self._agent_call_roles:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "error": {
+                    "code": "workflow_order",
+                    "detail": "必须先完成 financial_research，再调用 portfolio_manager",
+                },
+            }
+        if role == "account_trader" and "portfolio_manager" not in self._agent_call_roles:
+            return {
+                "ok": False,
+                "status": "blocked",
+                "error": {
+                    "code": "workflow_order",
+                    "detail": "必须先完成 portfolio_manager，再调用 account_trader",
+                },
+            }
+        return None
 
     def _get_miniqmt(self) -> MiniQMTClient:
         if self._miniqmt is None:
