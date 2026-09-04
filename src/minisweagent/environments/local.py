@@ -231,6 +231,9 @@ class LocalEnvironment:
         operation = action.get("operation", "")
         if operation == "read":
             result = read_account_journal(self.config.account_journal_dir)
+            # 待观测清单是用户的提醒，不是模型上下文或可执行指令。
+            if result.get("ok") and isinstance(result.get("data"), dict):
+                result = {**result, "data": {key: value for key, value in result["data"].items() if key != "observation_todo"}}
         elif operation == "append":
             result = append_account_cycle(
                 self.config.account_journal_dir,

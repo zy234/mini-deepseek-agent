@@ -91,6 +91,12 @@ python3 -m playwright install chromium
 
 MiniQMT 工具直接连接 Bridge，默认地址为 `http://127.0.0.1:8023`（可用 `MINIQMT_BRIDGE_URL` 修改），个人账户由宿主环境绑定：
 
+账户收盘复盘生成的 `observation-todo.md` 是给用户查看的提醒，不会注入 Agent 的 `account_journal` 工具结果，也不会被当作任务指令。可用下面命令查看：
+
+```bash
+mini --show-observation-todo
+```
+
 ```bash
 export MINIQMT_ACCOUNT_ID="your-account-id"
 export MINIQMT_BRIDGE_API_KEY="your-api-key"

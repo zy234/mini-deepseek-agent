@@ -21,7 +21,11 @@ from rich.console import Console
 from minisweagent.agents import get_agent
 from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
-from minisweagent.environments.account_journal import append_account_cycle, append_cycle_fallback
+from minisweagent.environments.account_journal import (
+    append_account_cycle,
+    append_cycle_fallback,
+    read_observation_todo,
+)
 from minisweagent.environments.market_monitor import MarketMonitor
 from minisweagent.models import get_model
 from minisweagent.utils.cli_display import clear_recent_full_blocks, render_recent_full_blocks
@@ -387,6 +391,15 @@ def _install_account_schedule(config: Path) -> Path:
     subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True)
     console.print(f"已安装账户日定时任务：{plist_path}")
     return plist_path
+
+
+def _show_observation_todo() -> None:
+    """在终端展示给用户的待观测清单，不启动 Agent。"""
+    journal_dir = Path(os.getenv("MINIQMT_AGENT_STATE_DIR", ".sessions/account-manager"))
+    if not journal_dir.is_absolute():
+        journal_dir = Path.cwd() / journal_dir
+    todo = read_observation_todo(journal_dir)
+    console.print(todo or "当前没有待观测清单。")
 
 
 @app.command()

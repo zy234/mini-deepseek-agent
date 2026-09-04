@@ -24,7 +24,7 @@ RECORD_FIELDS = {
 
 
 def read_account_journal(directory: str | Path) -> dict[str, Any]:
-    """读取当日记录、收盘复盘和待观测清单，作为新会话的持久记忆。"""
+    """读取账本快照；待观测清单保留给宿主展示，不属于 Agent 指令。"""
     journal_dir = Path(directory).expanduser().resolve() / "journals"
     todo_path = journal_dir.parent / "observation-todo.md"
     today = datetime.now(TRADING_TZ).date().isoformat()
@@ -40,6 +40,12 @@ def read_account_journal(directory: str | Path) -> dict[str, Any]:
             "observation_todo": _read_tail(todo_path, 12_000),
         },
     )
+
+
+def read_observation_todo(directory: str | Path) -> str:
+    """读取给用户查看的待观测清单，不作为 Agent 工具结果返回。"""
+    journal_dir = Path(directory).expanduser().resolve() / "journals"
+    return _read_tail(journal_dir.parent / "observation-todo.md", 12_000)
 
 
 def append_account_cycle(
