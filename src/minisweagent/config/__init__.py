@@ -23,7 +23,24 @@ def get_config_path(config_spec: str | Path) -> Path:
 def get_config_from_spec(config_spec: str | Path) -> dict:
     """Load one YAML configuration file."""
     path = get_config_path(config_spec)
-    return yaml.safe_load(path.read_text(encoding="utf-8"))
+    settings = yaml.safe_load(path.read_text(encoding="utf-8"))
+    _resolve_prompt_paths(settings, path.parent)
+    return settings
+
+
+def _resolve_prompt_paths(settings: dict, base_dir: Path) -> None:
+    """把角色配置里的 *_template_path 读成 *_template，让 prompt 独立成文件便于查找和修改。"""
+    for role, profile in (settings.get("agents") or {}).items():
+        for key in ("system_template", "instance_template"):
+            prompt_path = profile.pop(f"{key}_path", None)
+            if prompt_path is None:
+                continue
+            if key in profile:
+                raise ValueError(f"agents.{role} 不能同时提供 {key} 和 {key}_path")
+            resolved = base_dir / prompt_path
+            if not resolved.is_file():
+                raise FileNotFoundError(f"agents.{role}.{key}_path 指向的 prompt 文件不存在：{resolved}")
+            profile[key] = resolved.read_text(encoding="utf-8")
 
 
 __all__ = ["builtin_config_dir", "get_config_path", "get_config_from_spec"]

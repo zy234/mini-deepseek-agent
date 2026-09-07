@@ -257,16 +257,15 @@ class LocalEnvironment:
         if operation == "read":
             result = monitor.read()
         elif operation == "replace":
+            # 只保留全量覆盖一个写入口：清空必须显式写成 plans=[]，避免误删其他持仓的风控计划。
             result = monitor.replace(action.get("plans"))
-        elif operation == "clear":
-            result = monitor.clear()
         else:
             result = {
                 "ok": False,
                 "status": "error",
                 "operation": None,
                 "data": None,
-                "error": {"code": "invalid_argument", "detail": "account_monitor 只支持 read、replace 或 clear"},
+                "error": {"code": "invalid_argument", "detail": "account_monitor 只支持 read 或 replace"},
             }
         return _json_tool_output("account_monitor", result)
 

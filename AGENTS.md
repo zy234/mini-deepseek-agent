@@ -20,7 +20,8 @@ src/minisweagent/environments/local.py          本地命令执行和工具分�
 src/minisweagent/environments/editor.py         工作区内文本编辑和原子写入
 src/minisweagent/run/mini.py                    CLI 和持续会话
 src/minisweagent/utils/cli_display.py           CLI 分段、颜色和摘要展示
-src/minisweagent/config/deepseek.yaml           Prompt 和运行时默认配置
+src/minisweagent/config/deepseek.yaml         角色装配（flow、tools、prompt 文件路径）和运行时默认配置
+src/minisweagent/config/prompts/              各角色 prompt，按 `<role>.system.md` 和 `<role>.instance.md` 存放
 tests/test_core.py                               核心功能测试
 ```
 
@@ -28,11 +29,11 @@ tests/test_core.py                               核心功能测试
 
 - 目标 Python 版本为 3.10 或更高，并使用类型注解。
 - 优先采用显式构造，不要增加工厂或兼容性垫片。
-- 配置保存在 `deepseek.yaml`；密钥从 `DS_KEY` 读取。
+- 配置保存在 `deepseek.yaml`，角色 prompt 单独放在 `config/prompts/`；改 Agent 行为改 prompt，改安全和硬约束改工具层。密钥从 `DS_KEY` 读取。
 - 永远不要序列化或记录 `DS_KEY`。
 - GitHub API Token 由用户在 `~/.zshrc` 中导出为 `GITHUB_TOKEN`；非交互命令创建 PR 时需通过交互 `zsh` 加载，但不得打印、序列化或记录其值。
 - 代码注释应用中文，清楚的解释为什么这么开发。
-- 使用 `pytest` 编写测试，使用 `ruff` 做静态检查。
+- 使用 `pytest` 编写测试，使用 `ruff` 做静态检查。只写大功能的端到端测试，不写零散单元测试。
 - 模型请求使用 mock client 测试；只有明确的 smoke test 才允许发起真实 DeepSeek 请求。
 - `LocalEnvironment` 不是 sandbox。任何扩大命令权限的改动都必须说明影响。
 - `str_replace_editor` 只能访问工作区路径；编辑必须经过路径校验、唯一匹配检查和原子写入。

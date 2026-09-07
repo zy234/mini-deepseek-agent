@@ -27,8 +27,8 @@ class MarketMonitor:
         self.path = Path(state_dir).expanduser().resolve() / "market-monitor.json"
 
     def replace(self, plans: Any) -> dict[str, Any]:
-        if not isinstance(plans, list) or not 1 <= len(plans) <= MAX_PLANS:
-            return _error("invalid_argument", f"plans 必须是 1 到 {MAX_PLANS} 项数组")
+        if not isinstance(plans, list) or len(plans) > MAX_PLANS:
+            return _error("invalid_argument", f"plans 必须是最多 {MAX_PLANS} 项数组")
         normalized: list[dict[str, Any]] = []
         seen: set[str] = set()
         for plan in plans:

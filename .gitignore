@@ -187,5 +187,9 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/python
 
-docs/
+docs/*
+!docs/financial-agents/
+!docs/financial-agents/*.md
+
+# 本地运行凭据和金融 Agent 配置
 .env

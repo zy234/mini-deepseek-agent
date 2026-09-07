@@ -219,14 +219,14 @@ ACCOUNT_MONITOR_TOOL = {
     "type": "function",
     "function": {
         "name": "account_monitor",
-        "description": "读取、替换或清理宿主持久化的股票行情监控计划。只保存显式触发条件，不会自行下单。",
+        "description": "读取或全量替换宿主持久化的股票行情监控计划。只保存显式触发条件，不会自行下单；清空必须显式提交空 plans 数组。",
         "parameters": {
             "type": "object",
             "properties": {
-                "operation": {"type": "string", "enum": ["read", "replace", "clear"]},
+                "operation": {"type": "string", "enum": ["read", "replace"]},
                 "plans": {
                     "type": "array",
-                    "minItems": 1,
+                    "minItems": 0,
                     "maxItems": 20,
                     "items": {
                         "type": "object",
@@ -582,10 +582,10 @@ def _validate_account_journal_args(args: dict) -> str:
 
 def _validate_account_monitor_args(args: dict) -> str:
     operation = args.get("operation")
-    if operation not in {"read", "replace", "clear"}:
-        return "account_monitor 的 operation 必须是 read、replace 或 clear。"
+    if operation not in {"read", "replace"}:
+        return "account_monitor 的 operation 必须是 read 或 replace。"
     if operation == "replace" and not isinstance(args.get("plans"), list):
-        return "account_monitor replace 必须包含 plans 数组。"
+        return "account_monitor replace 必须包含 plans 数组，清空时提交空数组。"
     if operation != "replace" and "plans" in args:
         return f"account_monitor {operation} 不能包含 plans。"
     return ""

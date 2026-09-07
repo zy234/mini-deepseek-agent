@@ -86,8 +86,7 @@ python3 -m pip install -e '.[browser]'
 python3 -m playwright install chromium
 ```
 
-设置 `MSWEA_WEB_FETCH_BROWSER=0` 可关闭浏览器降级。模拟运行由宿主设置带时区的
-`MSWEA_WEB_AS_OF`（例如 `2026-09-03T10:30:00+08:00`）；已知晚于截止时间的搜索结果会被删除，时间不明的搜索候选只返回无标题、无摘要的 URL 供 `web_fetch` 核验。正文只有在发布时间明确且不晚于截止时间时才返回，只有日期而没有盘中时刻的当天文章也会被拒绝，避免未来信息进入 Agent。
+设置 `MSWEA_WEB_FETCH_BROWSER=0` 可关闭浏览器降级。真实运行按当前时间获取最新信息；搜索和正文仍需核验来源、发布时间与内容质量，时间不明或正文不可核验的内容不得作为最终事实。
 
 MiniQMT 工具直接连接 Bridge，默认地址为 `http://127.0.0.1:8023`（可用 `MINIQMT_BRIDGE_URL` 修改），个人账户由宿主环境绑定：
 

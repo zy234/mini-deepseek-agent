@@ -192,9 +192,9 @@ def _account_cycle(
     )
     if premarket:
         task = (
-            f"09:20 盘前分析模式（只读，不得下单），交易日 {started.date().isoformat()}；"
+            f"盘前分析模式（只读，不得下单），交易日 {started.date().isoformat()}，实际启动时间 {started.isoformat()}；"
             "必须以 account_journal.previous 中前一交易日收盘记录为基准，结合今日新闻和账户持仓完成研究、组合取舍，"
-            f"并将后续行情触发计划写入 account_monitor：{task}"
+            f"research_as_of 和 data_cutoff 使用实际启动时间，不过滤启动前已经获得的新信息；并将后续行情触发计划写入 account_monitor：{task}"
         )
     elif midday_review:
         task = (
@@ -265,7 +265,7 @@ def _run_trade_trigger(settings: dict, event: dict[str, Any], journal_dir: Path)
         f"当前行情：stock_code={event['stock_code']}，price={event['price']}，quote_at={event['quote_at']}。"
         f"本次交易使用稳定 client_intent_id=monitor-{event['plan']['plan_id']}。"
         "请查询账户和当前行情，独立完成 risk_check；只有风险通过才提交原 order，"
-        "交易后如需新的止盈、止损或撤单条件，读取现有监控计划并用 account_monitor replace 更新。"
+        "提交后用 miniqmt_account 的 orders/trades 复核实际成交量并报告 filled_volume。监控计划由主 Agent 维护，你不要改。"
     )
     try:
         model = get_model({**settings.get("model", {}), "stream_output": False})
@@ -332,6 +332,13 @@ def _account_loop_slot(now: datetime) -> tuple[str, str] | None:
     if current >= clock_time(15, 10):
         return "review", f"{now.date().isoformat()}-close"
     return None
+
+
+def _premarket_catchup_day(now: datetime) -> str | None:
+    """进程在盘中启动时补跑当天盘前分析，确保后续监控有计划可读。"""
+    if now.weekday() >= 5 or not (clock_time(9, 20) <= now.time() < clock_time(15, 10)):
+        return None
+    return now.date().isoformat()
 
 
 def _acquire_account_loop_lock() -> Any:
@@ -422,10 +429,16 @@ def main(
     account_day: bool = typer.Option(False, "--account-day", help="运行一个交易日并在收盘复盘后退出，供定时任务使用。"),
     install_account_schedule: bool = typer.Option(False, "--install-account-schedule", help="安装 macOS 工作日 09:20 自动运行的账户日定时任务。"),
     close_review: bool = typer.Option(False, "--close-review", help="运行一次只读收盘复盘。"),
+    show_observation_todo: bool = typer.Option(False, "--show-observation-todo", help="查看给用户的待观测清单，不启动 Agent。"),
 ) -> Any:
     """Run DeepSeek V4 Flash with host-owned Bash, editor, and web search tools."""
     _load_dotenv()
     settings = get_config_from_spec(config)
+    if show_observation_todo:
+        if account_loop or account_day or close_review or install_account_schedule:
+            raise typer.BadParameter("--show-observation-todo 不能与账户运行或安装参数同时使用")
+        _show_observation_todo()
+        return None
     if install_account_schedule:
         if account_loop or account_day or close_review:
             raise typer.BadParameter("--install-account-schedule 不能与账户运行参数同时使用")
@@ -447,6 +460,12 @@ def main(
         if not journal_dir.is_absolute():
             journal_dir = Path.cwd() / journal_dir
         try:
+            now = datetime.now(TRADING_TZ)
+            catchup_day = _premarket_catchup_day(now)
+            if catchup_day:
+                # launchd 延迟或人工晚启动时，不能直接进入 monitor 空转。
+                premarket_day = catchup_day
+                _account_cycle(settings, cycle_task, premarket=True)
             while True:
                 now = datetime.now(TRADING_TZ)
                 scheduled = _account_loop_slot(now)
