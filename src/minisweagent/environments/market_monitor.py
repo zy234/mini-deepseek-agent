@@ -73,7 +73,9 @@ class MarketMonitor:
         codes = [plan["stock_code"] for plan in active]
         quote_result = client.quotes(codes)
         if not quote_result["ok"]:
-            return _error("quote_error", "监控轮询无法取得最新行情")
+            # 行情失败的真正原因在 client 的 error.detail 里，吞掉它等于盘中轮询无法排查。
+            detail = (quote_result.get("error") or {}).get("detail") or "未知原因"
+            return _error("quote_error", f"监控轮询无法取得最新行情：{detail}")
         events: list[dict[str, Any]] = []
         changed = False
         for plan in plans:

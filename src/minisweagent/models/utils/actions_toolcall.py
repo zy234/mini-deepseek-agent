@@ -143,6 +143,72 @@ MINIQMT_QUOTES_TOOL = {
         },
     },
 }
+MINIQMT_SECTORS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "miniqmt_sectors",
+        "description": "查询 MiniQMT 板块：不传 sector_name 返回板块名列表，传板块名返回成分股代码。用于确定候选股票池。",
+        "parameters": {
+            "type": "object",
+            "properties": {"sector_name": {"type": "string", "maxLength": 30}},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+}
+MINIQMT_SCREEN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "miniqmt_screen",
+        "description": (
+            "对一个板块或指定代码列表批量取实时行情，按涨幅、跌幅或成交额排序后只返回前 limit 条紧凑行"
+            "（含 change_pct、amount、量价）。板块可以到全市场规模（沪深A股 5000 余只），自动分批取行情；"
+            "no_tick_count 和 unquotable_count 表示无行情或停牌被排除的数量。用于判断市场情绪方向和发现候选。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sector_name": {"type": "string", "maxLength": 30},
+                "stock_codes": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[036][0-9]{5}\\.(SH|SZ)$"},
+                    "minItems": 1,
+                    "maxItems": 300,
+                },
+                "sort_by": {"type": "string", "enum": ["change_pct_desc", "change_pct_asc", "amount_desc"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+}
+MINIQMT_HISTORY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "miniqmt_history",
+        "description": (
+            "查询最多 20 只 A 股的历史 K 线（自动先补下载再读本地），返回按日期排序的 open/high/low/close/volume/amount。"
+            "用于动量、相对强弱和量能对比；无数据的代码会列在 empty_codes 里，不会伪装成 0。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stock_codes": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[036][0-9]{5}\\.(SH|SZ)$"},
+                    "minItems": 1,
+                    "maxItems": 20,
+                },
+                "period": {"type": "string", "enum": ["1d", "5m", "1m"]},
+                "start_time": {"type": "string", "pattern": "^[0-9]{8}$"},
+                "end_time": {"type": "string", "pattern": "^[0-9]{8}$"},
+            },
+            "required": ["stock_codes", "start_time", "end_time"],
+            "additionalProperties": False,
+        },
+    },
+}
 MINIQMT_ACCOUNT_TOOL = {
     "type": "function",
     "function": {
@@ -289,6 +355,9 @@ TOOL_DEFINITIONS = [
     WEB_FETCH_TOOL,
     FINANCIAL_CALC_TOOL,
     MINIQMT_QUOTES_TOOL,
+    MINIQMT_SECTORS_TOOL,
+    MINIQMT_SCREEN_TOOL,
+    MINIQMT_HISTORY_TOOL,
     MINIQMT_ACCOUNT_TOOL,
     MINIQMT_TRADE_TOOL,
     ACCOUNT_JOURNAL_TOOL,
@@ -363,6 +432,10 @@ def parse_toolcall_actions(
             error_msg += _validate_financial_calc_args(args)
         elif tool_name == "miniqmt_quotes":
             error_msg += _validate_miniqmt_quotes_args(args)
+        elif tool_name == "miniqmt_screen":
+            error_msg += _validate_miniqmt_screen_args(args)
+        elif tool_name == "miniqmt_history":
+            error_msg += _validate_miniqmt_history_args(args)
         elif tool_name == "miniqmt_account":
             error_msg += _validate_miniqmt_account_args(args)
         elif tool_name == "miniqmt_trade":
@@ -384,6 +457,12 @@ def parse_toolcall_actions(
                 allowed = {"operation", "inputs"}
             elif tool_name == "miniqmt_quotes":
                 allowed = {"stock_codes"}
+            elif tool_name == "miniqmt_sectors":
+                allowed = {"sector_name"}
+            elif tool_name == "miniqmt_screen":
+                allowed = {"sector_name", "stock_codes", "sort_by", "limit"}
+            elif tool_name == "miniqmt_history":
+                allowed = {"stock_codes", "period", "start_time", "end_time"}
             elif tool_name == "miniqmt_account":
                 allowed = {"view"}
             elif tool_name == "miniqmt_trade":
@@ -471,6 +550,13 @@ def parse_toolcall_actions(
             action["task"] = args["task"]
             actions.append(action)
             continue
+        if tool_name in {"miniqmt_sectors", "miniqmt_screen", "miniqmt_history"}:
+            # 这三个行情发现工具没有必填的 command，参数按 schema 原样透传给宿主。
+            for key in ("sector_name", "stock_codes", "sort_by", "limit", "period", "start_time", "end_time"):
+                if key in args:
+                    action[key] = args[key]
+            actions.append(action)
+            continue
         action["command"] = args["command"]
         keys = ("workdir", "timeout", "description") if tool_name == "bash" else (
             "path", "file_text", "old_str", "new_str", "insert_line", "view_range", "expected_hash"
@@ -552,6 +638,38 @@ def _validate_miniqmt_quotes_args(args: dict) -> str:
         return "miniqmt_quotes 的 stock_codes 必须包含 1 到 20 项。"
     if any(not isinstance(code, str) or not code.strip() for code in stock_codes):
         return "miniqmt_quotes 的股票代码必须是非空字符串。"
+    return ""
+
+
+def _validate_miniqmt_screen_args(args: dict) -> str:
+    sector_name = args.get("sector_name")
+    stock_codes = args.get("stock_codes")
+    if bool(isinstance(sector_name, str) and sector_name.strip()) == bool(isinstance(stock_codes, list) and stock_codes):
+        return "miniqmt_screen 必须且只能提供 sector_name 或 stock_codes 之一。"
+    if isinstance(stock_codes, list) and not 1 <= len(stock_codes) <= 300:
+        return "miniqmt_screen 的 stock_codes 最多 300 项。"
+    if "sort_by" in args and args["sort_by"] not in {"change_pct_desc", "change_pct_asc", "amount_desc"}:
+        return "miniqmt_screen 的 sort_by 不受支持。"
+    limit = args.get("limit", 20)
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
+        return "miniqmt_screen 的 limit 必须是 1 到 50 的整数。"
+    return ""
+
+
+def _validate_miniqmt_history_args(args: dict) -> str:
+    stock_codes = args.get("stock_codes")
+    if not isinstance(stock_codes, list) or not 1 <= len(stock_codes) <= 20:
+        return "miniqmt_history 的 stock_codes 必须包含 1 到 20 项。"
+    if any(not isinstance(code, str) or not code.strip() for code in stock_codes):
+        return "miniqmt_history 的股票代码必须是非空字符串。"
+    for name in ("start_time", "end_time"):
+        value = args.get(name)
+        if not isinstance(value, str) or len(value) != 8 or not value.isdigit():
+            return f"miniqmt_history 的 {name} 必须是 YYYYMMDD。"
+    if args["start_time"] > args["end_time"]:
+        return "miniqmt_history 的 start_time 不能晚于 end_time。"
+    if "period" in args and args["period"] not in {"1d", "5m", "1m"}:
+        return "miniqmt_history 的 period 只能是 1d、5m 或 1m。"
     return ""
 
 

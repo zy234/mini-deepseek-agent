@@ -45,6 +45,10 @@ DEFAULT_FORMAT_ERROR_TEMPLATE = """
 """.strip()
 
 
+class StreamInterrupted(RuntimeError):
+    """流式读取中断：保留原始异常类型和已收数据量，避免只剩一个 ReadTimeout 类名。"""
+
+
 class DeepSeekModelConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -139,7 +143,14 @@ class DeepSeekModel:
                 if attempt + 1 >= max(1, self.config.retry_attempts):
                     raise
                 delay = 2**attempt
-                logger.warning("DeepSeek request failed; retrying in %ss: %s", delay, error)
+                logger.warning(
+                    "DeepSeek request failed (attempt %s/%s); retrying in %ss: %s: %s",
+                    attempt + 1,
+                    max(1, self.config.retry_attempts),
+                    delay,
+                    type(error).__name__,
+                    error,
+                )
                 time.sleep(delay)
         raise RuntimeError("DeepSeek request failed") from last_error  # pragma: no cover
 
@@ -150,39 +161,56 @@ class DeepSeekModel:
         finish_reason = None
         usage: dict = {}
         output_state = _OutputState(enabled=self.config.stream_output)
+        chunks = 0
+        stream_started = time.time()
+        last_chunk_at = stream_started
 
-        for chunk in response:
-            if getattr(chunk, "usage", None):
-                usage = chunk.usage.model_dump(exclude_none=True)
-            for choice in getattr(chunk, "choices", []) or []:
-                finish_reason = getattr(choice, "finish_reason", None) or finish_reason
-                delta = getattr(choice, "delta", None)
-                if delta is None:
-                    continue
-                reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
-                if reasoning:
-                    reasoning_parts.append(reasoning)
-                    self._stream_text(output_state, "思考", reasoning)
-                content = getattr(delta, "content", None)
-                if content:
-                    content_parts.append(content)
-                    self._stream_text(output_state, "回复", content)
-                for tool_delta in getattr(delta, "tool_calls", None) or []:
-                    index = getattr(tool_delta, "index", None)
-                    index = 0 if index is None else index
-                    call = tool_calls.setdefault(index, _ToolCall())
-                    call.id = getattr(tool_delta, "id", None) or call.id
-                    function = getattr(tool_delta, "function", None)
-                    if function is None:
+        try:
+            for chunk in response:
+                chunks += 1
+                last_chunk_at = time.time()
+                if getattr(chunk, "usage", None):
+                    usage = chunk.usage.model_dump(exclude_none=True)
+                for choice in getattr(chunk, "choices", []) or []:
+                    finish_reason = getattr(choice, "finish_reason", None) or finish_reason
+                    delta = getattr(choice, "delta", None)
+                    if delta is None:
                         continue
-                    name = getattr(function, "name", None)
-                    arguments = getattr(function, "arguments", None)
-                    if name:
-                        call.function.name = name
-                    if arguments:
-                        call.function.arguments += arguments
+                    reasoning = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
+                    if reasoning:
+                        reasoning_parts.append(reasoning)
+                        self._stream_text(output_state, "思考", reasoning)
+                    content = getattr(delta, "content", None)
+                    if content:
+                        content_parts.append(content)
+                        self._stream_text(output_state, "回复", content)
+                    for tool_delta in getattr(delta, "tool_calls", None) or []:
+                        index = getattr(tool_delta, "index", None)
+                        index = 0 if index is None else index
+                        call = tool_calls.setdefault(index, _ToolCall())
+                        call.id = getattr(tool_delta, "id", None) or call.id
+                        function = getattr(tool_delta, "function", None)
+                        if function is None:
+                            continue
+                        name = getattr(function, "name", None)
+                        arguments = getattr(function, "arguments", None)
+                        if name:
+                            call.function.name = name
+                        if arguments:
+                            call.function.arguments += arguments
+        except Exception as error:
+            # 流建立后的读取不在 _request 的重试范围内，这里把现场量化后抛出，禁止静默丢失。
+            now = time.time()
+            raise StreamInterrupted(
+                f"{type(error).__name__}: {error}｜已收 {chunks} 个 chunk、"
+                f"正文 {len(''.join(content_parts))} 字、思考 {len(''.join(reasoning_parts))} 字、"
+                f"tool_calls {len(tool_calls)} 个、finish_reason={finish_reason}；"
+                f"距上一个 chunk {now - last_chunk_at:.1f}s，本次流已持续 {now - stream_started:.1f}s，"
+                f"读超时上限 {self.config.api_timeout_seconds}s"
+            ) from error
+        finally:
+            output_state.finish()
 
-        output_state.finish()
         return "".join(content_parts), "".join(reasoning_parts), list(tool_calls.values()), finish_reason, usage
 
     @staticmethod

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import platform
 import selectors
@@ -6,7 +7,9 @@ import signal
 import subprocess
 import tempfile
 import time
+import traceback
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -48,6 +51,8 @@ STREAM_MAX_BYTES = 64_000
 STREAM_SPILL_MAX_BYTES = 64 * 1024 * 1024
 TERMINATION_GRACE_SECONDS = 0.25
 
+logger = logging.getLogger("minisweagent.environment")
+
 
 class LocalEnvironmentConfig(BaseModel):
     cwd: str = ""
@@ -71,6 +76,8 @@ class LocalEnvironmentConfig(BaseModel):
     agent_common_config: dict[str, Any] = Field(default_factory=dict)
     agent_model_config: dict[str, Any] = Field(default_factory=dict)
     agent_call_limit: int = Field(default=4, ge=1, le=20)
+    # 子 Agent 轨迹前缀：宿主传入当次会话轨迹的去后缀路径，子 Agent 轨迹与父会话同目录同前缀。
+    agent_trace_prefix: str = ""
 
 
 class LocalEnvironment:
@@ -108,6 +115,28 @@ class LocalEnvironment:
             return _json_tool_output("financial_calc", result)
         if action.get("tool") == "miniqmt_quotes":
             return _json_tool_output("miniqmt_quotes", self._get_miniqmt().quotes(action.get("stock_codes", [])))
+        if action.get("tool") == "miniqmt_sectors":
+            return _json_tool_output("miniqmt_sectors", self._get_miniqmt().sectors(action.get("sector_name", "")))
+        if action.get("tool") == "miniqmt_screen":
+            return _json_tool_output(
+                "miniqmt_screen",
+                self._get_miniqmt().screen(
+                    sector_name=action.get("sector_name", ""),
+                    stock_codes=action.get("stock_codes"),
+                    sort_by=action.get("sort_by", "change_pct_desc"),
+                    limit=action.get("limit", 20),
+                ),
+            )
+        if action.get("tool") == "miniqmt_history":
+            return _json_tool_output(
+                "miniqmt_history",
+                self._get_miniqmt().history(
+                    action.get("stock_codes", []),
+                    period=action.get("period", "1d"),
+                    start_time=action.get("start_time", ""),
+                    end_time=action.get("end_time", ""),
+                ),
+            )
         if action.get("tool") == "miniqmt_account":
             return _json_tool_output("miniqmt_account", self._get_miniqmt().account(action.get("view", "")))
         if action.get("tool") == "miniqmt_trade":
@@ -299,6 +328,10 @@ class LocalEnvironment:
         if phase_error is not None:
             return _json_tool_output("agent_call", phase_error)
         self._agent_call_count += 1
+        attempt = self._agent_call_count
+        trace_path = self._child_trace_path(attempt, role)
+        started = time.monotonic()
+        child_agent: Any = None
         try:
             # 延迟导入避免 agents -> environments 的循环依赖。
             from minisweagent.agents import get_agent
@@ -310,7 +343,8 @@ class LocalEnvironment:
             child_settings = recursive_merge(self.config.agent_common_config, dict(profile))
             child_settings.pop("description", None)
             child_settings["agent_name"] = role
-            child_settings["output_path"] = None
+            # 子 Agent 轨迹独立落盘：失败时这是唯一能还原死亡位置和已获材料的证据。
+            child_settings["output_path"] = trace_path
             child_environment = LocalEnvironment(
                 cwd=self.config.cwd,
                 env=dict(self.config.env),
@@ -337,6 +371,7 @@ class LocalEnvironment:
                         "error": {
                             "code": result.get("exit_status", "child_agent_incomplete"),
                             "detail": "子 Agent 未提交完整结果，不能把该阶段视为完成",
+                            **self._child_failure_context(role, started, child_agent, trace_path),
                         },
                     },
                 )
@@ -351,6 +386,8 @@ class LocalEnvironment:
                         "exit_status": result.get("exit_status", "unknown"),
                         "submission": result.get("submission", ""),
                         "api_calls": child_agent.n_calls,
+                        "elapsed_seconds": round(time.monotonic() - started, 1),
+                        "trace_path": str(trace_path) if trace_path else "",
                     },
                 },
             )
@@ -364,7 +401,11 @@ class LocalEnvironment:
                 {
                     "ok": False,
                     "status": "blocked" if isinstance(error, CommandNotApproved) else "error",
-                    "error": {"code": status, "detail": detail},
+                    "error": {
+                        "code": status,
+                        "detail": detail,
+                        **self._child_failure_context(role, started, child_agent, trace_path),
+                    },
                 },
             )
         except Exception as error:
@@ -373,9 +414,50 @@ class LocalEnvironment:
                 {
                     "ok": False,
                     "status": "error",
-                    "error": {"code": type(error).__name__, "detail": f"子 Agent 执行失败：{error}"},
+                    "error": {
+                        "code": type(error).__name__,
+                        "detail": f"子 Agent 执行失败：{error}",
+                        **self._child_failure_context(role, started, child_agent, trace_path, error=error),
+                    },
                 },
             )
+
+    def _child_trace_path(self, attempt: int, role: str) -> Path | None:
+        """子 Agent 轨迹独立成文件，与父会话轨迹同目录同前缀，按调用序号和角色区分。"""
+        if not self.config.agent_trace_prefix:
+            return None
+        return Path(f"{self.config.agent_trace_prefix}-{attempt:02d}-{role}.json")
+
+    def _child_failure_context(
+        self,
+        role: str,
+        started: float,
+        child_agent: Any,
+        trace_path: Path | None,
+        *,
+        error: BaseException | None = None,
+    ) -> dict[str, Any]:
+        """子 Agent 失败必须留下现场：完整 traceback 进 stderr，定位信息回报主 Agent。"""
+        elapsed = round(time.monotonic() - started, 1)
+        api_calls = getattr(child_agent, "n_calls", 0)
+        trace = str(trace_path) if trace_path else ""
+        stack = "".join(traceback.format_exception(error)).strip() if error is not None else ""
+        logger.error(
+            "%s agent_call 失败 role=%s elapsed=%ss api_calls=%s trace=%s%s",
+            time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            role,
+            elapsed,
+            api_calls,
+            trace or "<未配置轨迹前缀，未落盘>",
+            f"\n{stack}" if stack else "",
+        )
+        return {
+            "role": role,
+            "elapsed_seconds": elapsed,
+            "api_calls": api_calls,
+            "trace_path": trace,
+            "traceback_tail": stack.splitlines()[-1] if stack else "",
+        }
 
     def _validate_agent_call_phase(self, role: str) -> dict[str, Any] | None:
         """检查账户管理工作流的最小顺序，交易权限仍由交易工具再次校验。"""

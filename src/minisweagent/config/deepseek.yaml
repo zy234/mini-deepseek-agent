@@ -20,10 +20,13 @@ agents:
     system_template_path: prompts/single_call.system.md
     instance_template_path: prompts/single_call.instance.md
   financial_research:
-    description: 基于前一收盘和当日行情生成买入候选的金融研究 Agent
+    description: 先判断市场情绪方向再对照持仓、按需取证的金融研究 Agent
     flow: iterative
     tools:
       - miniqmt_quotes
+      - miniqmt_sectors
+      - miniqmt_screen
+      - miniqmt_history
       - financial_calc
       - web_search
       - web_fetch
@@ -34,6 +37,7 @@ agents:
     flow: iterative
     tools:
       - miniqmt_quotes
+      - miniqmt_history
       - miniqmt_account
       - financial_calc
       - web_search

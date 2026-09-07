@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -12,15 +13,28 @@ from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import ProxyHandler, Request, build_opener
 
 from minisweagent.environments.account_journal import append_trade_audit
 
 MAX_RESPONSE_BYTES = 1_000_000
+MAX_ERROR_BODY_CHARS = 400
 STOCK_CODE_PATTERN = re.compile(r"^(?:[036]\d{5})\.(?:SH|SZ)$")
 TRADING_TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
 STOP_LOSS_RATIO = 0.10
+QUOTE_BATCH_SIZE = 1000
+SCREEN_UNIVERSE_LIMIT = 6000
+HISTORY_CODE_LIMIT = 20
+HISTORY_BAR_LIMIT = 60
+HISTORY_PERIODS = ("1d", "5m", "1m")
+# 排序键与是否倒序：涨幅榜、跌幅榜、成交额榜是筛选候选唯一需要的三种视角。
+SCREEN_SORTS = {
+    "change_pct_desc": (lambda row: row["change_pct"], True),
+    "change_pct_asc": (lambda row: row["change_pct"], False),
+    "amount_desc": (lambda row: row["amount"], True),
+}
+logger = logging.getLogger("minisweagent.miniqmt")
 
 
 class MiniQMTClient:
@@ -66,6 +80,112 @@ class MiniQMTClient:
         if len(set(codes)) != len(codes):
             return _error("invalid_argument", "stock_codes 不能重复")
         return self._request("POST", "/api/v1/market/full-tick", payload={"codes": codes})
+
+    def sectors(self, sector_name: str = "") -> dict[str, Any]:
+        """不带板块名返回板块列表，带板块名返回成分股代码；候选发现的起点。"""
+        if not sector_name:
+            return self._request("GET", "/api/v1/market/sectors")
+        if len(sector_name) > 30:
+            return _error("invalid_argument", "sector_name 过长")
+        return self._request("GET", f"/api/v1/market/sectors/{quote(sector_name, safe='')}/stocks")
+
+    def screen(
+        self,
+        *,
+        sector_name: str = "",
+        stock_codes: list[str] | None = None,
+        sort_by: str = "change_pct_desc",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """按板块或指定代码批量取实时行情，只回排序后的紧凑行，避免整版 tick 淹没上下文。"""
+        if sort_by not in SCREEN_SORTS:
+            return _error("invalid_argument", f"sort_by 只能是 {'、'.join(SCREEN_SORTS)}")
+        if not 1 <= limit <= 50:
+            return _error("invalid_argument", "limit 必须是 1 到 50")
+        if bool(sector_name) == bool(stock_codes):
+            return _error("invalid_argument", "sector_name 与 stock_codes 必须且只能提供一个")
+        if sector_name:
+            resolved = self.sectors(sector_name)
+            if not resolved["ok"]:
+                return resolved
+            universe = [code for code in resolved["data"].get("stocks", []) if STOCK_CODE_PATTERN.match(code)]
+        else:
+            try:
+                universe = [_stock_code(code) for code in stock_codes or []]
+            except ValueError as exc:
+                return _error("invalid_argument", str(exc))
+        universe = list(dict.fromkeys(universe))
+        if not universe:
+            return _error("empty_universe", f"板块或代码列表里没有可用 A 股代码：{sector_name or '自定义列表'}")
+        if len(universe) > SCREEN_UNIVERSE_LIMIT:
+            return _error("invalid_argument", f"股票池最多 {SCREEN_UNIVERSE_LIMIT} 只，当前 {len(universe)} 只")
+        rows: list[dict[str, Any]] = []
+        quote_at = ""
+        returned = 0
+        for start in range(0, len(universe), QUOTE_BATCH_SIZE):
+            batch = self._request(
+                "POST", "/api/v1/market/full-tick", payload={"codes": universe[start : start + QUOTE_BATCH_SIZE]}
+            )
+            if not batch["ok"]:
+                return batch
+            ticks = batch["data"].get("ticks") or {}
+            returned += len(ticks)
+            for code, tick in ticks.items():
+                row = _screen_row(code, tick)
+                if row:
+                    rows.append(row)
+                quote_at = max(quote_at, str(tick.get("timetag") or ""))
+        rows.sort(key=SCREEN_SORTS[sort_by][0], reverse=SCREEN_SORTS[sort_by][1])
+        return _success(
+            operation="market_screen",
+            data={
+                "sector": sector_name,
+                "quote_at": quote_at,
+                "universe_size": len(universe),
+                "quoted": len(rows),
+                # 行情缺失和停牌不能混进榜单，也不能被静默丢掉，单独计数交出去。
+                "no_tick_count": len(universe) - returned,
+                "unquotable_count": returned - len(rows),
+                "sort_by": sort_by,
+                "rows": rows[:limit],
+            },
+        )
+
+    def history(
+        self, stock_codes: list[str], *, period: str = "1d", start_time: str = "", end_time: str = ""
+    ) -> dict[str, Any]:
+        """先按范围补下载再读本地 K 线；xtdata 不下载就只返回空表，静默的空数据比报错更危险。"""
+        if not 1 <= len(stock_codes) <= HISTORY_CODE_LIMIT:
+            return _error("invalid_argument", f"stock_codes 必须包含 1 到 {HISTORY_CODE_LIMIT} 项")
+        try:
+            codes = [_stock_code(code) for code in stock_codes]
+        except ValueError as exc:
+            return _error("invalid_argument", str(exc))
+        codes = list(dict.fromkeys(codes))
+        if period not in HISTORY_PERIODS:
+            return _error("invalid_argument", f"period 只能是 {'、'.join(HISTORY_PERIODS)}")
+        if not (_is_day_stamp(start_time) and _is_day_stamp(end_time)) or start_time > end_time:
+            return _error("invalid_argument", "start_time 和 end_time 必须是 YYYYMMDD，且开始不晚于结束")
+        payload = {"stock_list": codes, "period": period, "start_time": start_time, "end_time": end_time}
+        downloaded = self._request("POST", "/api/v1/market/history/download2", payload=payload)
+        if not downloaded["ok"]:
+            return downloaded
+        local = self._request("POST", "/api/v1/market/history/local", payload={**payload, "count": -1})
+        if not local["ok"]:
+            return local
+        bars = {code: _history_rows(frame) for code, frame in (local["data"].get("data") or {}).items()}
+        empty = sorted(code for code, rows in bars.items() if not rows)
+        return _success(
+            operation="market_history",
+            data={
+                "period": period,
+                "start_time": start_time,
+                "end_time": end_time,
+                "bars": {code: rows[-HISTORY_BAR_LIMIT:] for code, rows in bars.items() if rows},
+                "empty_codes": empty,
+            },
+        )
+
 
     def account(self, view: str) -> dict[str, Any]:
         account_id = os.getenv("MINIQMT_ACCOUNT_ID", "").strip()
@@ -425,13 +545,23 @@ class MiniQMTClient:
                     return _error("response_too_large", "MiniQMT 响应超过 1 MB 限制")
                 data = json.loads(raw.decode("utf-8"))
         except HTTPError as exc:
+            # Bridge 把真正的原因放在响应体里（例如 trader not connected），丢掉它等于让 Agent 瞎猜。
+            body = _error_body(exc)
+            scene = f"{method} {path} HTTP {exc.code}：{body}"
+            logger.error("%s MiniQMT 请求失败 %s", _now(), scene)
             if unknown_on_network_error and exc.code >= 500:
-                return _error("unknown", "交易提交结果未知，请查询委托后人工确认")
+                return _error("unknown", f"交易提交结果未知，请查询委托后人工确认（{scene}）")
             error_code = "authentication_error" if exc.code in {401, 403} else "http_error"
-            return _error(error_code, f"MiniQMT Bridge 返回 HTTP {exc.code}")
+            return _error(error_code, f"MiniQMT Bridge {scene}")
         except (URLError, TimeoutError, OSError) as exc:
+            scene = f"{method} {path} {type(exc).__name__}: {_mask_account(str(exc))}"
+            logger.error("%s MiniQMT 连接失败 %s", _now(), scene)
             code = "unknown" if unknown_on_network_error else "network_error"
-            detail = "交易提交结果未知，请查询委托后人工确认" if unknown_on_network_error else f"MiniQMT 连接失败：{type(exc).__name__}"
+            detail = (
+                f"交易提交结果未知，请查询委托后人工确认（{scene}）"
+                if unknown_on_network_error
+                else f"MiniQMT 连接失败：{scene}"
+            )
             return _error(code, detail)
         except (UnicodeDecodeError, json.JSONDecodeError):
             return _error("parse_error", "MiniQMT 返回的不是有效 UTF-8 JSON")
@@ -485,6 +615,64 @@ def _stock_code(value: Any) -> str:
     if not isinstance(value, str) or not STOCK_CODE_PATTERN.fullmatch(value.upper()):
         raise ValueError("股票代码必须是 600000.SH 形式的 A 股代码")
     return value.upper()
+
+
+def _is_day_stamp(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 8 and value.isdigit()
+
+
+def _screen_row(code: str, tick: dict[str, Any]) -> dict[str, Any] | None:
+    """把整版 tick 压成筛选需要的几个字段；停牌或无成交的直接丢掉，不当成 0% 涨幅。"""
+    last = _finite(tick.get("lastPrice"))
+    close = _finite(tick.get("lastClose"))
+    if last is None or close is None or last <= 0 or close <= 0:
+        return None
+    return {
+        "stock_code": code,
+        "last_price": last,
+        "last_close": close,
+        "change_pct": round((last - close) / close * 100, 2),
+        "open": _finite(tick.get("open")),
+        "high": _finite(tick.get("high")),
+        "low": _finite(tick.get("low")),
+        "volume": _finite(tick.get("volume")) or 0.0,
+        "amount": _finite(tick.get("amount")) or 0.0,
+    }
+
+
+def _history_rows(frame: Any) -> list[dict[str, Any]]:
+    """把 bridge 的 dataframe 字典压成按日期排序的紧凑行。"""
+    if not isinstance(frame, dict):
+        return []
+    columns = frame.get("columns") or []
+    wanted = [name for name in ("open", "high", "low", "close", "volume", "amount", "preClose") if name in columns]
+    rows = []
+    for stamp, values in zip(frame.get("index") or [], frame.get("data") or [], strict=False):
+        row: dict[str, Any] = {"date": stamp}
+        for name in wanted:
+            row[name] = _finite(values[columns.index(name)])
+        rows.append(row)
+    return rows
+
+
+def _finite(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and math.isfinite(value) else None
+
+
+def _error_body(exc: HTTPError) -> str:
+    """读取 Bridge 的错误响应体：真正的故障原因在这里，脱敏并截断后必须交出去。"""
+    try:
+        raw = exc.read(MAX_ERROR_BODY_CHARS * 4)
+    except OSError as read_error:
+        return f"<响应体读取失败：{type(read_error).__name__}>"
+    text = _mask_account(" ".join(raw.decode("utf-8", "replace").split())) or "<空响应体>"
+    return text[:MAX_ERROR_BODY_CHARS] + ("…" if len(text) > MAX_ERROR_BODY_CHARS else "")
+
+
+def _mask_account(text: str) -> str:
+    """错误现场可能带上账户号，落盘和回报前一律替换成占位符。"""
+    account_id = os.getenv("MINIQMT_ACCOUNT_ID", "").strip()
+    return text.replace(account_id, "<account_id>") if account_id else text
 
 
 def _redact(value: Any) -> Any:

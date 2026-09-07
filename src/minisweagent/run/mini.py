@@ -2,6 +2,7 @@
 """Run the single-model DeepSeek Bash agent."""
 
 import json
+import logging
 import os
 import plistlib
 import re
@@ -9,6 +10,7 @@ import secrets
 import subprocess
 import sys
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from datetime import time as clock_time
 from pathlib import Path
@@ -37,6 +39,7 @@ DEFAULT_CONFIG_FILE = Path(
 console = Console(highlight=False)
 app = typer.Typer(add_completion=False)
 TRADING_TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
+logger = logging.getLogger("minisweagent.run")
 
 
 def _load_dotenv(path: Path | None = None) -> None:
@@ -188,6 +191,7 @@ def _account_cycle(
             "agent_profiles": agent_profiles,
             "agent_common_config": settings.get("agent", {}),
             "agent_model_config": settings.get("model", {}),
+            "agent_trace_prefix": str(session_output.with_suffix("")),
         },
     )
     if premarket:
@@ -219,9 +223,17 @@ def _account_cycle(
     try:
         result = agent.run(task)
     except Exception as exc:
+        # 主 Agent 崩溃时把完整 traceback 和轨迹路径写到 stderr，账本里只记结论不足以复盘。
+        logger.error(
+            "%s 账户管理周期异常 cycle=%s trace=%s\n%s",
+            datetime.now(TRADING_TZ).isoformat(),
+            cycle_id,
+            session_output,
+            "".join(traceback.format_exception(exc)).strip(),
+        )
         result = {
             "exit_status": type(exc).__name__,
-            "submission": f"账户管理周期异常：{type(exc).__name__}: {exc}",
+            "submission": f"账户管理周期异常：{type(exc).__name__}: {exc}（轨迹 {session_output}）",
         }
     append_cycle_fallback(
         environment.config.account_journal_dir,
@@ -273,7 +285,18 @@ def _run_trade_trigger(settings: dict, event: dict[str, Any], journal_dir: Path)
         agent = get_agent(model, environment, agent_settings)
         result = agent.run(task)
     except Exception as exc:
-        result = {"exit_status": type(exc).__name__, "submission": f"交易触发处理异常：{type(exc).__name__}: {exc}"}
+        logger.error(
+            "%s 交易触发处理异常 cycle=%s plan=%s trace=%s\n%s",
+            datetime.now(TRADING_TZ).isoformat(),
+            cycle_id,
+            event["plan"].get("plan_id", ""),
+            session_output,
+            "".join(traceback.format_exception(exc)).strip(),
+        )
+        result = {
+            "exit_status": type(exc).__name__,
+            "submission": f"交易触发处理异常：{type(exc).__name__}: {exc}（轨迹 {session_output}）",
+        }
     action = event["plan"].get("side", "HOLD")
     append_account_cycle(
         journal_dir,
@@ -310,7 +333,12 @@ def _poll_market_monitor(settings: dict, journal_dir: Path) -> list[dict[str, An
         environment = get_environment(environment_settings)
         result = monitor.poll(environment._get_miniqmt())
     except Exception as exc:
-        console.print(f"[bold]行情监控异常：{type(exc).__name__}[/bold]")
+        logger.error(
+            "%s 行情监控异常\n%s",
+            datetime.now(TRADING_TZ).isoformat(),
+            "".join(traceback.format_exception(exc)).strip(),
+        )
+        console.print(f"[bold]行情监控异常：{type(exc).__name__}: {exc}[/bold]")
         return []
     if not result["ok"]:
         console.print(f"[bold]行情监控失败：{result['error']['detail']}[/bold]")
@@ -521,6 +549,8 @@ def main(
                 },
                 "agent_common_config": settings.get("agent", {}),
                 "agent_model_config": settings.get("model", {}),
+                # 子 Agent 轨迹跟随父会话轨迹落在同一日期目录下，便于失败后按序号回溯。
+                "agent_trace_prefix": str(Path(agent_settings["output_path"]).with_suffix("")),
             },
         )
     task = task or terminal_prompt("Task: ")
