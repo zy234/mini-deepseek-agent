@@ -147,10 +147,17 @@ MINIQMT_SECTORS_TOOL = {
     "type": "function",
     "function": {
         "name": "miniqmt_sectors",
-        "description": "查询 MiniQMT 板块：不传 sector_name 返回板块名列表，传板块名返回成分股代码。用于确定候选股票池。",
+        "description": (
+            "查询 MiniQMT 板块：不传 sector_name 返回板块名列表（板块总数上千，必须用 name_filter 关键字过滤，"
+            "返回带 total、matched 和 truncated 说明截断情况），传板块名返回成分股代码。用于确定候选股票池。"
+        ),
         "parameters": {
             "type": "object",
-            "properties": {"sector_name": {"type": "string", "maxLength": 30}},
+            "properties": {
+                "sector_name": {"type": "string", "maxLength": 30},
+                "name_filter": {"type": "string", "maxLength": 30},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            },
             "required": [],
             "additionalProperties": False,
         },
@@ -161,9 +168,17 @@ MINIQMT_SCREEN_TOOL = {
     "function": {
         "name": "miniqmt_screen",
         "description": (
-            "对一个板块或指定代码列表批量取实时行情，按涨幅、跌幅或成交额排序后只返回前 limit 条紧凑行"
-            "（含 change_pct、amount、量价）。板块可以到全市场规模（沪深A股 5000 余只），自动分批取行情；"
-            "no_tick_count 和 unquotable_count 表示无行情或停牌被排除的数量。用于判断市场情绪方向和发现候选。"
+            "对一个板块或指定代码列表批量取实时行情，排序后只返回前 limit 条紧凑行。板块可以到全市场规模"
+            "（沪深A股 5000 余只），自动分批取行情；no_tick_count 和 unquotable_count 表示无行情或停牌被排除的数量。"
+            "sort_by 里 close_position_desc 按收盘价在当日振幅中的位置排序，用来区分收在最高价的强势票和冲高回落；"
+            "涨幅榜只能告诉你今天谁已经涨完了，挑趋势跟随候选必须配合 enrich_trend。"
+            "enrich_trend=true 时额外读日线补确定性趋势字段（limit 最多 20）：ma5/ma10/ma20、ma_stack、ma20_gap_pct、"
+            "vol_ratio（当日量 / 前 5 日均量）、pivot（20 日最高，突破参考）、high_20d_gap_pct、swing_low_10d、"
+            "stop_ref（止损参考）、breakout_entry（可直接用于 account_monitor price_range 的下界和追高上限）"
+            "以及 trend_gate（breakout / pullback / holding / extended / broken / insufficient_data）。"
+            "这些字段是工具算出的事实，只能引用不得重判。"
+            "每行的 lot_cost 是一手（100 股）成本，buyable 表示宿主账户能否买入，买不了的行带 unbuyable 原因；"
+            "顶层 buy_limits 给出单笔买入金额上限、可买最高股价和被禁板块。"
         ),
         "parameters": {
             "type": "object",
@@ -175,8 +190,40 @@ MINIQMT_SCREEN_TOOL = {
                     "minItems": 1,
                     "maxItems": 300,
                 },
-                "sort_by": {"type": "string", "enum": ["change_pct_desc", "change_pct_asc", "amount_desc"]},
+                "sort_by": {
+                    "type": "string",
+                    "enum": ["change_pct_desc", "change_pct_asc", "amount_desc", "close_position_desc"],
+                },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                "enrich_trend": {"type": "boolean"},
+            },
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+}
+MINIQMT_SECTOR_RANK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "miniqmt_sector_rank",
+        "description": (
+            "按板块聚合当日全市场行情，返回板块热度榜。发现候选的入口就是这里，不是个股涨幅榜——"
+            "涨幅榜前排要么涨停封死买不进，要么一手成本就超过单笔上限。"
+            "family：TGN 是概念题材（短线资金炒的就是概念），THY 是行业，SW1/SW2 是申万一级/二级行业，"
+            "用 TGN 定当日主线、再用 SW2 交叉验证这个主线背后有没有行业级资金。"
+            "每个板块返回成分股数、上涨家数与占比、中位涨幅、总成交额，以及这个账户真正关心的三个字段："
+            "buyable_count（一手成本在单笔上限内且非科创板的家数）、buyable_median_change_pct（只统计可买票的中位涨幅，"
+            "榜单按它排序）和 top_buyable（板块内可买且最强的三只，作为下钻起点）。"
+            "只有龙头在涨、可买小票不动的板块 buyable_median_change_pct 会很低，对这个账户没有意义。"
+            "min_buyable 过滤掉可买家数不足的板块。板块成分股按交易日缓存，当天第一次调用较慢。"
+            "拿到热板块后用 miniqmt_screen 传 sector_name 加 enrich_trend 复查个股结构，只买 trend_gate=breakout 的。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "family": {"type": "string", "enum": ["TGN", "THY", "SW1", "SW2"]},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 30},
+                "min_buyable": {"type": "integer", "minimum": 0, "maximum": 100},
             },
             "required": [],
             "additionalProperties": False,
@@ -226,14 +273,22 @@ MINIQMT_TRADE_TOOL = {
     "type": "function",
     "function": {
         "name": "miniqmt_trade",
-        "description": "向宿主绑定的个人账户提交或撤销委托。observe 阻断，execute 人工审批，auto_execute 通过宿主安全规则后自动执行。",
+        "description": (
+            "向宿主绑定的个人账户提交或撤销委托。observe 阻断，execute 人工审批，auto_execute 通过宿主安全规则后自动执行。"
+            "买入必须固定限价、单笔金额不超过宿主上限、买入后保留现金下限，且禁止科创板 688/689；卖出只校验可卖数量和上限。"
+            "买入用 price_cap（追高上限）而不是 price：宿主在提交那一刻按最新价推导出既能成交又不超偏离上限的限价，"
+            "自己算 price 会在价格漂移后被偏离上限拒掉。最新价已高过 price_cap 时宿主直接拒单，不追高。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "operation": {"type": "string", "enum": ["submit", "cancel"]},
                 "inputs": {
                     "type": "object",
-                    "description": "submit: client_intent_id/stock_code/side/volume/price；cancel: client_intent_id/order_id",
+                    "description": (
+                        "submit: client_intent_id/stock_code/side/volume，加 price_cap（买入，追高上限）"
+                        "或 price（卖出，固定限价）；两者互斥。cancel: client_intent_id/order_id"
+                    ),
                     "additionalProperties": True,
                 },
             },
@@ -285,7 +340,16 @@ ACCOUNT_MONITOR_TOOL = {
     "type": "function",
     "function": {
         "name": "account_monitor",
-        "description": "读取或全量替换宿主持久化的股票行情监控计划。只保存显式触发条件，不会自行下单；清空必须显式提交空 plans 数组。",
+        "description": (
+            "读取或全量替换宿主持久化的股票行情监控计划。只保存显式触发条件，不会自行下单；清空必须显式提交空 plans 数组。"
+            "SELL 用 price_lte（破位止损）、price_gte（止盈）或 immediate（时间止损到期，无条件在第一次轮询触发，不接受 value）。"
+            "BUY 只能用 price_range：value 是区间下界，upper 是区间上界，只有价格落在 [value, upper] 内才触发，"
+            "order 只给 volume——限价由交易工具在提交那一刻按最新价推导，upper 就是追高上限，写 order.price 会被拒。"
+            "突破腿把区间挂在现价上方（下界取 pivot，上界取追高天花板，"
+            "可直接用 miniqmt_screen 的 breakout_entry），回踩腿把区间挂在现价下方（下界是不能破的结构位）。"
+            "单点买入触发已被禁止：它的真实语义是越跌越买，跳空砸穿也会成交。"
+            "换仓请在 BUY 计划里写 rotate_from=卖出股票代码，同批必须存在该股票的 SELL 计划，否则整批被拒。"
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -303,14 +367,19 @@ ACCOUNT_MONITOR_TOOL = {
                             "trigger": {
                                 "type": "object",
                                 "properties": {
-                                    "type": {"type": "string", "enum": ["price_lte", "price_gte", "change_pct_lte", "change_pct_gte"]},
+                                    "type": {
+                                        "type": "string",
+                                        "enum": ["price_lte", "price_gte", "immediate", "price_range"],
+                                    },
                                     "value": {"type": "number"},
+                                    "upper": {"type": "number"},
                                     "baseline": {"type": "number"},
                                 },
-                                "required": ["type", "value"],
+                                "required": ["type"],
                                 "additionalProperties": False,
                             },
                             "order": {"type": "object", "additionalProperties": True},
+                            "rotate_from": {"type": "string", "pattern": "^[036][0-9]{5}\\.(SH|SZ)$"},
                             "note": {"type": "string"},
                         },
                         "required": ["plan_id", "stock_code", "side", "trigger"],
@@ -357,6 +426,7 @@ TOOL_DEFINITIONS = [
     MINIQMT_QUOTES_TOOL,
     MINIQMT_SECTORS_TOOL,
     MINIQMT_SCREEN_TOOL,
+    MINIQMT_SECTOR_RANK_TOOL,
     MINIQMT_HISTORY_TOOL,
     MINIQMT_ACCOUNT_TOOL,
     MINIQMT_TRADE_TOOL,
@@ -458,9 +528,11 @@ def parse_toolcall_actions(
             elif tool_name == "miniqmt_quotes":
                 allowed = {"stock_codes"}
             elif tool_name == "miniqmt_sectors":
-                allowed = {"sector_name"}
+                allowed = {"sector_name", "name_filter", "limit"}
             elif tool_name == "miniqmt_screen":
-                allowed = {"sector_name", "stock_codes", "sort_by", "limit"}
+                allowed = {"sector_name", "stock_codes", "sort_by", "limit", "enrich_trend"}
+            elif tool_name == "miniqmt_sector_rank":
+                allowed = {"family", "limit", "min_buyable"}
             elif tool_name == "miniqmt_history":
                 allowed = {"stock_codes", "period", "start_time", "end_time"}
             elif tool_name == "miniqmt_account":
@@ -550,9 +622,21 @@ def parse_toolcall_actions(
             action["task"] = args["task"]
             actions.append(action)
             continue
-        if tool_name in {"miniqmt_sectors", "miniqmt_screen", "miniqmt_history"}:
-            # 这三个行情发现工具没有必填的 command，参数按 schema 原样透传给宿主。
-            for key in ("sector_name", "stock_codes", "sort_by", "limit", "period", "start_time", "end_time"):
+        if tool_name in {"miniqmt_sectors", "miniqmt_screen", "miniqmt_sector_rank", "miniqmt_history"}:
+            # 这几个行情发现工具没有必填的 command，参数按 schema 原样透传给宿主。
+            for key in (
+                "sector_name",
+                "name_filter",
+                "stock_codes",
+                "sort_by",
+                "limit",
+                "enrich_trend",
+                "family",
+                "min_buyable",
+                "period",
+                "start_time",
+                "end_time",
+            ):
                 if key in args:
                     action[key] = args[key]
             actions.append(action)
@@ -648,11 +732,18 @@ def _validate_miniqmt_screen_args(args: dict) -> str:
         return "miniqmt_screen 必须且只能提供 sector_name 或 stock_codes 之一。"
     if isinstance(stock_codes, list) and not 1 <= len(stock_codes) <= 300:
         return "miniqmt_screen 的 stock_codes 最多 300 项。"
-    if "sort_by" in args and args["sort_by"] not in {"change_pct_desc", "change_pct_asc", "amount_desc"}:
+    if "sort_by" in args and args["sort_by"] not in {
+        "change_pct_desc",
+        "change_pct_asc",
+        "amount_desc",
+        "close_position_desc",
+    }:
         return "miniqmt_screen 的 sort_by 不受支持。"
     limit = args.get("limit", 20)
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
         return "miniqmt_screen 的 limit 必须是 1 到 50 的整数。"
+    if args.get("enrich_trend") and limit > 20:
+        return "miniqmt_screen 带 enrich_trend 时 limit 最多 20（趋势字段需要逐只读日线）。"
     return ""
 
 

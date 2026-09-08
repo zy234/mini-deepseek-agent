@@ -151,6 +151,7 @@ def _account_cycle(
     close_review: bool = False,
     premarket: bool = False,
     midday_review: bool = False,
+    intraday_scan: bool = False,
 ) -> None:
     """每次创建全新 Agent；跨轮状态只从每日账本和状态库恢复。"""
     started = datetime.now(TRADING_TZ)
@@ -173,7 +174,10 @@ def _account_cycle(
     environment_settings = recursive_merge(
         settings.get("environment", {}),
         {
-            "miniqmt_mode": "observe" if close_review or premarket or midday_review else "auto_execute",
+            # 盘中扫描同样只读：下单权只留给监控触发那条路径，扫描轮只能改布防。
+            "miniqmt_mode": "observe"
+            if close_review or premarket or midday_review or intraday_scan
+            else "auto_execute",
             "account_journal_dir": str(journal_dir),
             "account_cycle_id": cycle_id,
             "account_review_mode": close_review,
@@ -205,6 +209,19 @@ def _account_cycle(
             f"12:50 午盘前计划复核模式（只读，不得下单），交易日 {started.date().isoformat()}；"
             "先读取 account_journal.today 和 account_monitor 当前计划，再结合上午收盘行情、上午新增新闻和最新账户状态，"
             f"重新调用研究与组合 Agent；保留、修改或撤销计划后，用 account_monitor replace 写入完整新计划：{task}"
+        )
+    elif intraday_scan:
+        task = (
+            f"盘中候选发现模式（只读，不得下单），交易日 {started.date().isoformat()}，实际启动 {started.isoformat()}；"
+            "先读取 account_journal.today 和 account_monitor 当前计划，再用 miniqmt_sector_rank 看当日板块热度定主线，"
+            "从主线板块内部用 miniqmt_screen 配 enrich_trend 找 buyable=true 且 trend_gate=breakout 的票；"
+            "不要从个股涨幅榜捡票，那张榜前排要么涨停封死要么一手成本超过单笔上限。"
+            "这一轮只找当日盘中新出现的突破机会，"
+            "不是重做盘前研究：没有 breakout 就直接结束，不要为了交差降格用 holding 或 extended 的票。"
+            "找到候选才调用 financial_research 和 portfolio_manager 做取舍，并且必须与现有最弱持仓对比，"
+            "只有结构质量压倒性更优才建仓，同时在 BUY 计划里用 rotate_from 声明资金来自哪只卖出。"
+            "重算监控表时只允许新增 BUY 或收紧 SELL，已有 SELL 计划一律不得放宽或删除；"
+            f"plan_id 沿用未触发计划的原值，避免已成交的计划被复活：{task}"
         )
     elif close_review:
         task = (
@@ -276,7 +293,8 @@ def _run_trade_trigger(settings: dict, event: dict[str, Any], journal_dir: Path)
         f"触发计划：{json.dumps(event['plan'], ensure_ascii=False, sort_keys=True)}；"
         f"当前行情：stock_code={event['stock_code']}，price={event['price']}，quote_at={event['quote_at']}。"
         f"本次交易使用稳定 client_intent_id=monitor-{event['plan']['plan_id']}。"
-        "请查询账户和当前行情，独立完成 risk_check；只有风险通过才提交原 order，"
+        "请查询账户和当前行情，独立完成 risk_check；只有风险通过才按计划的数量提交，"
+        "BUY 用 price_cap=trigger.upper 让宿主按最新价推导限价，SELL 用计划给的 order.price；"
         "提交后用 miniqmt_account 的 orders/trades 复核实际成交量并报告 filled_volume。监控计划由主 Agent 维护，你不要改。"
     )
     try:
@@ -369,6 +387,22 @@ def _premarket_catchup_day(now: datetime) -> str | None:
     return now.date().isoformat()
 
 
+# 盘中候选发现窗口。短线趋势跟随的买点出现在盘中放量突破那一刻，而盘前用的是昨收数据，
+# 只靠盘前布防等于永远在追昨天的赢家；这两个窗口给系统一次用当日实时量价重算候选的机会。
+# 窗口宽度 10 分钟：轮询间隔 10 秒，够宽到上一轮周期跑久了也不会整段错过。
+INTRADAY_SCAN_WINDOWS = (
+    (clock_time(10, 0), clock_time(10, 10)),
+    (clock_time(13, 30), clock_time(13, 40)),
+)
+
+
+def _intraday_scan_key(now: datetime) -> str | None:
+    for start, end in INTRADAY_SCAN_WINDOWS:
+        if start <= now.time() < end:
+            return f"{now.date().isoformat()}-{start.hour:02d}{start.minute:02d}"
+    return None
+
+
 def _acquire_account_loop_lock() -> Any:
     try:
         import fcntl
@@ -457,33 +491,51 @@ def main(
     account_day: bool = typer.Option(False, "--account-day", help="运行一个交易日并在收盘复盘后退出，供定时任务使用。"),
     install_account_schedule: bool = typer.Option(False, "--install-account-schedule", help="安装 macOS 工作日 09:20 自动运行的账户日定时任务。"),
     close_review: bool = typer.Option(False, "--close-review", help="运行一次只读收盘复盘。"),
+    premarket: bool = typer.Option(False, "--premarket", help="运行一次只读盘前分析，用于随时验证研究到组合的全流程。"),
+    intraday_scan: bool = typer.Option(False, "--intraday-scan", help="运行一次只读盘中候选发现，用突破结构找新候选。"),
     show_observation_todo: bool = typer.Option(False, "--show-observation-todo", help="查看给用户的待观测清单，不启动 Agent。"),
 ) -> Any:
     """Run DeepSeek V4 Flash with host-owned Bash, editor, and web search tools."""
     _load_dotenv()
     settings = get_config_from_spec(config)
     if show_observation_todo:
-        if account_loop or account_day or close_review or install_account_schedule:
+        if account_loop or account_day or close_review or premarket or intraday_scan or install_account_schedule:
             raise typer.BadParameter("--show-observation-todo 不能与账户运行或安装参数同时使用")
         _show_observation_todo()
         return None
     if install_account_schedule:
-        if account_loop or account_day or close_review:
+        if account_loop or account_day or close_review or premarket or intraday_scan:
             raise typer.BadParameter("--install-account-schedule 不能与账户运行参数同时使用")
         _install_account_schedule(config)
         return None
-    if account_loop or account_day or close_review:
-        if sum((account_loop, account_day, close_review)) > 1:
-            raise typer.BadParameter("--account-loop、--account-day 与 --close-review 不能同时使用")
+    if account_loop or account_day or close_review or premarket or intraday_scan:
+        if sum((account_loop, account_day, close_review, premarket, intraday_scan)) > 1:
+            raise typer.BadParameter(
+                "--account-loop、--account-day、--close-review、--premarket 与 --intraday-scan 不能同时使用"
+            )
         cycle_task = task or "观察账户、行情和未完成委托，判断是否需要交易并记录本轮完整决策。"
         if close_review:
             _account_cycle(settings, cycle_task, close_review=True)
             return None
+        if premarket:
+            _account_cycle(settings, cycle_task, premarket=True)
+            return None
+        if intraday_scan:
+            _account_cycle(
+                settings,
+                task or "用当日盘中实时量价寻找新的突破候选，并判断是否值得换掉最弱持仓。",
+                intraday_scan=True,
+            )
+            return None
         loop_lock = _acquire_account_loop_lock()
-        console.print("账户管理循环已启动：09:20 盘前分析，12:50 午盘前复核，盘中监控触发交易，15:10 收盘复盘。")
+        console.print(
+            "账户管理循环已启动：09:20 盘前分析，10:00 与 13:30 盘中候选发现，12:50 午盘前复核，"
+            "盘中监控触发交易，15:10 收盘复盘。"
+        )
         premarket_day = ""
         midday_day = ""
         review_day = ""
+        scan_slots: set[str] = set()
         journal_dir = Path(os.getenv("MINIQMT_AGENT_STATE_DIR", ".sessions/account-manager"))
         if not journal_dir.is_absolute():
             journal_dir = Path.cwd() / journal_dir
@@ -509,6 +561,12 @@ def main(
                     elif kind == "monitor":
                         for event in _poll_market_monitor(settings, journal_dir):
                             _run_trade_trigger(settings, event, journal_dir)
+                        # 先处理触发再扫描：已布防的止损和到期退出优先于寻找新机会。
+                        scan_key = _intraday_scan_key(now)
+                        if scan_key and scan_key not in scan_slots:
+                            scan_slots.add(scan_key)
+                            scan_task = "用当日盘中实时量价寻找新的突破候选，并判断是否值得换掉最弱持仓。"
+                            _account_cycle(settings, scan_task, intraday_scan=True)
                     elif kind == "review" and day_key != review_day:
                         review_day = day_key
                         review_task = "核对当日成交、收益、滑点、决策偏差、监控触发、监控更新和踩坑，并写出下一交易日观察计划。"

@@ -5,7 +5,11 @@ from __future__ import annotations
 import atexit
 import html
 import json
+import logging
+import os
 import re
+import signal
+import subprocess
 import threading
 import urllib.error
 import urllib.parse
@@ -14,6 +18,8 @@ from html.parser import HTMLParser
 from typing import Any
 
 from minisweagent.environments.web_time import cutoff_status, parse_web_time, require_cutoff
+
+logger = logging.getLogger("minisweagent.web_fetch")
 
 MAX_FETCH_BYTES = 1_000_000
 MAX_TEXT_CHARS = 12_000
@@ -254,13 +260,17 @@ def _browser_get(url: str, *, timeout: float) -> tuple[str, str]:
     with _BROWSER_LOCK:
         context = None
         try:
-            global _BROWSER_RUNTIME, _BROWSER
+            global _BROWSER_RUNTIME, _BROWSER, _DRIVER_PIDS
             if _BROWSER is None:
+                before = set(_child_pids(os.getpid()))
                 _BROWSER_RUNTIME = sync_playwright().start()
                 _BROWSER = _BROWSER_RUNTIME.chromium.launch(
                     headless=True,
                     args=["--disable-blink-features=AutomationControlled"],
                 )
+                # driver 是我们的直接子进程，chromium 挂在 driver 下面。记下 driver pid 只为
+                # SIGTERM 抢不到锁那条路径服务：那时没法再走 playwright 的正常清理。
+                _DRIVER_PIDS = tuple(set(_child_pids(os.getpid())) - before)
             context = _BROWSER.new_context(user_agent=USER_AGENT, locale="zh-CN")
             page = context.new_page()
             page.route(
@@ -284,7 +294,11 @@ def _browser_get(url: str, *, timeout: float) -> tuple[str, str]:
                 )
             return payload, final_url
         except (PlaywrightError, PlaywrightTimeoutError) as error:
-            _stop_browser_unlocked()
+            # 页面级失败（超时、拒连、证书错）是常态，不代表浏览器坏了。原来无条件销毁单例，
+            # 既让下一次抓取白付一到两秒冷启动，又在 close 失败时把 driver 和 chromium 漏成孤儿。
+            # 只有连接真的断了才重建。
+            if not _browser_alive():
+                _stop_browser_unlocked()
             raise WebFetchError(f"浏览器抓取失败：{error}", "WEB_FETCH_BROWSER_ERROR") from error
         finally:
             if context is not None:
@@ -294,25 +308,95 @@ def _browser_get(url: str, *, timeout: float) -> tuple[str, str]:
                     pass
 
 
+def _child_pids(pid: int) -> list[int]:
+    """列出 pid 的直接子进程。pgrep 在 macOS 和 Linux 上都有，只在浏览器启动和强杀时调用。"""
+    try:
+        done = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError) as error:
+        logger.error("枚举子进程失败，无法定位 driver：%s: %s", type(error).__name__, error)
+        return []
+    return [int(item) for item in done.stdout.split() if item.isdigit()]
+
+
+def _kill_tree(pid: int) -> None:
+    """自底向上 SIGKILL 整棵子树：先收 chromium 再收 driver，反过来会把 chromium 留成孤儿。"""
+    for child in _child_pids(pid):
+        _kill_tree(child)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass  # 已经自己退了，这是正常情况
+    except OSError as error:
+        logger.error("强杀 pid=%s 失败，进程可能残留：%s", pid, error)
+
+
+def _browser_alive() -> bool:
+    """浏览器连接是否还在。探测本身失败就按已断处理——driver 死掉时 is_connected 也会抛。"""
+    if _BROWSER is None:
+        return False
+    try:
+        return bool(_BROWSER.is_connected())
+    except Exception:
+        return False
+
+
 def _close_browser() -> None:
     with _BROWSER_LOCK:
         _stop_browser_unlocked()
 
 
 def _stop_browser_unlocked() -> None:
-    global _BROWSER_RUNTIME, _BROWSER
+    global _BROWSER_RUNTIME, _BROWSER, _DRIVER_PIDS
     if _BROWSER is not None:
         try:
             _BROWSER.close()
-        except Exception:
-            pass
+        except Exception as error:
+            # 关不掉就意味着 chromium 留在系统里。置空全局是为了让下次重建，但必须留下痕迹，
+            # 否则孤儿进程只能等人去 ps 里偶然发现。
+            logger.error("浏览器关闭失败，chromium 进程可能残留：%s: %s", type(error).__name__, error)
         _BROWSER = None
     if _BROWSER_RUNTIME is not None:
         try:
             _BROWSER_RUNTIME.stop()
-        except Exception:
-            pass
+        except Exception as error:
+            logger.error("Playwright driver 停止失败，node 进程可能残留：%s: %s", type(error).__name__, error)
         _BROWSER_RUNTIME = None
+    # 走完正常清理就必须忘掉这些 pid：系统会复用 pid，留着它们等于给下次强杀一份错名单。
+    _DRIVER_PIDS = ()
+
+
+def _on_sigterm(signum: int, _frame: Any) -> None:
+    # 信号处理跑在主线程上：抓取进行中直接 with _BROWSER_LOCK 会自锁，所以限时获取。
+    if _BROWSER_LOCK.acquire(timeout=5):
+        try:
+            _stop_browser_unlocked()
+        finally:
+            _BROWSER_LOCK.release()
+    elif _DRIVER_PIDS:
+        # 抓取正卡在半路，playwright 的正常清理走不通了。直接强杀 driver 子树：
+        # 停止信号必须有响应，chromium 也不能留成孤儿。
+        logger.error("SIGTERM 收尾拿不到浏览器锁，强杀 driver 子树 pids=%s", list(_DRIVER_PIDS))
+        for pid in _DRIVER_PIDS:
+            _kill_tree(pid)
+    else:
+        logger.error("SIGTERM 收尾拿不到浏览器锁，且没有记录到 driver pid，chromium 可能残留")
+    # 收完尾把信号还原并重新发给自己，保持 128+signum 的退出语义，不吞掉宿主的停止意图。
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+def _install_sigterm_hook() -> None:
+    """launchd 停止任务发的是 SIGTERM，而 Python 默认不为它执行 atexit：
+    不接这个信号，driver 和 chromium 会变成 PPID=1 的孤儿，占着内存活到机器重启。
+    已有 handler 时不抢，避免踩掉宿主自己的收尾逻辑。"""
+    try:
+        if signal.getsignal(signal.SIGTERM) is not signal.SIG_DFL:
+            return
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except ValueError as error:
+        # 非主线程导入时无法注册信号。不能静默放过：此时进程收尾只剩 atexit，
+        # 而 atexit 恰恰不为 SIGTERM 执行，等于回到漏进程的老状态，必须留下痕迹。
+        logger.warning("非主线程导入，SIGTERM 收尾未注册，停止任务时 chromium 可能残留：%s", error)
 
 
 class _PageParser(HTMLParser):
@@ -625,7 +709,11 @@ def _error_result(
     }
 
 
-_BROWSER_LOCK = threading.Lock()
+# RLock 而不是 Lock：SIGTERM 处理器跑在主线程，抓取进行中收到信号时需要重入同一把锁。
+_BROWSER_LOCK = threading.RLock()
 _BROWSER_RUNTIME: Any = None
 _BROWSER: Any = None
+# 启动浏览器时记下的 driver pid，只用于 SIGTERM 抢不到锁时的强杀路径。
+_DRIVER_PIDS: tuple[int, ...] = ()
 atexit.register(_close_browser)
+_install_sigterm_hook()

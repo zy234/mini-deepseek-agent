@@ -68,7 +68,8 @@ class LocalEnvironmentConfig(BaseModel):
     miniqmt_bridge_url: str = Field(
         default_factory=lambda: os.getenv("MINIQMT_BRIDGE_URL", "http://127.0.0.1:8023")
     )
-    miniqmt_mode: str = Field(default_factory=lambda: os.getenv("MINIQMT_AGENT_MODE", "observe"))
+    # 账户是自主运行的，默认就该能下单；测试时显式 MINIQMT_AGENT_MODE=observe 关掉执行。
+    miniqmt_mode: str = Field(default_factory=lambda: os.getenv("MINIQMT_AGENT_MODE", "auto_execute"))
     account_journal_dir: str = ".sessions/account-manager"
     account_cycle_id: str = Field(default_factory=lambda: f"manual-{time.time_ns()}")
     account_review_mode: bool = False
@@ -116,7 +117,14 @@ class LocalEnvironment:
         if action.get("tool") == "miniqmt_quotes":
             return _json_tool_output("miniqmt_quotes", self._get_miniqmt().quotes(action.get("stock_codes", [])))
         if action.get("tool") == "miniqmt_sectors":
-            return _json_tool_output("miniqmt_sectors", self._get_miniqmt().sectors(action.get("sector_name", "")))
+            return _json_tool_output(
+                "miniqmt_sectors",
+                self._get_miniqmt().sectors(
+                    action.get("sector_name", ""),
+                    name_filter=action.get("name_filter", ""),
+                    limit=action.get("limit", 60),
+                ),
+            )
         if action.get("tool") == "miniqmt_screen":
             return _json_tool_output(
                 "miniqmt_screen",
@@ -125,6 +133,16 @@ class LocalEnvironment:
                     stock_codes=action.get("stock_codes"),
                     sort_by=action.get("sort_by", "change_pct_desc"),
                     limit=action.get("limit", 20),
+                    enrich_trend=bool(action.get("enrich_trend", False)),
+                ),
+            )
+        if action.get("tool") == "miniqmt_sector_rank":
+            return _json_tool_output(
+                "miniqmt_sector_rank",
+                self._get_miniqmt().sector_rank(
+                    family=action.get("family", "TGN"),
+                    limit=action.get("limit", 15),
+                    min_buyable=action.get("min_buyable", 3),
                 ),
             )
         if action.get("tool") == "miniqmt_history":

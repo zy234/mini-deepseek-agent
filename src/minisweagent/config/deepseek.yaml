@@ -25,6 +25,7 @@ agents:
     tools:
       - miniqmt_quotes
       - miniqmt_sectors
+      - miniqmt_sector_rank
       - miniqmt_screen
       - miniqmt_history
       - financial_calc
