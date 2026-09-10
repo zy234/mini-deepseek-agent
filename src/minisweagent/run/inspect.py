@@ -170,6 +170,7 @@ def _summarize(path: Path, root: Path, parsed: tuple | None = None) -> dict:
         "session_id": session.get("id") or "",
         "parent": session.get("parent") or "",
         "kind": session.get("kind") or "",
+        "label": session.get("label") or "",
         "agent_name": agent.get("agent_name") or "",
         "flow": agent.get("flow") or "",
         "tools": agent.get("tools") or [],

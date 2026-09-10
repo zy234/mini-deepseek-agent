@@ -45,6 +45,9 @@ class AgentConfig(BaseModel):
     宿主知道自己为什么启动这一轮，不写下来的话观测端只能去 grep 任务文本猜。"""
     parent_session_id: str = ""
     """父会话 id；子 Agent 由宿主注入，用来还原调度树而不依赖文件名规则。"""
+    session_label: str = ""
+    """会话在调度树里的展示名。并行读图组用它区分板块，宿主装配时注入；
+    观测端只读这个结构化字段，不去解析任务文本猜名字。"""
     flow: Literal["iterative", "single_shot"] = "iterative"
     """角色使用的执行流程。"""
     tools: list[str] | None = None
@@ -283,6 +286,7 @@ class DefaultAgent:
                     "cwd": self.config.session_cwd,
                     "parent": self.config.parent_session_id,
                     "kind": self.config.cycle_kind,
+                    "label": self.config.session_label,
                 },
                 "mini_version": __version__,
                 "exit_status": last_extra.get("exit_status", ""),

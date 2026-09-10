@@ -82,7 +82,8 @@ button:disabled { color: var(--dim); cursor: not-allowed; }
 .card .name { color: var(--fg); }
 .card .dur { margin-left: auto; color: var(--dim); }
 .card .meta, .card .kid { color: var(--dim); font-size: 12px; }
-.card .kid { padding-left: 12px; color: var(--child); }
+.card .kid { padding-left: 12px; color: var(--child); cursor: pointer; }
+.card .kid:hover, .card .kid.on { color: var(--fg); }
 .tag {
   padding: 0 5px; border-radius: 3px; background: #2b3038; color: var(--dim); font-size: 11px;
 }
@@ -110,9 +111,8 @@ button:disabled { color: var(--dim); cursor: not-allowed; }
 .row .t { width: 66px; text-align: right; color: var(--dim); flex: none; }
 .row .what { width: 300px; overflow: hidden; text-overflow: ellipsis; flex: none; }
 .row .what .arg { color: var(--dim); }
-.row .what .fold { color: var(--child); cursor: pointer; }
 .kids { padding-left: 26px; border-left: 2px solid var(--child); margin-left: 12px; }
-.kids .hd { padding: 3px 12px; color: var(--child); }
+.kids .hd { padding: 3px 12px; color: var(--child); cursor: pointer; user-select: none; }
 .miss { color: var(--err); padding: 4px 12px; }
 #detail h3 { margin: 0; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
 #detail section { border-bottom: 1px solid var(--line); }
@@ -184,7 +184,7 @@ function brief(a) {
 function cardHTML(r) {
   const total = r.tokens.prompt + r.tokens.completion;
   const kids = (r.children || []).map((c) =>
-    `<div class="kid">└ ${esc(c.agent_name)} ${dur(c.duration)} ${c.n_errors ? `<span class="tag bad">${c.n_errors} 错</span>` : "✓"}</div>`).join("");
+    `<div class="kid ${S.id === c.id ? "on" : ""}" data-id="${esc(c.id)}">└ ${esc(c.label || c.agent_name)} ${dur(c.duration)} ${c.n_errors ? `<span class="tag bad">${c.n_errors} 错</span>` : "✓"}</div>`).join("");
   return `<div class="card ${S.id === r.id ? "on" : ""}" data-id="${esc(r.id)}">
     <div class="top">
       <span class="name">${r.running ? '<span class="live">●</span> ' : ""}${clock(r.started_at)} ${esc(r.agent_name || "?")}</span>
@@ -204,6 +204,8 @@ function renderList() {
   }
   $("#list").innerHTML = html || '<div class="hint">没有匹配的会话。</div>';
   $("#list").querySelectorAll(".card").forEach((el) => el.onclick = () => openSession(el.dataset.id));
+  // 子会话行点进去就是它自己的轨迹；不拦住冒泡的话点它会开成父会话。
+  $("#list").querySelectorAll(".kid").forEach((el) => el.onclick = (ev) => { ev.stopPropagation(); openSession(el.dataset.id); });
 }
 
 function fillFilters() {
@@ -224,30 +226,34 @@ function rowHTML(s, span, key) {
     : s.role === "assistant"
       ? (s.tools || []).length ? esc(s.tools.join(" + ")) : '<span class="arg">无工具调用 → 提交</span>'
       : `<span class="arg">${esc((s.content || "").split("\n")[0].slice(0, 90))}</span>`;
-  const mark = s.child_trace ? `<span class="fold" data-fold="${esc(key)}">${S.kids.has(key) ? "▾" : "▸"}</span> ` : "";
   return `<div class="row ${S.sel === key ? "on" : ""}" data-key="${esc(key)}">
     <span class="idx">#${s.index}</span>
     <span class="who ${s.status ? "tool" : s.role}">${s.status ? "tool" : s.role}</span>
     <span class="bar"><i class="${fill}" style="left:${l}%;width:${w}%"></i></span>
     <span class="t">${dur(s.duration)}</span>
-    <span class="what">${mark}${what}${s.error_code ? ` <span class="tag bad">${esc(s.error_code)}</span>` : ""}</span></div>`;
+    <span class="what">${what}${s.images && s.images.length ? ` <span class="tag">📷 ${s.images.length} 图</span>` : ""}${s.error_code ? ` <span class="tag bad">${esc(s.error_code)}</span>` : ""}</span></div>`;
+}
+
+function childBlock(sid, child) {
+  const c = child.session;
+  const name = c.label || c.agent_name || c.id;
+  if (child.error) {
+    return `<div class="kids"><div class="hd">${esc(name)}</div><div class="miss">子轨迹缺失：${esc(child.error)}</div></div>`;
+  }
+  const key = `${sid}@${c.id}`;
+  const open = S.kids.has(key);
+  return `<div class="kids"><div class="hd" data-fold="${esc(key)}">${open ? "▾" : "▸"} ${esc(name)} · ${c.api_calls} calls · ${dur(c.duration)} · ${esc(c.exit_status || "运行中")}${c.n_errors ? ` · ${c.n_errors} 工具错` : ""}</div>`
+    + (open ? waterfall(c.id, child.steps, child.children) : "") + "</div>";
 }
 
 function waterfall(sid, steps, children) {
+  // 宿主并行起的子会话不挂在任何步骤上，整块排在时间轴前面：读图先于汇总执行，顺序即时间。
+  let html = (children || []).map((child) => childBlock(sid, child)).join("");
   const span = Math.max(...steps.map((s) => (s.offset || 0) + (s.duration || 0)), 0.001);
-  let html = "", kid = 0;
   for (const s of steps) {
     const key = `${sid}#${s.index}`;
     S.rows[key] = s;
     html += rowHTML(s, span, key);
-    if (!s.child_trace) continue;
-    const child = (children || [])[kid++];
-    if (!S.kids.has(key)) continue;
-    if (!child) { html += '<div class="miss">子轨迹未随本次请求返回。</div>'; continue; }
-    if (child.error) { html += `<div class="miss">子轨迹缺失：${esc(child.error)}</div>`; continue; }
-    const c = child.session;
-    html += `<div class="kids"><div class="hd">${esc(c.agent_name)} · ${c.api_calls} calls · ${dur(c.duration)} · ${esc(c.exit_status)}${c.n_errors ? ` · ${c.n_errors} 工具错` : ""}</div>
-      ${waterfall(c.id, child.steps, child.children)}</div>`;
   }
   return html;
 }
@@ -259,7 +265,7 @@ function renderPath() {
   $("#path").innerHTML = `<div class="day">${esc(r.id)} · ${esc(r.agent_name)} · ${esc(r.kind || "来源未记录")} · ${esc(r.miniqmt_mode || "-")} · ${dur(r.duration)} · ${esc(r.exit_status || "运行中")}</div>`
     + waterfall(r.id, S.data.steps, S.data.children);
   $("#path").querySelectorAll(".row").forEach((el) => el.onclick = () => { S.sel = el.dataset.key; renderPath(); renderDetail(); });
-  $("#path").querySelectorAll(".fold").forEach((el) => el.onclick = (ev) => {
+  $("#path").querySelectorAll("[data-fold]").forEach((el) => el.onclick = (ev) => {
     ev.stopPropagation();
     const key = el.dataset.fold;
     S.kids.has(key) ? S.kids.delete(key) : S.kids.add(key);
@@ -295,9 +301,9 @@ function renderDetail() {
   add("stdout", pretty(s.stdout));
   add("stderr", s.stderr, "err");
   add("退出状态", s.exit_status);
-  // 读图这一步模型看到的就是这些图；不把它们摊开，就只能凭结论猜它看到了什么。
+  // 读图这一步模型看到的就是这些图，渲染顺序即轨迹里记录的顺序，也就是模型实际收到图的顺序。
   if (s.images && s.images.length) {
-    parts.push(`<section><div class="k">模型看到的图（${s.images.length} 张）</div>`
+    parts.push(`<section><div class="k">模型看到的图（${s.images.length} 张，按模型实际收到的顺序）</div>`
       + s.images.map((path) => `<div class="shot"><div class="note">${esc(path)}</div>`
         + `<img loading="lazy" src="/api/image?path=${encodeURIComponent(path)}" alt="${esc(path)}"></div>`).join("")
       + "</section>");

@@ -209,7 +209,12 @@ class TradingPipeline:
             path for stock in group["stocks"] for path in (stock.get("charts") or {}).values()
         ]
         agent = self._build_agent(
-            "chart_reader", trace=child, session_id=f"{session_id}-{position:02d}", cycle_kind="intraday", parent=session_id
+            "chart_reader",
+            trace=child,
+            session_id=f"{session_id}-{position:02d}",
+            cycle_kind="intraday",
+            parent=session_id,
+            label=group["name"],
         )
         try:
             payload = self._ask_json(
@@ -358,6 +363,7 @@ class TradingPipeline:
         session_id: str,
         cycle_kind: str,
         parent: str = "",
+        label: str = "",
         environment_settings: dict[str, Any] | None = None,
     ) -> Any:
         profile = dict((self.settings.get("agents") or {}).get(role) or {})
@@ -375,6 +381,7 @@ class TradingPipeline:
                 "session_cwd": str(Path.cwd()),
                 "cycle_kind": cycle_kind,
                 "parent_session_id": parent,
+                "session_label": label,
             },
         )
         model_settings = dict(self.settings.get("model", {}))
