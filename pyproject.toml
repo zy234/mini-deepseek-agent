@@ -23,6 +23,7 @@ classifiers = [
 dependencies = [
     "bashlex>=0.18",
     "jinja2",
+    "matplotlib>=3.8",
     "openai",
     "prompt-toolkit>=3.0,<4",
     "pydantic>=2.0",

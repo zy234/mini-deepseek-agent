@@ -1,9 +1,11 @@
-"""OpenAI-compatible DeepSeek V4 Flash adapter."""
+"""OpenAI-compatible DeepSeek Flash adapter."""
 
+import base64
 import logging
 import os
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
@@ -77,8 +79,7 @@ class DeepSeekModel:
 
     def query(self, messages: list[dict[str, Any]], **kwargs) -> dict:
         tool_names = kwargs.get("tools")
-        delegate_roles = kwargs.get("delegate_roles")
-        tools = get_tool_definitions(tool_names, delegate_roles)
+        tools = get_tool_definitions(tool_names)
         request = {
             "model": self.config.model_name,
             "messages": self._api_messages(messages),
@@ -88,6 +89,10 @@ class DeepSeekModel:
         if tools:
             request["tools"] = tools
             request["tool_choice"] = "auto"
+        if kwargs.get("json_output"):
+            # 结构化输出的角色由宿主解析它的答复，所以在 API 层就要求 JSON，
+            # 而不是靠 prompt 求模型别加解释文字。
+            request["response_format"] = {"type": "json_object"}
         request["extra_body"] = {
             "thinking": {"type": "enabled" if self.config.thinking else "disabled"}
         }
@@ -107,7 +112,6 @@ class DeepSeekModel:
                 format_error_template=self.config.format_error_template,
                 template_kwargs={"finish_reason": finish_reason},
                 allowed_tools=set(tool_names) if tool_names is not None else None,
-                delegate_roles=delegate_roles,
             )
             if self.config.stream_output:
                 render_tool_actions(actions)
@@ -245,6 +249,15 @@ class DeepSeekModel:
             }
             if role == "assistant" and not api_message.get("tool_calls"):
                 api_message.pop("tool_calls", None)
+            images = (message.get("extra") or {}).get("images") or []
+            if images:
+                if role != "user":
+                    # 平台只接受 user 消息里的图片，system 和 assistant 带图直接 400。
+                    raise ValueError(f"{role} 消息不能携带图片")
+                api_message["content"] = [
+                    {"type": "text", "text": api_message.get("content") or ""},
+                    *(_image_part(path) for path in images),
+                ]
             result.append(api_message)
         return result
 
@@ -281,11 +294,27 @@ class DeepSeekModel:
         }
 
 
+IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp", ".gif": "image/gif"}
+
+
+def _image_part(path: str) -> dict[str, Any]:
+    """图片按路径存在轨迹里，只在发请求这一刻读成 base64。
+
+    轨迹要能反复读、被观测端加载，塞进几 MB 的 base64 会把它变成不可读的文件；
+    存路径则观测端还能直接打开那张图。图读不到必须抛：读图 Agent 没有图只会瞎猜。
+    """
+    file = Path(path)
+    mime = IMAGE_MIME.get(file.suffix.lower())
+    if mime is None:
+        raise ValueError(f"不支持的图片格式：{path}")
+    payload = base64.b64encode(file.read_bytes()).decode("ascii")
+    return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{payload}"}}
+
+
 @dataclass
 class _FunctionCall:
     name: str = "bash"
     arguments: str = ""
-
 
 @dataclass
 class _ToolCall:

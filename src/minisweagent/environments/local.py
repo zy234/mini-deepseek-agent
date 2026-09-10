@@ -7,10 +7,7 @@ import signal
 import subprocess
 import tempfile
 import time
-import traceback
 from collections.abc import Callable
-from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -21,15 +18,13 @@ from minisweagent.environments.account_journal import (
 )
 from minisweagent.environments.bash_policy import analyze_bash_command
 from minisweagent.environments.editor import execute_editor
-from minisweagent.environments.financial_calc import execute_financial_calc
-from minisweagent.environments.market_monitor import MarketMonitor
 from minisweagent.environments.miniqmt import MiniQMTClient
 from minisweagent.environments.web_fetch import execute_web_fetch
 from minisweagent.environments.web_search import (
     DEFAULT_SEARCH_ENGINES,
     execute_web_search,
 )
-from minisweagent.exceptions import CommandNotApproved, InterruptAgentFlow, Submitted
+from minisweagent.exceptions import CommandNotApproved, Submitted
 from minisweagent.utils.serialize import recursive_merge
 
 SENSITIVE_ENV_NAMES = frozenset(
@@ -73,16 +68,6 @@ class LocalEnvironmentConfig(BaseModel):
     miniqmt_mode: str = Field(default_factory=lambda: os.getenv("MINIQMT_AGENT_MODE", "auto_execute"))
     account_journal_dir: str = ".sessions/account-manager"
     account_cycle_id: str = Field(default_factory=lambda: f"manual-{time.time_ns()}")
-    account_review_mode: bool = False
-    agent_profiles: dict[str, dict[str, Any]] = Field(default_factory=dict)
-    agent_common_config: dict[str, Any] = Field(default_factory=dict)
-    agent_model_config: dict[str, Any] = Field(default_factory=dict)
-    agent_call_limit: int = Field(default=4, ge=1, le=20)
-    # 子 Agent 轨迹前缀：宿主传入当次会话轨迹的去后缀路径，子 Agent 轨迹与父会话同目录同前缀。
-    agent_trace_prefix: str = ""
-    # 父会话身份：子 Agent 轨迹里显式写下父 id 和调度来源，观测端才不用靠文件名规则倒推调度树。
-    agent_session_id: str = ""
-    agent_cycle_kind: str = ""
 
 
 class LocalEnvironment:
@@ -97,10 +82,6 @@ class LocalEnvironment:
         self.config = config_class(**kwargs)
         self.approval_callback = approval_callback or _prompt_for_approval
         self._miniqmt: MiniQMTClient | None = None
-        self._market_monitor: MarketMonitor | None = None
-        self._agent_call_count = 0
-        # 主 Agent 的交接阶段由宿主记录，避免模型跳过研究或组合风控直接交易。
-        self._agent_call_roles: list[str] = []
 
     def execute(self, action: dict, cwd: str = "", *, timeout: float | None = None) -> dict[str, Any]:
         """Execute a command in the local environment and return the result as a dict."""
@@ -115,60 +96,12 @@ class LocalEnvironment:
                 as_of=self.config.web_as_of,
                 browser_enabled=self.config.web_fetch_browser_enabled,
             )
-        if action.get("tool") == "financial_calc":
-            result = execute_financial_calc(action.get("operation", ""), action.get("inputs", {}))
-            return _json_tool_output("financial_calc", result)
-        if action.get("tool") == "miniqmt_quotes":
-            return _json_tool_output("miniqmt_quotes", self._get_miniqmt().quotes(action.get("stock_codes", [])))
-        if action.get("tool") == "miniqmt_sectors":
-            return _json_tool_output(
-                "miniqmt_sectors",
-                self._get_miniqmt().sectors(
-                    action.get("sector_name", ""),
-                    name_filter=action.get("name_filter", ""),
-                    limit=action.get("limit", 60),
-                ),
-            )
-        if action.get("tool") == "miniqmt_screen":
-            return _json_tool_output(
-                "miniqmt_screen",
-                self._get_miniqmt().screen(
-                    sector_name=action.get("sector_name", ""),
-                    stock_codes=action.get("stock_codes"),
-                    sort_by=action.get("sort_by", "change_pct_desc"),
-                    limit=action.get("limit", 20),
-                    enrich_trend=bool(action.get("enrich_trend", False)),
-                ),
-            )
-        if action.get("tool") == "miniqmt_sector_rank":
-            return _json_tool_output(
-                "miniqmt_sector_rank",
-                self._get_miniqmt().sector_rank(
-                    family=action.get("family", "TGN"),
-                    limit=action.get("limit", 15),
-                    min_buyable=action.get("min_buyable", 3),
-                ),
-            )
-        if action.get("tool") == "miniqmt_history":
-            return _json_tool_output(
-                "miniqmt_history",
-                self._get_miniqmt().history(
-                    action.get("stock_codes", []),
-                    period=action.get("period", "1d"),
-                    start_time=action.get("start_time", ""),
-                    end_time=action.get("end_time", ""),
-                ),
-            )
         if action.get("tool") == "miniqmt_account":
             return _json_tool_output("miniqmt_account", self._get_miniqmt().account(action.get("view", "")))
         if action.get("tool") == "miniqmt_trade":
             return self._execute_miniqmt_trade(action)
         if action.get("tool") == "account_journal":
             return self._execute_account_journal(action)
-        if action.get("tool") == "account_monitor":
-            return self._execute_account_monitor(action)
-        if action.get("tool") == "agent_call":
-            return self._execute_agent_call(action)
         command = action.get("command", "")
         cwd = action.get("workdir") or cwd or self.config.cwd or os.getcwd()
         global_timeout = timeout if timeout is not None else self.config.timeout
@@ -282,9 +215,6 @@ class LocalEnvironment:
         operation = action.get("operation", "")
         if operation == "read":
             result = read_account_journal(self.config.account_journal_dir)
-            # 待观测清单是用户的提醒，不是模型上下文或可执行指令。
-            if result.get("ok") and isinstance(result.get("data"), dict):
-                result = {**result, "data": {key: value for key, value in result["data"].items() if key != "observation_todo"}}
         elif operation == "append":
             result = append_account_cycle(
                 self.config.account_journal_dir,
@@ -300,207 +230,6 @@ class LocalEnvironment:
                 "error": {"code": "invalid_argument", "detail": "account_journal 只支持 read 或 append"},
             }
         return _json_tool_output("account_journal", result)
-
-    def _execute_account_monitor(self, action: dict) -> dict[str, Any]:
-        monitor = self._market_monitor or MarketMonitor(self.config.account_journal_dir)
-        self._market_monitor = monitor
-        operation = action.get("operation", "")
-        if operation == "read":
-            result = monitor.read()
-        elif operation == "replace":
-            # 只保留全量覆盖一个写入口：清空必须显式写成 plans=[]，避免误删其他持仓的风控计划。
-            result = monitor.replace(action.get("plans"))
-        else:
-            result = {
-                "ok": False,
-                "status": "error",
-                "operation": None,
-                "data": None,
-                "error": {"code": "invalid_argument", "detail": "account_monitor 只支持 read 或 replace"},
-            }
-        return _json_tool_output("account_monitor", result)
-
-    def _execute_agent_call(self, action: dict) -> dict[str, Any]:
-        """在宿主侧运行配置声明的子 Agent，避免模型自行获得账户工具或递归编排能力。"""
-        role = action.get("role", "")
-        task = action.get("task", "")
-        # 能不能委派只看宿主注入了哪些 profile：一个真相来源，不再另存一份角色枚举。
-        profile = self.config.agent_profiles.get(role)
-        if not isinstance(profile, dict):
-            allowed = ", ".join(sorted(self.config.agent_profiles)) or "无"
-            return _json_tool_output(
-                "agent_call",
-                {"ok": False, "status": "invalid_argument", "error": {"code": "unknown_role", "detail": f"不可委派的子 Agent：{role or '(空)'}；本角色可委派：{allowed}"}},
-            )
-        if profile.get("delegates_to"):
-            return _json_tool_output(
-                "agent_call",
-                {"ok": False, "status": "configuration_error", "error": {"code": "nested_delegation", "detail": f"子 Agent {role} 声明了 delegates_to，但宿主只支持一层委派"}},
-            )
-        if not isinstance(task, str) or not task.strip() or len(task) > 12000:
-            return _json_tool_output(
-                "agent_call",
-                {"ok": False, "status": "invalid_argument", "error": {"code": "invalid_task", "detail": "子 Agent 任务必须是 1 到 12000 个字符"}},
-            )
-        if self._agent_call_count >= self.config.agent_call_limit:
-            return _json_tool_output(
-                "agent_call",
-                {"ok": False, "status": "blocked", "error": {"code": "agent_call_limit", "detail": "已达到本次主 Agent 的子 Agent 调用上限"}},
-            )
-        phase_error = self._validate_agent_call_phase(role)
-        if phase_error is not None:
-            return _json_tool_output("agent_call", phase_error)
-        self._agent_call_count += 1
-        attempt = self._agent_call_count
-        trace_path = self._child_trace_path(attempt, role)
-        started = time.monotonic()
-        child_agent: Any = None
-        try:
-            # 延迟导入避免 agents -> environments 的循环依赖。
-            from minisweagent.agents import get_agent
-            from minisweagent.models import get_model
-
-            child_model_config = dict(self.config.agent_model_config)
-            child_model_config["stream_output"] = False
-            child_model = get_model(child_model_config)
-            child_settings = recursive_merge(self.config.agent_common_config, dict(profile))
-            child_settings.pop("description", None)
-            child_settings["agent_name"] = role
-            # 子 Agent 轨迹独立落盘：失败时这是唯一能还原死亡位置和已获材料的证据。
-            child_settings["output_path"] = trace_path
-            child_settings["session_id"] = f"{self.config.agent_session_id}-{attempt:02d}-{role}"
-            child_settings["session_started_at"] = datetime.now().astimezone().isoformat()
-            child_settings["session_cwd"] = self.config.cwd or os.getcwd()
-            child_settings["parent_session_id"] = self.config.agent_session_id
-            child_settings["cycle_kind"] = self.config.agent_cycle_kind
-            child_environment = LocalEnvironment(
-                cwd=self.config.cwd,
-                env=dict(self.config.env),
-                timeout=self.config.timeout,
-                web_search_engines=list(self.config.web_search_engines),
-                web_search_max_results=self.config.web_search_max_results,
-                web_as_of=self.config.web_as_of,
-                web_fetch_browser_enabled=self.config.web_fetch_browser_enabled,
-                miniqmt_bridge_url=self.config.miniqmt_bridge_url,
-                miniqmt_mode="observe" if self.config.account_review_mode else self.config.miniqmt_mode,
-                account_journal_dir=self.config.account_journal_dir,
-                account_cycle_id=self.config.account_cycle_id,
-                account_review_mode=self.config.account_review_mode,
-                approval_callback=self.approval_callback,
-            )
-            child_agent = get_agent(child_model, child_environment, child_settings)
-            result = child_agent.run(task)
-            if result.get("exit_status") != "Submitted":
-                return _json_tool_output(
-                    "agent_call",
-                    {
-                        "ok": False,
-                        "status": "error",
-                        "error": {
-                            "code": result.get("exit_status", "child_agent_incomplete"),
-                            "detail": "子 Agent 未提交完整结果，不能把该阶段视为完成",
-                            **self._child_failure_context(role, started, child_agent, trace_path),
-                        },
-                    },
-                )
-            self._agent_call_roles.append(role)
-            return _json_tool_output(
-                "agent_call",
-                {
-                    "ok": True,
-                    "status": "success",
-                    "data": {
-                        "role": role,
-                        "exit_status": result.get("exit_status", "unknown"),
-                        "submission": result.get("submission", ""),
-                        "api_calls": child_agent.n_calls,
-                        "elapsed_seconds": round(time.monotonic() - started, 1),
-                        "trace_path": str(trace_path) if trace_path else "",
-                    },
-                },
-            )
-        except InterruptAgentFlow as error:
-            message = error.messages[-1] if error.messages else {}
-            extra = message.get("extra", {})
-            status = extra.get("exit_status", type(error).__name__)
-            detail = message.get("content", str(error))
-            return _json_tool_output(
-                "agent_call",
-                {
-                    "ok": False,
-                    "status": "blocked" if isinstance(error, CommandNotApproved) else "error",
-                    "error": {
-                        "code": status,
-                        "detail": detail,
-                        **self._child_failure_context(role, started, child_agent, trace_path),
-                    },
-                },
-            )
-        except Exception as error:
-            return _json_tool_output(
-                "agent_call",
-                {
-                    "ok": False,
-                    "status": "error",
-                    "error": {
-                        "code": type(error).__name__,
-                        "detail": f"子 Agent 执行失败：{error}",
-                        **self._child_failure_context(role, started, child_agent, trace_path, error=error),
-                    },
-                },
-            )
-
-    def _child_trace_path(self, attempt: int, role: str) -> Path | None:
-        """子 Agent 轨迹独立成文件，与父会话轨迹同目录同前缀，按调用序号和角色区分。"""
-        if not self.config.agent_trace_prefix:
-            return None
-        return Path(f"{self.config.agent_trace_prefix}-{attempt:02d}-{role}.json")
-
-    def _child_failure_context(
-        self,
-        role: str,
-        started: float,
-        child_agent: Any,
-        trace_path: Path | None,
-        *,
-        error: BaseException | None = None,
-    ) -> dict[str, Any]:
-        """子 Agent 失败必须留下现场：完整 traceback 进 stderr，定位信息回报主 Agent。"""
-        elapsed = round(time.monotonic() - started, 1)
-        api_calls = getattr(child_agent, "n_calls", 0)
-        trace = str(trace_path) if trace_path else ""
-        stack = "".join(traceback.format_exception(error)).strip() if error is not None else ""
-        logger.error(
-            "%s agent_call 失败 role=%s elapsed=%ss api_calls=%s trace=%s%s",
-            time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            role,
-            elapsed,
-            api_calls,
-            trace or "<未配置轨迹前缀，未落盘>",
-            f"\n{stack}" if stack else "",
-        )
-        return {
-            "role": role,
-            "elapsed_seconds": elapsed,
-            "api_calls": api_calls,
-            "trace_path": trace,
-            "traceback_tail": stack.splitlines()[-1] if stack else "",
-        }
-
-    def _validate_agent_call_phase(self, role: str) -> dict[str, Any] | None:
-        """交接顺序由子角色配置的 requires 声明；交易权限仍由交易工具再次校验。"""
-        required = (self.config.agent_profiles.get(role) or {}).get("requires") or []
-        missing = [name for name in required if name not in self._agent_call_roles]
-        if not missing:
-            return None
-        return {
-            "ok": False,
-            "status": "blocked",
-            "error": {
-                "code": "workflow_order",
-                "detail": f"必须先完成 {'、'.join(missing)}，再调用 {role}",
-            },
-        }
 
     def _get_miniqmt(self) -> MiniQMTClient:
         if self._miniqmt is None:

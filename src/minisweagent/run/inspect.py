@@ -43,6 +43,8 @@ PROMPT_DIR = "prompts"
 # 子轨迹文件名规则由宿主的 agent_trace_prefix 固定：<父轨迹名>-<序号>-<角色>.json。
 CHILD_NAME = re.compile(r"^(?P<parent>.+)-(?P<seq>\d{2})-(?P<role>.+)$")
 UI_PATH = Path(__file__).resolve().parent / "inspect_ui.html"
+# 观测页要能显示读图 Agent 当时看到的图；这是唯一允许被读出来的非 JSON 文件类型。
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
 # 没有 exit 消息且近期还在写盘的轨迹当作正在运行；轨迹每步覆盖写，mtime 就是心跳。
 RUNNING_GRACE_SECONDS = 180
 
@@ -65,22 +67,6 @@ def _first_timestamp(messages: list[dict]) -> float | None:
     return None
 
 
-def _child_trace(extra: dict) -> str:
-    """agent_call 的结果里宿主写下了子轨迹路径，这是调度树唯一可靠的边。"""
-    stdout = extra.get("stdout") or ""
-    if '"trace_path"' not in stdout:
-        return ""
-    try:
-        payload = json.loads(stdout)
-    except ValueError:
-        return ""
-    for section in ("data", "error"):
-        path = (payload.get(section) or {}).get("trace_path")
-        if path:
-            return str(path)
-    return ""
-
-
 def _step(index: int, message: dict, start: float | None, end: float | None, t0: float | None) -> dict:
     """一条消息换算成一行时间轴步骤；角色决定携带哪些字段，不做统一的空壳。"""
     extra = message.get("extra") or {}
@@ -93,6 +79,8 @@ def _step(index: int, message: dict, start: float | None, end: float | None, t0:
         "offset": round(start - t0, 3) if start and t0 else None,
         "duration": round(end - start, 3) if start and end else None,
     }
+    if extra.get("images"):
+        step["images"] = list(extra["images"])
     if role == "assistant":
         actions = extra.get("actions") or []
         step["actions"] = actions
@@ -111,7 +99,6 @@ def _step(index: int, message: dict, start: float | None, end: float | None, t0:
         step["stdout"] = extra.get("stdout") or ""
         step["stderr"] = extra.get("stderr") or ""
         step["truncated"] = bool(extra.get("stdout_truncated") or extra.get("stderr_truncated"))
-        step["child_trace"] = _child_trace(extra)
     elif role == "exit":
         step["exit_status"] = extra.get("exit_status") or ""
     return step
@@ -202,7 +189,8 @@ def _summarize(path: Path, root: Path, parsed: tuple | None = None) -> dict:
         "running": not exited and time.time() - stat.st_mtime < RUNNING_GRACE_SECONDS,
         "stale": False,
         "parse_error": "",
-        "child_traces": [step["child_trace"] for step in tool_steps if step.get("child_trace")],
+        # 一轮里模型看到的图；轨迹只存路径，前端要能顺着它翻出当时那张图。
+        "images": sorted({image for step in steps for image in step.get("images") or []}),
     }
 
 
@@ -256,7 +244,7 @@ class TraceIndex:
         return sibling if sibling in summaries else ""
 
     def sessions(self) -> list[dict]:
-        """返回调度树：根是宿主启动的会话，children 是它 agent_call 出去的子会话。"""
+        """返回调度树：根是宿主启动的会话，children 是同一轮里并行跑的读图子会话。"""
         summaries = {summary["id"]: dict(summary, children=[]) for summary in self._scan()}
         by_session_id = {s["session_id"]: s["id"] for s in summaries.values() if s["session_id"]}
         roots = []
@@ -277,23 +265,41 @@ class TraceIndex:
             raise FileNotFoundError(f"轨迹不存在或不在观测目录内：{session_id}")
         return path
 
-    def _child(self, trace_path: str) -> dict:
+    def image(self, raw_path: str) -> tuple[bytes, str]:
+        """按轨迹里记录的路径读一张图。只允许观测目录内的图片文件，其他一律拒绝。
+
+        轨迹里存的是绝对路径（宿主渲染时的位置），所以这里既接受绝对路径也接受相对路径，
+        但两者都必须落在观测目录内——观测服务不是通用文件服务器。
+        """
+        candidate = Path(raw_path)
+        path = (candidate if candidate.is_absolute() else self.root / candidate).resolve()
+        suffix = path.suffix.lower()
+        if suffix not in IMAGE_TYPES:
+            raise ValueError(f"只允许读取图片：{raw_path}")
+        if self.root not in path.parents or not path.is_file():
+            raise FileNotFoundError(f"图片不存在或不在观测目录内：{raw_path}")
+        return path.read_bytes(), IMAGE_TYPES[suffix]
+
+    def _child(self, child_id: str) -> dict:
         """子轨迹缺失必须显式报出来：那正是子 Agent 在落盘前就死掉的现场。"""
         try:
-            relative = Path(trace_path).resolve().relative_to(self.root).as_posix()
-            path = self._resolve(relative)
+            path = self._resolve(child_id)
             parsed = _read(path)
         except (NotATrace, ValueError, OSError) as error:
-            return {"session": {"id": trace_path}, "steps": [], "error": str(error)}
+            return {"session": {"id": child_id}, "steps": [], "error": str(error)}
         return {"session": _summarize(path, self.root, parsed), "steps": parsed[1], "error": ""}
 
     def load(self, session_id: str) -> dict:
-        """单条轨迹全文 + 它直接调度出去的子轨迹全文，一次给全，本地传输不值得再切接口。"""
+        """单条轨迹全文 + 它下面并行跑的子轨迹全文，一次给全，本地传输不值得再切接口。"""
         path = self._resolve(session_id)
         parsed = _read(path)
-        steps = parsed[1]
-        children = [self._child(step["child_trace"]) for step in steps if step.get("child_trace")]
-        return {"session": _summarize(path, self.root, parsed), "steps": steps, "children": children}
+        summary = _summarize(path, self.root, parsed)
+        children = [
+            self._child(child["id"])
+            for child in self._scan()
+            if child["parent"] and child["parent"] == summary["session_id"]
+        ]
+        return {"session": summary, "steps": parsed[1], "children": children}
 
 
 class ConfigStore:
@@ -369,15 +375,17 @@ class Conflict(Exception):
     """已有运行占用，返回 409 而不是 400。"""
 
 
-AGENT_MODES = ("auto_execute", "execute", "observe")
+AGENT_MODES = ("observe", "execute", "auto_execute")
+# 试跑只有这两种：单个角色已经跑不起来了，盘前和盘中轮次的输入都由宿主注入。
+RUN_KINDS = {"premarket": "--premarket", "round": "--round"}
 
 
 class Runner:
-    """前端触发的单次运行。
+    """前端触发的单次试跑。
 
-    用子进程跑 `mini --agent ...`，而不是在服务里直接构造 Agent：装配逻辑一份都不重复，
-    Agent 崩溃打不到观测服务，停止运行就是终止进程。
-    同一时刻只允许一个，否则两轮 Agent 会抢 MiniQMT 连接和当日账本。
+    用子进程跑 `mini --premarket` 或 `mini --round`，而不是在服务里直接构造流水线：
+    装配逻辑一份都不重复，流水线崩溃打不到观测服务，停止运行就是终止进程。
+    同一时刻只允许一个，否则两轮会抢 MiniQMT 连接、当日账本和下单额度。
     """
 
     def __init__(self, sessions_dir: Path, store: ConfigStore):
@@ -389,52 +397,49 @@ class Runner:
 
     def status(self) -> dict:
         if self.current is None:
-            return {"idle": True}
+            return {"idle": True, "kinds": list(RUN_KINDS), "modes": list(AGENT_MODES)}
         returncode = self._process.poll() if self._process else None
         return {
             **self.current,
             "idle": False,
             "running": returncode is None,
             "returncode": returncode,
+            "kinds": list(RUN_KINDS),
+            "modes": list(AGENT_MODES),
             "log_tail": self._log_tail(),
         }
 
-    def start(self, role: str, task: str, mode: str) -> dict:
+    def start(self, kind: str, mode: str) -> dict:
         if self._process is not None and self._process.poll() is None:
-            raise Conflict(f"已有运行中的 {self.current['role']}；先停止它再启动新的")
-        if role not in self.store.read()["agents"]:
-            raise ValueError(f"配置里没有角色 {role}")
-        if not task.strip():
-            raise ValueError("任务不能为空")
+            raise Conflict(f"已有运行中的 {self.current['kind']}；先停止它再启动新的")
+        if kind not in RUN_KINDS:
+            raise ValueError(f"kind 只能是 {', '.join(RUN_KINDS)}")
         if mode not in AGENT_MODES:
             raise ValueError(f"mode 只能是 {', '.join(AGENT_MODES)}")
         started = datetime.now().astimezone()
         run_id = f"{started.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
         day_dir = self.sessions_dir / started.strftime("%Y%m%d")
         day_dir.mkdir(parents=True, exist_ok=True)
-        trace = day_dir / f"{run_id}-inspect-{role}.json"
-        self._spawn(trace, role, task, mode)
+        log_path = day_dir / f"{run_id}-inspect-{kind}.log"
+        self._spawn(log_path, kind, mode)
         self.current = {
             "run_id": run_id,
-            "role": role,
-            "task": task,
+            "kind": kind,
             "mode": mode,
             "started_at": started.isoformat(),
-            "trace_id": trace.relative_to(self.sessions_dir).as_posix(),
-            "log_path": str(trace.with_suffix(".log")),
+            "log_path": str(log_path),
         }
         return self.status()
 
-    def _spawn(self, trace: Path, role: str, task: str, mode: str) -> None:
+    def _spawn(self, log_path: Path, kind: str, mode: str) -> None:
         command = [
             sys.executable, "-m", "minisweagent.run.mini",
-            "--agent", role,
-            "--task", task,
+            RUN_KINDS[kind],
+            "--miniqmt-mode", mode,
             "--config", str(self.store.path),
-            "--output", str(trace),
         ]
         self._close_log()
-        self._log = trace.with_suffix(".log").open("w", encoding="utf-8")
+        self._log = log_path.open("w", encoding="utf-8")
         # stdin 必须断开：服务是从终端启动的，子进程继承 tty 会进入交互模式然后卡在等输入。
         self._process = subprocess.Popen(
             command,
@@ -442,7 +447,7 @@ class Runner:
             stdout=self._log,
             stderr=subprocess.STDOUT,
             cwd=str(Path.cwd()),
-            env={**os.environ, "MINIQMT_AGENT_MODE": mode},
+            env=dict(os.environ),
         )
 
     def stop(self) -> dict:
@@ -509,6 +514,7 @@ class Handler(BaseHTTPRequestHandler):
             "/index.html": self._ui,
             "/api/sessions": self._sessions,
             "/api/session": self._session,
+            "/api/image": self._image,
             "/api/config": self._config,
             "/api/prompt": self._prompt,
             "/api/run": self._run_status,
@@ -574,6 +580,14 @@ class Handler(BaseHTTPRequestHandler):
     def _config(self, _query: dict) -> None:
         self._json(self._store().read())
 
+    def _image(self, query: dict) -> None:
+        index: TraceIndex = self.server.index  # type: ignore[attr-defined]
+        raw_path = (query.get("path") or [""])[0]
+        if not raw_path:
+            raise ValueError("缺少 path 参数")
+        body, content_type = index.image(raw_path)
+        self._send(200, content_type, body)
+
     def _prompt(self, query: dict) -> None:
         role = (query.get("role") or [""])[0]
         kind = (query.get("kind") or [""])[0]
@@ -601,13 +615,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(self._runner().status())
 
     def _start_run(self, body: dict) -> None:
-        self._json(
-            self._runner().start(
-                body.get("role", ""),
-                body.get("task", ""),
-                body.get("mode", AGENT_MODES[0]),
-            )
-        )
+        self._json(self._runner().start(body.get("kind", ""), body.get("mode", AGENT_MODES[0])))
 
     def _stop_run(self, _body: dict) -> None:
         self._json(self._runner().stop())

@@ -10,6 +10,12 @@ from minisweagent.models.utils.actions_toolcall import TOOL_DEFINITIONS_BY_NAME
 builtin_config_dir = Path(__file__).parent
 PROMPT_KINDS = ("system", "instance")
 PROMPT_DIRNAME = "prompts"
+# 交易日流水线的三个阶段角色，以及它们不能被配置改坏的硬形态。
+PIPELINE_ROLES = {
+    "candidate_scout": {"flow": "single_shot", "json_output": True, "tools": ()},
+    "chart_reader": {"flow": "single_shot", "json_output": True, "tools": ()},
+    "execution_manager": {"flow": "iterative", "json_output": False, "tools": ("miniqmt_trade",)},
+}
 
 
 def get_config_path(config_spec: str | Path) -> Path:
@@ -89,6 +95,26 @@ def validate_agents(settings: dict, base_dir: Path) -> None:
         raise ValueError("配置里至少要有一个 agent")
     for name, profile in agents.items():
         _validate_profile(name, profile, agents, base_dir)
+    _validate_pipeline_roles(agents)
+
+
+def _validate_pipeline_roles(agents: dict) -> None:
+    """交易日流水线的三个角色由宿主按名字调度，它们的 flow、输出形态和工具不能被改坏。
+
+    改坏的后果不是报错而是跑偏：读图角色被摘掉 json_output，宿主就解析不出结论；
+    执行角色被摘掉 miniqmt_trade，整天下不出一笔单还看不出哪里错了。
+    """
+    for role, demands in PIPELINE_ROLES.items():
+        profile = agents.get(role)
+        if not isinstance(profile, dict):
+            raise ValueError(f"交易日流水线需要角色 {role}，配置里没有它")
+        if profile.get("flow", "iterative") != demands["flow"]:
+            raise ValueError(f"agents.{role}.flow 必须是 {demands['flow']}")
+        if bool(profile.get("json_output")) != demands["json_output"]:
+            raise ValueError(f"agents.{role}.json_output 必须是 {str(demands['json_output']).lower()}")
+        missing = [tool for tool in demands["tools"] if tool not in (profile.get("tools") or [])]
+        if missing:
+            raise ValueError(f"agents.{role}.tools 缺少必需工具：{', '.join(missing)}")
 
 
 def _validate_profile(name: str, profile: dict, agents: dict, base_dir: Path) -> None:
@@ -106,25 +132,10 @@ def _validate_profile(name: str, profile: dict, agents: dict, base_dir: Path) ->
         raise ValueError(f"agents.{name}.tools 含未知工具：{', '.join(unknown)}")
     if flow == "single_shot" and tools:
         raise ValueError(f"agents.{name} 用 single_shot flow 时不能配置工具")
-    _validate_delegation(name, profile, agents, tools or [])
-    for role in profile.get("requires") or []:
-        if role not in agents:
-            raise ValueError(f"agents.{name}.requires 引用了不存在的角色：{role}")
+    if "json_output" in profile and not isinstance(profile["json_output"], bool):
+        raise ValueError(f"agents.{name}.json_output 必须是布尔值")
     for kind in PROMPT_KINDS:
         _validate_prompt_source(name, profile, base_dir, f"{kind}_template")
-
-
-def _validate_delegation(name: str, profile: dict, agents: dict, tools: list) -> None:
-    delegates = profile.get("delegates_to") or []
-    for role in delegates:
-        if role not in agents:
-            raise ValueError(f"agents.{name}.delegates_to 引用了不存在的角色：{role}")
-        if (agents[role] or {}).get("delegates_to"):
-            raise ValueError(f"agents.{name} 委派的 {role} 自己也声明了 delegates_to；宿主只支持一层委派")
-    if delegates and "agent_call" not in tools:
-        raise ValueError(f"agents.{name} 声明了 delegates_to，但 tools 里没有 agent_call")
-    if not delegates and "agent_call" in tools:
-        raise ValueError(f"agents.{name} 配了 agent_call 工具，但没有声明 delegates_to")
 
 
 def _validate_prompt_source(name: str, profile: dict, base_dir: Path, key: str) -> None:
@@ -139,6 +150,7 @@ def _validate_prompt_source(name: str, profile: dict, base_dir: Path, key: str) 
 
 
 __all__ = [
+    "PIPELINE_ROLES",
     "PROMPT_KINDS",
     "builtin_config_dir",
     "get_config_from_spec",

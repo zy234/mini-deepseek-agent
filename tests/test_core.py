@@ -1,5 +1,7 @@
+import base64
 import json
 import logging
+import re
 import shutil
 import signal
 import subprocess
@@ -11,15 +13,21 @@ from types import SimpleNamespace
 
 import pytest
 
+from minisweagent import config
 from minisweagent.agents.default import DefaultAgent
-from minisweagent.environments import account_journal, market_monitor, miniqmt, web_fetch
+from minisweagent.environments import local as local_env
+from minisweagent.environments import miniqmt, web_fetch
 from minisweagent.environments.local import LocalEnvironment
+from minisweagent.exceptions import FormatError
 from minisweagent.models.deepseek_model import DEFAULT_OBSERVATION_TEMPLATE, DeepSeekModel
-from minisweagent.models.utils.actions_toolcall import (
-    format_toolcall_observation_messages,
-    get_tool_definitions,
-)
+from minisweagent.models.utils.actions_toolcall import format_toolcall_observation_messages
 from minisweagent.run import inspect, mini
+from minisweagent.trading import pipeline
+
+# 1x1 透明 PNG：只用来验证图片被读成 base64 塞进请求，不需要真图。
+TINY_PNG = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
+)
 
 
 class FakeModel:
@@ -79,131 +87,6 @@ def test_agent_runs_bash_and_saves_submission(tmp_path: Path):
     assert result == {"exit_status": "Submitted", "submission": "finished"}
     assert trajectory.exists()
     assert any(message.get("role") == "tool" for message in agent.messages)
-
-
-def test_delegation_graph_comes_from_role_configuration():
-    settings = mini.get_config_from_spec(mini.DEFAULT_CONFIG_FILE)
-    manager = mini._get_agent_settings(settings, "financial_manager")
-    profiles = mini._delegate_profiles(settings, manager)
-    env = LocalEnvironment(timeout=5, agent_profiles=profiles)
-
-    # 模型看到的 role 枚举、宿主的准入和交接顺序都读同一份配置。
-    assert set(profiles) == {"financial_research", "portfolio_manager", "account_trader"}
-    schema = get_tool_definitions(["agent_call"], manager["delegates_to"])[0]
-    assert schema["function"]["parameters"]["properties"]["role"]["enum"] == manager["delegates_to"]
-
-    assert env._validate_agent_call_phase("portfolio_manager")["error"]["code"] == "workflow_order"
-    env._agent_call_roles.append("financial_research")
-    assert env._validate_agent_call_phase("portfolio_manager") is None
-    assert env._validate_agent_call_phase("account_trader")["error"]["code"] == "workflow_order"
-    env._agent_call_roles.append("portfolio_manager")
-    assert env._validate_agent_call_phase("account_trader") is None
-
-    # 没被声明为可委派的角色直接拒绝，哪怕它在 agents 里存在。
-    rejected = env._execute_agent_call({"tool": "agent_call", "role": "interactive", "task": "x"})
-    assert json.loads(rejected["stdout"])["error"]["code"] == "unknown_role"
-
-    # 换一份配置就换一套委派关系，不需要改代码。
-    custom = {
-        "agent": {"system_template": "s", "instance_template": "{{ task }}"},
-        "agents": {
-            "boss": {"tools": ["agent_call"], "delegates_to": ["scout", "closer"]},
-            "scout": {"tools": []},
-            "closer": {"tools": [], "requires": ["scout"]},
-        },
-    }
-    boss = mini._get_agent_settings(custom, "boss")
-    custom_env = LocalEnvironment(timeout=5, agent_profiles=mini._delegate_profiles(custom, boss))
-    assert custom_env._validate_agent_call_phase("scout") is None
-    assert custom_env._validate_agent_call_phase("closer")["error"]["code"] == "workflow_order"
-
-    # 配置错误必须在启动时炸掉，而不是等模型真去委派才失败。
-    with pytest.raises(ValueError, match="不存在的 Agent"):
-        mini._delegate_profiles({"agents": {}}, {"delegates_to": ["ghost"]})
-    with pytest.raises(ValueError, match="delegates_to"):
-        get_tool_definitions(["agent_call"], [])
-    with pytest.raises(ValueError, match="没有 agent_call"):
-        mini._delegate_profiles(custom, {**boss, "tools": []})
-
-    # 宿主只支持一层委派：子 Agent 自己声明了 delegates_to 时显式报配置错误。
-    nested = LocalEnvironment(timeout=5, agent_profiles={"mid": {"delegates_to": ["scout"]}})
-    blocked = nested._execute_agent_call({"tool": "agent_call", "role": "mid", "task": "x"})
-    assert json.loads(blocked["stdout"])["error"]["code"] == "nested_delegation"
-
-
-def test_financial_agent_profiles_describe_daily_handoff():
-    settings = mini.get_config_from_spec(mini.DEFAULT_CONFIG_FILE)
-    research = settings["agents"]["financial_research"]["system_template"]
-    portfolio = settings["agents"]["portfolio_manager"]["system_template"]
-    trader = settings["agents"]["account_trader"]["system_template"]
-    manager = settings["agents"]["financial_manager"]["system_template"]
-
-    assert "buy_candidates" in research
-    assert "previous_close_as_of" in research
-    assert "selected_candidates" in portfolio
-    assert "risk_check" in trader
-    assert "financial_research" in manager
-    assert "portfolio_manager" in manager
-    assert "account_trader" in manager
-    # 监控表只有主 Agent 能写：交易 Agent 成交后不可能顺手清掉其他持仓的风控计划。
-    assert "account_monitor" not in settings["agents"]["account_trader"]["tools"]
-    assert "account_monitor" in settings["agents"]["financial_manager"]["tools"]
-
-
-def test_market_monitor_persists_plans_and_emits_each_trigger_once(tmp_path):
-    monitor = market_monitor.MarketMonitor(tmp_path)
-    # 买入单点触发已被禁止：price_lte 的真实语义是越跌越买，跳空砸穿也会成交。
-    single_point_buy = {
-        "plan_id": "buy-600000",
-        "stock_code": "600000.SH",
-        "side": "BUY",
-        "trigger": {"type": "price_lte", "value": 10},
-        "order": {"volume": 100, "price": 10},
-    }
-    assert monitor.replace([single_point_buy])["ok"] is False
-    plan = {
-        "plan_id": "buy-600000",
-        "stock_code": "600000.SH",
-        "side": "BUY",
-        "trigger": {"type": "price_range", "value": 10, "upper": 10.5},
-        "order": {"volume": 100},
-    }
-    assert monitor.replace([plan])["ok"] is True
-    # 买入限价必须由交易工具在提交那一刻推导：提前钉死的限价在价格从区间下沿触发时必然撞破偏离上限。
-    assert monitor.replace([{**plan, "order": {"volume": 100, "price": 10.2}}])["ok"] is False
-    # 换仓必须成对：声明了资金来源就得有那只票的卖出计划。
-    rotation = {**plan, "rotate_from": "000651.SZ"}
-    assert monitor.replace([rotation])["ok"] is False
-
-    class FakeQuoteClient:
-        def __init__(self, price):
-            self.price = price
-
-        def quotes(self, stock_codes):
-            assert stock_codes == ["600000.SH"]
-            return {
-                "ok": True,
-                "data": {"ticks": {"600000.SH": {"last_price": self.price, "time": "2026-09-03T10:00:00+08:00"}}},
-            }
-
-    # 跌破区间下界不触发：这正是趋势跟随和接刀的区别。
-    assert monitor.poll(FakeQuoteClient(9.5))["data"]["events"] == []
-    first = monitor.poll(FakeQuoteClient(10.2))
-    assert [event["stock_code"] for event in first["data"]["events"]] == ["600000.SH"]
-    second = monitor.poll(FakeQuoteClient(10.2))
-    assert second["data"]["events"] == []
-    assert json.loads((tmp_path / "market-monitor.json").read_text())["plans"][0]["fired"] is True
-
-    # 重算整张表不能让已成交的计划复活；想重新布防必须换 plan_id。
-    replaced = monitor.replace([plan])
-    assert replaced["data"]["kept_fired"] == ["buy-600000"]
-    assert monitor.poll(FakeQuoteClient(10.2))["data"]["events"] == []
-
-    # 只保留全量覆盖一个写入口：clear 已取消，清空必须显式提交空数组。
-    env = LocalEnvironment(timeout=5, account_journal_dir=str(tmp_path))
-    assert "invalid_argument" in env._execute_account_monitor({"operation": "clear"})["stdout"]
-    emptied = env._execute_account_monitor({"operation": "replace", "plans": []})
-    assert json.loads(emptied["stdout"])["data"]["plans"] == []
 
 
 def test_buy_limit_price_is_derived_from_latest_quote_within_deviation_cap(tmp_path, monkeypatch):
@@ -305,31 +188,6 @@ def test_low_price_stock_buy_is_blocked_instead_of_resting_unfilled(tmp_path, mo
     # 拒单原因必须和跳空追高分开讲：一个是行情跑了，一个是这只票的报价单位装不下额度。
     assert "报价单位" in result["error"]["detail"] and "跳空" not in result["error"]["detail"]
     assert submitted == []
-
-
-def test_account_loop_schedules_premarket_monitoring_and_close_review():
-    tz = mini.TRADING_TZ
-    assert mini._account_loop_slot(datetime(2026, 9, 3, 9, 20, tzinfo=tz)) == (
-        "premarket",
-        "2026-09-03",
-    )
-    assert mini._account_loop_slot(datetime(2026, 9, 3, 9, 35, tzinfo=tz)) == (
-        "monitor",
-        "2026-09-03",
-    )
-    assert mini._account_loop_slot(datetime(2026, 9, 3, 12, 50, tzinfo=tz)) == (
-        "midday",
-        "2026-09-03",
-    )
-    assert mini._account_loop_slot(datetime(2026, 9, 3, 15, 10, tzinfo=tz)) == (
-        "review",
-        "2026-09-03-close",
-    )
-    # 盘中候选发现窗口落在 monitor 时段内，两个窗口各自只跑一次。
-    assert mini._intraday_scan_key(datetime(2026, 9, 3, 9, 35, tzinfo=tz)) is None
-    assert mini._intraday_scan_key(datetime(2026, 9, 3, 10, 5, tzinfo=tz)) == "2026-09-03-1000"
-    assert mini._intraday_scan_key(datetime(2026, 9, 3, 10, 11, tzinfo=tz)) is None
-    assert mini._intraday_scan_key(datetime(2026, 9, 3, 13, 31, tzinfo=tz)) == "2026-09-03-1330"
 
 
 def test_sector_rank_ranks_by_buyable_strength_and_caches_members(tmp_path, monkeypatch):
@@ -465,15 +323,6 @@ def test_screen_trend_enrichment_labels_breakout_and_broken(monkeypatch):
     assert breakout["stop_ref"] > 0
     assert "breakout_entry" not in rows["600002.SH"]
     assert result["data"]["trend_gate_counts"] == {"breakout": 1, "broken": 1}
-
-
-def test_account_journal_reads_observation_todo(tmp_path):
-    todo = tmp_path / "observation-todo.md"
-    todo.write_text("明日核对现金和监控计划", encoding="utf-8")
-
-    result = account_journal.read_account_journal(tmp_path)
-
-    assert result["data"]["observation_todo"] == "明日核对现金和监控计划"
 
 
 def test_web_search_failure_diagnostics_are_visible_in_model_observation():
@@ -818,181 +667,463 @@ def test_deepseek_model_streams_and_emits_configured_tool_calls(monkeypatch, cap
     ]
     assert model._api_messages([message])[0]["reasoning_content"] == "thinking "
 
+    # 读图角色：轨迹里只存图片路径，发请求这一刻才读成 base64 塞进 user 消息。
+    chart = Path(__file__).parent / "fixture-chart.png"
+    chart.write_bytes(base64.b64decode(TINY_PNG))
+    try:
+        content = model._api_messages(
+            [{"role": "user", "content": "看图", "extra": {"images": [str(chart)]}}]
+        )[0]["content"]
+        assert content[0] == {"type": "text", "text": "看图"}
+        assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        # 平台只接受 user 消息里的图片，别处带图会 400，所以宿主自己先拦住。
+        with pytest.raises(ValueError, match="不能携带图片"):
+            model._api_messages([{"role": "system", "content": "s", "extra": {"images": [str(chart)]}}])
+    finally:
+        chart.unlink()
 
-def _parent_trace(child_path: Path, missing_path: Path, started: datetime) -> dict:
-    """手写一条主 Agent 轨迹：一次 agent_call 成功、一次失败且子轨迹没落盘。"""
-    t0 = started.timestamp()
-    return {
-        "trajectory_format": "mini-swe-agent-1.1",
-        "info": {
-            "session": {
-                "id": "20260909-090000-000000-parent",
-                "started_at": started.isoformat(),
-                "parent": "",
-                "kind": "premarket",
-            },
-            "config": {
-                "agent": {"agent_name": "financial_manager", "flow": "iterative", "tools": ["agent_call"]},
-                "environment": {"miniqmt_mode": "observe", "account_cycle_id": "cycle-1"},
-            },
-            "model_stats": {"api_calls": 1},
-            "exit_status": "Submitted",
-            "submission": "完成",
-        },
-        "messages": [
-            {"role": "system", "content": "s"},
-            {"role": "user", "content": "t"},
+    # JSON 输出角色：请求里带 response_format，且没有工具可用——它真去调工具就是格式错误。
+    captured.clear()
+    with pytest.raises(FormatError):
+        model.query([{"role": "user", "content": "只要 JSON"}], tools=[], json_output=True)
+    assert captured["response_format"] == {"type": "json_object"}
+    assert "tools" not in captured
+
+
+class FakeMiniQMT:
+    """假 MiniQMT：形状与真实 Bridge 一致，数据是构造的，图能真的渲染出来。
+
+    真实客户端的取数细节已经由 miniqmt 的测试覆盖，这里要验的是流水线：宿主取什么、
+    注入什么、模型看到什么图、最后下出什么单。
+    """
+
+    submissions: list[dict] = []
+
+    def __init__(self, **kwargs):
+        self.mode = kwargs.get("mode", "observe")
+        self.pool = {
+            "TGN热门一": ["600001.SH", "600002.SH", "600003.SH"],
+            "TGN热门二": ["000004.SZ", "000005.SZ", "000006.SZ"],
+        }
+        self.held = "603386.SH"
+
+    # ---- 行情 ----
+    def download_sectors(self):
+        return _ok({"downloaded": True})
+
+    def sector_rank(self, *, family="TGN", limit=15, min_buyable=3):
+        return _ok(
             {
-                "role": "assistant",
-                "content": "",
-                "extra": {
-                    "timestamp": t0 + 1,
-                    "usage": {"prompt_tokens": 100, "completion_tokens": 20},
-                    "actions": [
-                        {"tool": "agent_call", "tool_call_id": "call_a", "role": "financial_research", "task": "研究"},
-                        {"tool": "agent_call", "tool_call_id": "call_b", "role": "portfolio_manager", "task": "组合"},
+                "family": family,
+                "quote_at": "20260910 09:20:03",
+                "sectors": [
+                    {
+                        "sector": name,
+                        "members": len(codes),
+                        "members_quoted": len(codes),
+                        "up_count": len(codes),
+                        "up_ratio": 0.8,
+                        "median_change_pct": 3.1,
+                        "amount": 1.2e9,
+                        "buyable_count": len(codes),
+                        "buyable_median_change_pct": 4.2 - index,
+                        "top_buyable": [],
+                    }
+                    for index, (name, codes) in enumerate(self.pool.items())
+                ][:limit],
+            }
+        )
+
+    def screen(self, *, sector_name="", stock_codes=None, sort_by="change_pct_desc", limit=20, enrich_trend=False):
+        codes = self.pool.get(sector_name, []) if sector_name else list(stock_codes or [])
+        return _ok(
+            {
+                "sector": sector_name,
+                "quote_at": "20260910 10:00:03",
+                "universe_size": len(codes),
+                "rows": [_row(code) for code in codes[:limit]],
+                "trend_gate_counts": {"breakout": len(codes)},
+            }
+        )
+
+    def quotes(self, stock_codes):
+        return _ok(
+            {
+                "ticks": {
+                    code: {"lastPrice": 3900.0, "lastClose": 3880.0, "amount": 9.9e11, "timetag": "20260910 10:00:03"}
+                    for code in stock_codes
+                }
+            }
+        )
+
+    def history(self, stock_codes, *, period="1d", start_time="", end_time=""):
+        return _ok(
+            {
+                "period": period,
+                "bars": {code: (_daily_bars() if period == "1d" else _minute_bars()) for code in stock_codes},
+                "empty_codes": [],
+            }
+        )
+
+    # ---- 账户 ----
+    def account(self, view):
+        if view == "snapshot":
+            return _ok(
+                {
+                    "snapshot_at": "2026-09-10T10:00:03+08:00",
+                    "result": {
+                        "assets": {"asset": {"cash": 60000.0, "total_asset": 100000.0, "market_value": 40000.0, "frozen_cash": 0.0}},
+                        "positions": {
+                            "items": [
+                                {
+                                    "stock_code": self.held,
+                                    "instrument_name": "骏亚科技",
+                                    "volume": 600,
+                                    "can_use_volume": 600,
+                                    "yesterday_volume": 600,
+                                    "avg_price": 15.0,
+                                    "last_price": 15.6,
+                                    "market_value": 9360.0,
+                                    "float_profit": 360.0,
+                                    "profit_rate": 0.04,
+                                }
+                            ]
+                        },
+                    },
+                }
+            )
+        return _ok({"snapshot_at": "2026-09-10T10:00:03+08:00", "result": {"items": []}})
+
+    def trade(self, operation, inputs):
+        FakeMiniQMT.submissions.append({"operation": operation, "inputs": inputs, "mode": self.mode})
+        if self.mode == "observe":
+            return {"ok": False, "status": "blocked", "operation": operation, "data": None,
+                    "error": {"code": "blocked", "detail": "交易工具处于 observe 模式"}}
+        return _ok({"order_id": "9001"})
+
+
+def _ok(data):
+    return {"ok": True, "status": "success", "operation": "fake", "data": data, "error": None}
+
+
+def _row(code):
+    return {
+        "stock_code": code,
+        "last_price": 15.6,
+        "last_close": 15.0,
+        "change_pct": 4.0,
+        "open": 15.1,
+        "high": 15.7,
+        "low": 15.0,
+        "close_position": 0.86,
+        "volume": 12000.0,
+        "amount": 1.8e8,
+        "lot_cost": 1560.0,
+        "buyable": True,
+        "trend_gate": "breakout",
+        "ma20": 14.2,
+        "vol_ratio": 1.9,
+        "pivot": 15.4,
+        "stop_ref": 14.3,
+    }
+
+
+def _daily_bars():
+    """40 根递增日线，最后一根是当日 bar。图要真的画出来，所以字段必须齐。"""
+    bars = []
+    for index in range(40):
+        close = 12.0 + index * 0.1
+        bars.append(
+            {
+                "date": int(f"2026080{index + 1}") if index < 9 else 20260810 + index - 9,
+                "open": close - 0.05,
+                "high": close + 0.12,
+                "low": close - 0.15,
+                "close": close,
+                "volume": 9000.0 + index * 30,
+                "amount": (9000.0 + index * 30) * close * 100,
+            }
+        )
+    return bars
+
+
+def _minute_bars():
+    return [
+        {
+            "date": int(f"20260910{9 + (index + 30) // 60:02d}{(index + 30) % 60:02d}00"),
+            "open": 15.4,
+            "high": 15.65,
+            "low": 15.35,
+            "close": 15.4 + index * 0.005,
+            "volume": 120.0 + index,
+            "amount": (120.0 + index) * 15.5 * 100,
+        }
+        for index in range(45)
+    ]
+
+
+class ScriptedModel:
+    """按 system prompt 分辨角色的假模型。第一次选池故意编一个池子外的代码，验证宿主会打回。"""
+
+    seen: dict[str, int] = {}
+    images: list[list[str]] = []
+
+    def __init__(self, **kwargs):
+        self.config = SimpleNamespace(model_name="fake", stream_output=False)
+        self.calls = 0
+
+    def format_message(self, **kwargs):
+        return {key: value for key, value in kwargs.items() if value is not None}
+
+    def query(self, messages, **kwargs):
+        self.calls += 1
+        system = messages[0]["content"]
+        # 汇总执行的 prompt 里也会提到读图，所以先认它，再认另外两个。
+        if "汇总执行" in system:
+            return self._executor()
+        if "盘前选池" in system:
+            return self._scout(kwargs)
+        return self._reader(messages, kwargs)
+
+    def _scout(self, kwargs):
+        assert kwargs.get("json_output") is True, "选池角色必须走 JSON 输出"
+        count = ScriptedModel.seen["scout"] = ScriptedModel.seen.get("scout", 0) + 1
+        if count == 1:
+            # 凭记忆编的代码：宿主必须打回，不能让它进待观测清单。
+            picks = [{"stock_code": "600519.SH", "reason": "记错了", "risk": "无"}]
+        else:
+            picks = [{"stock_code": "600001.SH", "reason": "站上前高", "risk": "破 14.3 走"}]
+        return _answer(
+            json.dumps(
+                {
+                    "market_view": "指数强势",
+                    "sectors": [
+                        {"sector": "TGN热门一", "reason": "主线", "picks": picks},
+                        {
+                            "sector": "TGN热门二",
+                            "reason": "补涨",
+                            "picks": [{"stock_code": "000004.SZ", "reason": "放量", "risk": "跌破均价"}],
+                        },
                     ],
                 },
-            },
-            {
-                "role": "tool",
-                "tool_call_id": "call_a",
-                "content": "",
-                "extra": {
-                    "tool": "agent_call", "status": "success", "started_at": t0 + 1, "ended_at": t0 + 31,
-                    "stdout": json.dumps({"ok": True, "data": {"trace_path": str(child_path)}}),
+                ensure_ascii=False,
+            )
+        )
+
+    def _reader(self, messages, kwargs):
+        assert kwargs.get("json_output") is True, "读图角色必须走 JSON 输出"
+        images = (messages[1].get("extra") or {}).get("images") or []
+        ScriptedModel.images.append(images)
+        assert images, "读图角色必须真的收到图片路径"
+        # 本组标的从任务行里取：注入的正文里还有大盘代码，按 JSON 字段乱抓会把指数也算进来。
+        listed = re.search(r"标的 ([^。]+)。", messages[1]["content"])
+        unique = list(dict.fromkeys((listed.group(1) if listed else "").split("、")))
+        ScriptedModel.seen["reader"] = ScriptedModel.seen.get("reader", 0) + 1
+        return _answer(
+            json.dumps(
+                {
+                    "index_view": "大盘在均价上方",
+                    "verdicts": [
+                        {
+                            "stock_code": code,
+                            "action": "BUY" if code.startswith("6000") else "HOLD",
+                            "confidence": 0.7,
+                            "price_hint": 15.8,
+                            "reason": "日线突破，分钟站上均价",
+                            "risk": "破均价走",
+                        }
+                        for code in unique
+                    ],
                 },
-            },
-            {
-                "role": "tool",
-                "tool_call_id": "call_b",
-                "content": "",
-                "extra": {
-                    "tool": "agent_call", "status": "error", "error_code": "TimeExceeded",
-                    "started_at": t0 + 31, "ended_at": t0 + 41,
-                    "stdout": json.dumps({"ok": False, "error": {"trace_path": str(missing_path)}}),
-                },
-            },
-            {"role": "exit", "content": "完成", "extra": {"exit_status": "Submitted", "submission": "完成"}},
-        ],
+                ensure_ascii=False,
+            )
+        )
+
+    def _executor(self):
+        ScriptedModel.seen["executor"] = ScriptedModel.seen.get("executor", 0) + 1
+        if self.calls == 1:
+            return _actions(
+                [
+                    {
+                        "tool": "miniqmt_trade",
+                        "tool_call_id": "call_trade",
+                        "operation": "submit",
+                        "inputs": {
+                            "client_intent_id": "round-test-600001",
+                            "stock_code": "600001.SH",
+                            "side": "BUY",
+                            "volume": 100,
+                            "price_cap": 15.8,
+                        },
+                    }
+                ]
+            )
+        if self.calls == 2:
+            return _actions(
+                [
+                    {
+                        "tool": "account_journal",
+                        "tool_call_id": "call_journal",
+                        "operation": "append",
+                        "record": {
+                            "action": "BUY",
+                            "market_view": "指数强势",
+                            "account_risk": "现金充足",
+                            "decision": "买入 600001.SH 一手",
+                            "follow_up": "盯 14.3 止损",
+                            "orders": ["BUY 600001.SH 100"],
+                            "pitfalls": [],
+                            "tool_errors": [],
+                        },
+                    }
+                ]
+            )
+        return _answer("本轮买入 600001.SH 一手，其余持有。")
+
+    def format_observation_messages(self, message, outputs, template_vars=None):
+        return format_toolcall_observation_messages(
+            actions=message["extra"]["actions"],
+            outputs=outputs,
+            observation_template="{{ output.stdout }}",
+            template_vars=template_vars,
+        )
+
+    def get_template_vars(self, **kwargs):
+        return {}
+
+    def serialize(self):
+        return {"info": {"model": "scripted"}}
+
+
+def _answer(content):
+    return {"role": "assistant", "content": content, "extra": {"actions": [], "timestamp": time.time()}}
+
+
+def _actions(actions):
+    return {"role": "assistant", "content": None, "extra": {"actions": actions, "timestamp": time.time()}}
+
+
+def _pipeline_settings(tmp_path: Path) -> dict:
+    """用仓库真实配置和真实 prompt 跑，只把规模和目录换成测试值。
+
+    prompt 用 StrictUndefined 渲染，所以这条测试同时在验"宿主注入的变量和 prompt 要求的变量一致"，
+    少注入一个变量会直接炸在这里，而不是等到某天盘中那一轮。
+    """
+    settings = mini.get_config_from_spec(mini.DEFAULT_CONFIG_FILE)
+    settings["trading"] = {
+        "premarket_at": "09:20",
+        "round_interval_minutes": 10,
+        "sector_count": 2,
+        "picks_per_sector": 1,
+        "sectors_scanned": 2,
+        "rows_per_sector": 3,
+        "index_codes": ["000001.SH"],
+        "daily_chart_days": 30,
+        "max_parallel_groups": 2,
+        "round_json_attempts": 2,
     }
+    settings["environment"] = {**settings.get("environment", {}), "miniqmt_mode": "auto_execute", "timeout": 5}
+    return settings
 
 
-def test_inspect_indexes_dispatch_tree_and_execution_path(tmp_path: Path):
-    sessions = tmp_path / ".sessions" / "20260909"
-    child_path = sessions / "20260909-090000-000000-parent-01-financial_research.json"
-    agent = DefaultAgent(
-        FakeModel(),
-        LocalEnvironment(timeout=5),
-        system_template="You are an agent.",
-        instance_template="{{ task }}",
-        step_limit=3,
-        output_path=child_path,
-        agent_name="financial_research",
-        session_id="20260909-090000-000000-parent-01-financial_research",
-        session_started_at=datetime.now().astimezone().isoformat(),
-        parent_session_id="20260909-090000-000000-parent",
-        cycle_kind="premarket",
+def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
+    """盘前选池 → 并行读图 → 汇总执行的完整一天：图真的渲染，单真的提交，账本真的落盘。"""
+    FakeMiniQMT.submissions.clear()
+    ScriptedModel.seen.clear()
+    ScriptedModel.images.clear()
+    monkeypatch.setattr(pipeline, "MiniQMTClient", FakeMiniQMT)
+    monkeypatch.setattr(local_env, "MiniQMTClient", FakeMiniQMT)
+    monkeypatch.setattr(pipeline, "get_model", lambda config: ScriptedModel(**config))
+    monkeypatch.chdir(tmp_path)
+
+    sessions_dir = tmp_path / ".sessions"
+    journal_dir = tmp_path / "state"
+    day = pipeline.TradingPipeline(
+        _pipeline_settings(tmp_path), sessions_dir=sessions_dir, journal_dir=journal_dir, echo=lambda text: None
     )
-    agent.run("跑一个子 Agent")
 
-    # 埋点：子轨迹自己知道父是谁、这一轮为什么被启动，工具结果带工具名和独立起止时间。
-    child = json.loads(child_path.read_text(encoding="utf-8"))
-    assert child["info"]["session"]["parent"] == "20260909-090000-000000-parent"
-    assert child["info"]["session"]["kind"] == "premarket"
-    observation = next(message for message in child["messages"] if message["role"] == "tool")
-    assert observation["extra"]["tool"] == "bash"
-    assert observation["extra"]["ended_at"] >= observation["extra"]["started_at"] > 0
+    watchlist = day.premarket()
+    # 编出来的代码被打回，重试一次后才落盘；两个板块各一只，且都来自注入的池子。
+    assert ScriptedModel.seen["scout"] == 2
+    picked = [pick["stock_code"] for sector in watchlist["sectors"] for pick in sector["picks"]]
+    assert picked == ["600001.SH", "000004.SZ"]
+    assert (journal_dir / "watchlist" / f"{watchlist['trade_date']}.json").is_file()
 
-    started = datetime(2026, 9, 9, 9, 0, 0).astimezone()
-    missing_path = sessions / "20260909-090000-000000-parent-02-portfolio_manager.json"
-    parent_path = sessions / "20260909-090000-000000-parent.json"
-    parent_path.write_text(
-        json.dumps(_parent_trace(child_path, missing_path, started), ensure_ascii=False), encoding="utf-8"
-    )
-    (sessions.parent / "account-manager").mkdir(parents=True, exist_ok=True)
-    (sessions.parent / "account-manager" / "market-monitor.json").write_text('{"plans": []}', encoding="utf-8")
+    outcome = day.run_round()
 
-    index = inspect.TraceIndex(tmp_path / ".sessions")
-    roots = index.sessions()
+    # 两个候选板块各一组，加上持仓组，一共三组并行读图。
+    assert ScriptedModel.seen["reader"] == 3
+    assert len(outcome["readings"]) == 3
+    # 每组都收到了大盘两张图加本组每只票两张图。
+    assert all(len(images) >= 4 for images in ScriptedModel.images)
+    charts = sorted(path.name for path in (sessions_dir).rglob("*.png"))
+    assert "600001.SH-daily.png" in charts and "600001.SH-intraday.png" in charts
+    assert "000001.SH-intraday.png" in charts and "603386.SH-daily.png" in charts
 
-    # 状态文件不是轨迹，子轨迹挂到父下面，不再是独立的根。
-    assert [root["id"] for root in roots] == ["20260909/20260909-090000-000000-parent.json"]
-    root = roots[0]
-    assert root["kind"] == "premarket"
-    assert root["n_errors"] == 1
-    assert [child["agent_name"] for child in root["children"]] == ["financial_research"]
+    # 汇总执行真的提交了买单，且用的是 price_cap 而不是自己算的固定价。
+    assert len(FakeMiniQMT.submissions) == 1
+    submitted = FakeMiniQMT.submissions[0]["inputs"]
+    assert submitted["stock_code"] == "600001.SH" and submitted["price_cap"] == 15.8
+    assert "price" not in submitted
 
-    loaded = index.load(root["id"])
-    calls = [step for step in loaded["steps"] if step.get("tool") == "agent_call"]
-    assert [step["duration"] for step in calls] == [30.0, 10.0]
-    assert [step["offset"] for step in calls] == [1.0, 31.0]
-    assert calls[0]["args"]["role"] == "financial_research"
-    assert calls[1]["error_code"] == "TimeExceeded"
-    assert loaded["children"][0]["session"]["agent_name"] == "financial_research"
-    assert loaded["children"][0]["steps"][0]["role"] == "system"
-    # 子 Agent 在落盘前就死掉时，观测端必须把缺失当成结论报出来，而不是静默少一棵子树。
-    assert "portfolio_manager" in loaded["children"][1]["error"]
+    # 账本有本轮记录，轨迹按父子关系落盘，观测端能把并行读图挂在这一轮下面。
+    journal = (journal_dir / "journals" / f"{watchlist['trade_date']}.md").read_text(encoding="utf-8")
+    assert "买入 600001.SH 一手" in journal
+    roots = inspect.TraceIndex(sessions_dir).sessions()
+    round_root = next(root for root in roots if root["agent_name"] == "execution_manager")
+    assert [child["agent_name"] for child in round_root["children"]] == ["chart_reader"] * 3
+    assert any(child["images"] for child in round_root["children"])
 
-
-def test_config_store_edits_roles_and_prompts_under_validation(tmp_path: Path):
-    directory = tmp_path / "config"
-    shutil.copytree(Path(mini.DEFAULT_CONFIG_FILE).parent, directory)
-    target = directory / "deepseek.yaml"
-    store = inspect.ConfigStore(target)
-
-    # 新增角色：prompt 文件必须先落盘，否则配置自检过不去。
-    store.write_prompt("risk_auditor", "system", "你是风控审计 Agent。")
-    store.write_prompt("risk_auditor", "instance", "{{ task }}")
-    agents = store.read()["agents"]
-    agents["risk_auditor"] = {
-        "description": "复核交易前置条件",
-        "flow": "iterative",
-        "tools": ["miniqmt_account"],
-        "requires": ["account_trader"],
-        "system_template_path": "prompts/risk_auditor.system.md",
-        "instance_template_path": "prompts/risk_auditor.instance.md",
-    }
-    agents["financial_manager"]["delegates_to"].append("risk_auditor")
-    assert store.write_agents(agents)["ok"] is True
-
-    # 落盘的配置必须能被真实装配链直接吃下，并且新角色立刻可被委派。
-    settings = mini.get_config_from_spec(target)
-    manager = mini._get_agent_settings(settings, "financial_manager")
-    profiles = mini._delegate_profiles(settings, manager)
-    assert "risk_auditor" in profiles
-    env = LocalEnvironment(timeout=5, agent_profiles=profiles)
-    assert env._validate_agent_call_phase("risk_auditor")["error"]["code"] == "workflow_order"
-    env._agent_call_roles.append("account_trader")
-    assert env._validate_agent_call_phase("risk_auditor") is None
-
-    # 自检不通过时一个字节都不许落盘。
-    broken = store.read()["agents"]
-    broken["financial_manager"]["tools"] = ["account_journal"]
-    with pytest.raises(ValueError, match="agent_call"):
-        store.write_agents(broken)
-    assert "agent_call" in store.read()["agents"]["financial_manager"]["tools"]
-
-    # prompt 语法错和越界路径都在写盘前拦掉。
-    with pytest.raises(ValueError, match="模板语法错误"):
-        store.write_prompt("risk_auditor", "system", "{% if %}")
-    with pytest.raises(ValueError, match="非法角色名"):
-        store.write_prompt("../../etc/passwd", "system", "x")
-    assert "风控审计" in store.read_prompt("risk_auditor", "system")["text"]
-
-    # 删角色不删文件，但必须把不再被引用的 prompt 报出来。
-    kept = store.read()["agents"]
-    del kept["risk_auditor"]
-    kept["financial_manager"]["delegates_to"].remove("risk_auditor")
-    orphans = store.write_agents(kept)["orphan_prompts"]
-    assert "prompts/risk_auditor.system.md" in orphans
-    assert (directory / "prompts" / "risk_auditor.system.md").is_file()
+    # 轮次槽位对齐时钟，非连续竞价时段不跑；收盘后启动必须直接退出，不能空转到第二天。
+    tz = pipeline.TRADING_TZ
+    assert day._round_slot(datetime(2026, 9, 10, 9, 35, tzinfo=tz)) == "0930"
+    assert day._round_slot(datetime(2026, 9, 10, 11, 41, tzinfo=tz)) is None
+    assert day._round_slot(datetime(2026, 9, 10, 14, 7, tzinfo=tz)) == "1400"
+    monkeypatch.setattr(pipeline, "datetime", _FrozenClock(datetime(2026, 9, 10, 15, 30, tzinfo=tz)))
+    day.run_day()
 
 
-def _spawn_sleeper(self, trace: Path, role: str, task: str, mode: str) -> None:
-    """替掉真实的 Agent 启动：验证并发拦截和停止只需要一个长命子进程。"""
+class _FrozenClock:
+    """冻住时钟：收盘后启动这条路径靠真实时间验不了，但它一旦回归就是无限空转。"""
+
+    def __init__(self, moment: datetime):
+        self.moment = moment
+
+    def now(self, _tz=None) -> datetime:
+        return self.moment
+
+
+def test_pipeline_role_configuration_is_guarded(tmp_path):
+    """三个阶段角色的形态由校验守着：改坏了不会报错，只会安静地跑偏。"""
+    settings = mini.get_config_from_spec(mini.DEFAULT_CONFIG_FILE)
+    base_dir = config.builtin_config_dir
+    raw = config.load_config_file(base_dir / "deepseek.yaml")
+    config.validate_agents(raw, base_dir)
+
+    without_json = json.loads(json.dumps(raw))
+    del without_json["agents"]["chart_reader"]["json_output"]
+    with pytest.raises(ValueError, match="json_output"):
+        config.validate_agents(without_json, base_dir)
+
+    without_trade = json.loads(json.dumps(raw))
+    without_trade["agents"]["execution_manager"]["tools"] = ["miniqmt_account"]
+    with pytest.raises(ValueError, match="miniqmt_trade"):
+        config.validate_agents(without_trade, base_dir)
+
+    missing_role = json.loads(json.dumps(raw))
+    del missing_role["agents"]["candidate_scout"]
+    with pytest.raises(ValueError, match="candidate_scout"):
+        config.validate_agents(missing_role, base_dir)
+
+    # 读图和选池角色不许有工具：它们的输入全部由宿主注入。
+    assert settings["agents"]["chart_reader"]["tools"] == []
+    assert settings["agents"]["candidate_scout"]["tools"] == []
+
+
+def _spawn_sleeper(self, log_path: Path, kind: str, mode: str) -> None:
+    """替掉真实的流水线启动：验证并发拦截和停止只需要一个长命子进程。"""
     self._close_log()
-    self._log = trace.with_suffix(".log").open("w", encoding="utf-8")
+    self._log = log_path.open("w", encoding="utf-8")
     self._process = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(30)"],
         stdin=subprocess.DEVNULL,
@@ -1001,46 +1132,42 @@ def _spawn_sleeper(self, trace: Path, role: str, task: str, mode: str) -> None:
     )
 
 
-def test_runner_runs_one_agent_and_surfaces_its_failure(tmp_path: Path, monkeypatch):
-    directory = tmp_path / "config"
-    shutil.copytree(Path(mini.DEFAULT_CONFIG_FILE).parent, directory)
-    sessions = tmp_path / "sessions"
-    sessions.mkdir()
-    runner = inspect.Runner(sessions, inspect.ConfigStore(directory / "deepseek.yaml"))
+def test_inspect_edits_roles_and_starts_pipeline_runs(tmp_path, monkeypatch):
+    """观测端能改角色配置和 prompt，并就地跑一段流水线；改坏的配置一个字节都不许落盘。"""
+    config_dir = tmp_path / "cfg"
+    shutil.copytree(config.builtin_config_dir, config_dir, ignore=shutil.ignore_patterns("__pycache__"))
+    store = inspect.ConfigStore(config_dir / "deepseek.yaml")
+    payload = store.read()
+    assert set(config.PIPELINE_ROLES) <= set(payload["agents"])
+    assert "miniqmt_trade" in payload["tool_names"] and "agent_call" not in payload["tool_names"]
 
-    assert runner.status() == {"idle": True}
-    with pytest.raises(ValueError, match="没有角色"):
-        runner.start("ghost", "x", "observe")
-    with pytest.raises(ValueError, match="任务不能为空"):
-        runner.start("single_call", "   ", "observe")
-    with pytest.raises(ValueError, match="mode"):
-        runner.start("single_call", "x", "yolo")
+    agents = payload["agents"]
+    agents["chart_reader"]["json_output"] = False
+    with pytest.raises(ValueError, match="json_output"):
+        store.write_agents(agents)
+    # 校验没过就不许落盘：磁盘上的配置还是能跑的那一份。
+    assert config.load_config_file(store.path)["agents"]["chart_reader"]["json_output"] is True
 
-    # 真起一次子进程。DS_KEY 置空后模型构造就会失败，失败原因必须能在日志尾部看到——
-    # 否则前端点了运行没反应，用户完全没有线索。
-    monkeypatch.setenv("DS_KEY", "")
-    started = runner.start("single_call", "说一句你好", "observe")
-    assert started["trace_id"].endswith("-inspect-single_call.json")
-    assert started["running"] is True
-    deadline = time.time() + 60
-    while runner.status()["running"] and time.time() < deadline:
-        time.sleep(0.2)
-    finished = runner.status()
-    assert finished["running"] is False
-    assert finished["returncode"] != 0
-    assert "DS_KEY" in finished["log_tail"]
+    agents["chart_reader"]["json_output"] = True
+    agents["execution_manager"]["step_limit"] = 8
+    assert store.write_agents(agents)["ok"] is True
+    assert config.load_config_file(store.path)["agents"]["execution_manager"]["step_limit"] == 8
 
-    # 同一时刻只允许一个运行：两轮 Agent 会抢 MiniQMT 连接和当日账本。
+    store.write_prompt("chart_reader", "system", "看图并给结论。{{ task }}")
+    assert store.read_prompt("chart_reader", "system")["text"].endswith("{{ task }}")
+    with pytest.raises(ValueError, match="模板语法错误"):
+        store.write_prompt("chart_reader", "system", "{% for %}")
+
+    sessions_dir = tmp_path / ".sessions"
+    sessions_dir.mkdir()
+    runner = inspect.Runner(sessions_dir, store)
     monkeypatch.setattr(inspect.Runner, "_spawn", _spawn_sleeper)
-    runner.start("single_call", "长任务", "observe")
-    with pytest.raises(inspect.Conflict, match="已有运行中"):
-        runner.start("single_call", "又一个", "observe")
+    assert runner.status()["idle"] is True
+    with pytest.raises(ValueError, match="kind"):
+        runner.start("agent", "observe")
+    state = runner.start("round", "observe")
+    assert state["running"] is True and state["kind"] == "round"
+    # 同一时刻只允许一个：两轮会各自按自己的额度下单。
+    with pytest.raises(inspect.Conflict):
+        runner.start("premarket", "observe")
     assert runner.stop()["running"] is False
-    with pytest.raises(ValueError, match="没有运行中"):
-        runner.stop()
-
-    # 服务退出不留孤儿：auto_execute 的交易 Agent 活着就还能继续下单。
-    runner.start("single_call", "再来一个", "observe")
-    process = runner._process
-    runner.shutdown()
-    assert process.poll() is not None

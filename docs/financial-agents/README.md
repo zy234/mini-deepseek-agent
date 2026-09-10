@@ -4,7 +4,7 @@
 
 ## 当前框架边界
 
-- 模型固定为 DeepSeek Chat Completions，默认 `deepseek-v4-flash`。
+- 模型固定为 DeepSeek Chat Completions，默认 `deepseek-flash`（支持图片输入）。
 - Agent 使用一个显式的迭代循环，工具由角色配置选择。
 - 宿主工具是 `bash`、`str_replace_editor`、`web_search`、`web_fetch`。
 - 本地命令和文件编辑由宿主执行；Agent 不持有交易账户、券商连接或密钥。

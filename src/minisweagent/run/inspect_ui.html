@@ -71,6 +71,8 @@ button:disabled { color: var(--dim); cursor: not-allowed; }
 }
 .bar-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--line); }
 .note { color: var(--warn); padding: 6px 12px; }
+.shot { margin: 6px 0 10px; }
+.shot img { width: 100%; max-width: 760px; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
 .ok-note { color: var(--ok); padding: 6px 12px; }
 .day { padding: 4px 12px; color: var(--dim); background: var(--bg); position: sticky; top: 0; }
 .card { padding: 7px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
@@ -164,13 +166,11 @@ const badly = (r) => r.exit_status !== "Submitted" || r.n_errors > 0 || (r.child
 
 // 每个工具的显著参数不同，这是真实差异而不是设计缺陷，所以用表驱动而不是 if 链。
 const BRIEF = {
-  agent_call: (a) => a.role,
   bash: (a) => a.command,
   str_replace_editor: (a) => `${a.command} ${a.path}`,
   web_search: (a) => (a.queries || []).join(" | "),
   web_fetch: (a) => a.url,
   account_journal: (a) => a.operation,
-  account_monitor: (a) => `${a.operation}${a.plans ? ` ${a.plans.length} 条计划` : ""}`,
   miniqmt_account: (a) => a.view,
   miniqmt_trade: (a) => `${a.operation} ${JSON.stringify(a.inputs || {})}`,
 };
@@ -295,6 +295,13 @@ function renderDetail() {
   add("stdout", pretty(s.stdout));
   add("stderr", s.stderr, "err");
   add("退出状态", s.exit_status);
+  // 读图这一步模型看到的就是这些图；不把它们摊开，就只能凭结论猜它看到了什么。
+  if (s.images && s.images.length) {
+    parts.push(`<section><div class="k">模型看到的图（${s.images.length} 张）</div>`
+      + s.images.map((path) => `<div class="shot"><div class="note">${esc(path)}</div>`
+        + `<img loading="lazy" src="/api/image?path=${encodeURIComponent(path)}" alt="${esc(path)}"></div>`).join("")
+      + "</section>");
+  }
   $("#detail").innerHTML = parts.join("");
 }
 async function openSession(id) {
@@ -348,7 +355,7 @@ function renderAgents() {
   const rows = Object.entries(C.agents || {}).map(([name, p]) => `
     <div class="card ${C.role === name ? "on" : ""}" data-role="${esc(name)}">
       <div class="top"><span class="name">${esc(name)}</span><span class="dur">${(p.tools || []).length} 工具</span></div>
-      <div class="meta">${esc(p.flow || "iterative")}${(p.delegates_to || []).length ? ` · 委派 ${p.delegates_to.length}` : ""}${(p.requires || []).length ? ` · 前置 ${esc(p.requires.join("/"))}` : ""}</div>
+      <div class="meta">${esc(p.flow || "iterative")}${p.json_output ? " · JSON 输出" : ""}</div>
     </div>`).join("");
   $("#agents").innerHTML = `<div class="bar-actions">
       <button id="add">+ 新增角色</button>
@@ -368,7 +375,6 @@ function renderForm() {
   const box = $("#agent-form");
   const profile = C.agents && C.role ? C.agents[C.role] : null;
   if (!profile) { box.innerHTML = '<div class="hint">左侧选一个角色开始编辑。</div>'; return; }
-  const others = Object.keys(C.agents).filter((n) => n !== C.role);
   const flow = profile.flow || "iterative";
   const single = flow === "single_shot";
   box.innerHTML = `
@@ -379,10 +385,8 @@ function renderForm() {
       ${single ? '<span class="note">single_shot 不能配置工具</span>' : ""}</div>
     <div class="box"><label>tools（模型可见的工具）</label>
       <div class="checks">${C.tools.map((t) => checkHTML("t", t, (profile.tools || []).includes(t), single)).join("")}</div></div>
-    <div class="box"><label>delegates_to（可以 agent_call 谁；勾了就必须同时勾上 agent_call 工具）</label>
-      <div class="checks">${others.map((n) => checkHTML("d", n, (profile.delegates_to || []).includes(n), false)).join("")}</div></div>
-    <div class="box"><label>requires（本角色被委派前，必须已完成哪些角色）</label>
-      <div class="checks">${others.map((n) => checkHTML("r", n, (profile.requires || []).includes(n), false)).join("")}</div></div>`;
+    <div class="box"><label>json_output（只输出 JSON 对象；宿主要解析它答复的角色必须打开）</label>
+      <div class="checks">${checkHTML("j", "json_output", !!profile.json_output, false)}</div></div>`;
   $("#rm").onclick = removeAgent;
   box.querySelectorAll("input[type=checkbox], #fd").forEach((el) => el.onchange = applyForm);
   $("#ff").onchange = () => { applyForm(); renderForm(); };
@@ -393,13 +397,10 @@ function applyForm() {
   const collect = (g) => [...$("#agent-form").querySelectorAll(`input[data-g="${g}"]:checked`)].map((el) => el.value);
   profile.description = $("#fd").value;
   profile.flow = $("#ff").value;
-  // tools 空数组是有意义的配置（single_call 就是它）；委派字段为空则整键删掉，保持 yaml 干净。
+  // tools 空数组是有意义的配置（读图角色就是它）；json_output 为假则整键删掉，保持 yaml 干净。
   profile.tools = collect("t");
-  for (const key of ["delegates_to", "requires"]) {
-    const values = collect(key === "delegates_to" ? "d" : "r");
-    if (values.length) profile[key] = values;
-    else delete profile[key];
-  }
+  if (collect("j").length) profile.json_output = true;
+  else delete profile.json_output;
   C.dirty = true;
   renderAgents();
 }
@@ -482,17 +483,6 @@ function removeAgent() {
   const gone = C.role;
   if (!window.confirm(`删除角色 ${gone}？它的 prompt 文件会留在磁盘上。`)) return;
   delete C.agents[gone];
-  // 别人对它的引用也一起清掉，否则保存时自检会拦住而你还得自己找原因。
-  for (const profile of Object.values(C.agents)) {
-    for (const key of ["delegates_to", "requires"]) {
-      if (!profile[key]) continue;
-      profile[key] = profile[key].filter((name) => name !== gone);
-      if (!profile[key].length) delete profile[key];
-    }
-    if (!profile.delegates_to && profile.tools) {
-      profile.tools = profile.tools.filter((tool) => tool !== "agent_call");
-    }
-  }
   C.role = null;
   C.dirty = true;
   renderAgents();
@@ -518,12 +508,15 @@ const R = { state: null };
 
 function renderRunbox() {
   $("#runbox").innerHTML = `
-    <label>试跑（角色用左侧选中的那个；改完 prompt 直接跑）</label>
-    <input type="text" id="run-task" placeholder="任务，例如：说一句你好">
+    <label>试跑（改完 prompt 直接跑一段流水线；轨迹会出现在左边的观测页）</label>
     <div class="bar-actions" style="border:0;padding:6px 0">
+      <select id="run-kind">
+        <option value="premarket">盘前选池 · 写出当日待观测清单</option>
+        <option value="round">盘中一轮 · 并行读图 + 汇总执行</option>
+      </select>
       <select id="run-mode">
+        <option value="observe">observe · 只读，不会下单</option>
         <option value="auto_execute">auto_execute · 可真实下单</option>
-        <option value="observe">observe · 只读</option>
         <option value="execute">execute · 逐笔人工审批</option>
       </select>
       <button class="go" id="run-go">运行</button><span id="run-msg"></span>
@@ -537,14 +530,13 @@ function renderRunStatus() {
   const box = $("#run-status");
   if (!s || s.idle) { box.innerHTML = ""; return; }
   const live = s.running;
-  const danger = live && s.mode === "auto_execute";
+  const danger = live && s.mode !== "observe";
   const label = live
-    ? `▶ ${esc(s.role)} 运行中${danger ? " · 可下单" : ` · ${esc(s.mode)}`}`
-    : s.returncode === 0 ? `✓ ${esc(s.role)} 已结束` : `✗ ${esc(s.role)} 退出码 ${s.returncode}`;
+    ? `▶ ${esc(s.kind)} 运行中${danger ? " · 可下单" : ` · ${esc(s.mode)}`}`
+    : s.returncode === 0 ? `✓ ${esc(s.kind)} 已结束` : `✗ ${esc(s.kind)} 退出码 ${s.returncode}`;
   const cls = danger ? "live" : !live && s.returncode !== 0 ? "err-text" : "";
-  box.innerHTML = `<span id="run-jump" class="${cls}" style="cursor:pointer" title="点击查看它的执行路径">${label}</span>`
+  box.innerHTML = `<span class="${cls}">${label}</span>`
     + (live ? ' <button class="kill" id="run-stop">停止</button>' : "");
-  $("#run-jump").onclick = () => { showTab("trace"); openSession(s.trace_id); };
   if (live) $("#run-stop").onclick = stopRun;
 }
 
@@ -560,13 +552,12 @@ async function pollRun() {
 }
 
 async function startRun() {
-  if (!C.role) { $("#run-msg").innerHTML = '<span class="note">先在左侧选一个角色</span>'; return; }
   if (C.dirty) { $("#run-msg").innerHTML = '<span class="note">配置有未保存的改动，先点保存配置</span>'; return; }
   const stale = unsavedPrompt();
   if (stale) { $("#run-msg").innerHTML = `<span class="note">${stale} prompt 还没保存，跑出来的是旧版本</span>`; return; }
   const res = await fetch("/api/run", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ role: C.role, task: $("#run-task").value, mode: $("#run-mode").value }),
+    body: JSON.stringify({ kind: $("#run-kind").value, mode: $("#run-mode").value }),
   });
   const out = await res.json();
   if (!res.ok) { $("#run-msg").innerHTML = `<span class="note">${esc(out.error)}</span>`; return; }

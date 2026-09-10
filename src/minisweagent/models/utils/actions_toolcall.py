@@ -2,7 +2,7 @@
 
 import json
 import time
-from copy import deepcopy
+from typing import Any
 
 from jinja2 import StrictUndefined, Template
 
@@ -101,162 +101,6 @@ WEB_FETCH_TOOL = {
         },
     },
 }
-FINANCIAL_CALC_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "financial_calc",
-        "description": "执行无网络、无账户访问的确定性金融计算。缺少必要数据时返回结构化错误，不补默认财务数字。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "operation": {
-                    "type": "string",
-                    "enum": ["returns", "max_drawdown", "risk_metrics", "dcf", "portfolio_risk"],
-                },
-                "inputs": {
-                    "type": "object",
-                    "description": "计算所需的完整输入；字段随 operation 变化",
-                    "additionalProperties": True,
-                },
-            },
-            "required": ["operation", "inputs"],
-            "additionalProperties": False,
-        },
-    },
-}
-MINIQMT_QUOTES_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "miniqmt_quotes",
-        "description": "通过宿主绑定的 MiniQMT 查询最多 20 只 A 股的实时行情。不能指定服务地址、账户或凭据。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "stock_codes": {
-                    "type": "array",
-                    "items": {"type": "string", "pattern": "^[036][0-9]{5}\\.(SH|SZ)$"},
-                    "minItems": 1,
-                    "maxItems": 20,
-                }
-            },
-            "required": ["stock_codes"],
-            "additionalProperties": False,
-        },
-    },
-}
-MINIQMT_SECTORS_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "miniqmt_sectors",
-        "description": (
-            "查询 MiniQMT 板块：不传 sector_name 返回板块名列表（板块总数上千，必须用 name_filter 关键字过滤，"
-            "返回带 total、matched 和 truncated 说明截断情况），传板块名返回成分股代码。用于确定候选股票池。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sector_name": {"type": "string", "maxLength": 30},
-                "name_filter": {"type": "string", "maxLength": 30},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
-            },
-            "required": [],
-            "additionalProperties": False,
-        },
-    },
-}
-MINIQMT_SCREEN_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "miniqmt_screen",
-        "description": (
-            "对一个板块或指定代码列表批量取实时行情，排序后只返回前 limit 条紧凑行。板块可以到全市场规模"
-            "（沪深A股 5000 余只），自动分批取行情；no_tick_count 和 unquotable_count 表示无行情或停牌被排除的数量。"
-            "sort_by 里 close_position_desc 按收盘价在当日振幅中的位置排序，用来区分收在最高价的强势票和冲高回落；"
-            "涨幅榜只能告诉你今天谁已经涨完了，挑趋势跟随候选必须配合 enrich_trend。"
-            "enrich_trend=true 时额外读日线补确定性趋势字段（limit 最多 20）：ma5/ma10/ma20、ma_stack、ma20_gap_pct、"
-            "vol_ratio（当日量 / 前 5 日均量）、pivot（20 日最高，突破参考）、high_20d_gap_pct、swing_low_10d、"
-            "stop_ref（止损参考）、breakout_entry（可直接用于 account_monitor price_range 的下界和追高上限）"
-            "以及 trend_gate（breakout / pullback / holding / extended / broken / insufficient_data）。"
-            "这些字段是工具算出的事实，只能引用不得重判。"
-            "每行的 lot_cost 是一手（100 股）成本，buyable 表示宿主账户能否买入，买不了的行带 unbuyable 原因；"
-            "顶层 buy_limits 给出单笔买入金额上限、可买最高股价和被禁板块。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sector_name": {"type": "string", "maxLength": 30},
-                "stock_codes": {
-                    "type": "array",
-                    "items": {"type": "string", "pattern": "^[036][0-9]{5}\\.(SH|SZ)$"},
-                    "minItems": 1,
-                    "maxItems": 300,
-                },
-                "sort_by": {
-                    "type": "string",
-                    "enum": ["change_pct_desc", "change_pct_asc", "amount_desc", "close_position_desc"],
-                },
-                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
-                "enrich_trend": {"type": "boolean"},
-            },
-            "required": [],
-            "additionalProperties": False,
-        },
-    },
-}
-MINIQMT_SECTOR_RANK_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "miniqmt_sector_rank",
-        "description": (
-            "按板块聚合当日全市场行情，返回板块热度榜。发现候选的入口就是这里，不是个股涨幅榜——"
-            "涨幅榜前排要么涨停封死买不进，要么一手成本就超过单笔上限。"
-            "family：TGN 是概念题材（短线资金炒的就是概念），THY 是行业，SW1/SW2 是申万一级/二级行业，"
-            "用 TGN 定当日主线、再用 SW2 交叉验证这个主线背后有没有行业级资金。"
-            "每个板块返回成分股数、上涨家数与占比、中位涨幅、总成交额，以及这个账户真正关心的三个字段："
-            "buyable_count（一手成本在单笔上限内且非科创板的家数）、buyable_median_change_pct（只统计可买票的中位涨幅，"
-            "榜单按它排序）和 top_buyable（板块内可买且最强的三只，作为下钻起点）。"
-            "只有龙头在涨、可买小票不动的板块 buyable_median_change_pct 会很低，对这个账户没有意义。"
-            "min_buyable 过滤掉可买家数不足的板块。板块成分股按交易日缓存，当天第一次调用较慢。"
-            "拿到热板块后用 miniqmt_screen 传 sector_name 加 enrich_trend 复查个股结构，只买 trend_gate=breakout 的。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "family": {"type": "string", "enum": ["TGN", "THY", "SW1", "SW2"]},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 30},
-                "min_buyable": {"type": "integer", "minimum": 0, "maximum": 100},
-            },
-            "required": [],
-            "additionalProperties": False,
-        },
-    },
-}
-MINIQMT_HISTORY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "miniqmt_history",
-        "description": (
-            "查询最多 20 只 A 股的历史 K 线（自动先补下载再读本地），返回按日期排序的 open/high/low/close/volume/amount。"
-            "用于动量、相对强弱和量能对比；无数据的代码会列在 empty_codes 里，不会伪装成 0。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "stock_codes": {
-                    "type": "array",
-                    "items": {"type": "string", "pattern": "^[036][0-9]{5}\\.(SH|SZ)$"},
-                    "minItems": 1,
-                    "maxItems": 20,
-                },
-                "period": {"type": "string", "enum": ["1d", "5m", "1m"]},
-                "start_time": {"type": "string", "pattern": "^[0-9]{8}$"},
-                "end_time": {"type": "string", "pattern": "^[0-9]{8}$"},
-            },
-            "required": ["stock_codes", "start_time", "end_time"],
-            "additionalProperties": False,
-        },
-    },
-}
 MINIQMT_ACCOUNT_TOOL = {
     "type": "function",
     "function": {
@@ -337,127 +181,27 @@ ACCOUNT_JOURNAL_TOOL = {
         },
     },
 }
-ACCOUNT_MONITOR_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "account_monitor",
-        "description": (
-            "读取或全量替换宿主持久化的股票行情监控计划。只保存显式触发条件，不会自行下单；清空必须显式提交空 plans 数组。"
-            "SELL 用 price_lte（破位止损）、price_gte（止盈）或 immediate（时间止损到期，无条件在第一次轮询触发，不接受 value）。"
-            "BUY 只能用 price_range：value 是区间下界，upper 是区间上界，只有价格落在 [value, upper] 内才触发，"
-            "order 只给 volume——限价由交易工具在提交那一刻按最新价推导，upper 就是追高上限，写 order.price 会被拒。"
-            "突破腿把区间挂在现价上方（下界取 pivot，上界取追高天花板，"
-            "可直接用 miniqmt_screen 的 breakout_entry），回踩腿把区间挂在现价下方（下界是不能破的结构位）。"
-            "单点买入触发已被禁止：它的真实语义是越跌越买，跳空砸穿也会成交。"
-            "换仓请在 BUY 计划里写 rotate_from=卖出股票代码，同批必须存在该股票的 SELL 计划，否则整批被拒。"
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "operation": {"type": "string", "enum": ["read", "replace"]},
-                "plans": {
-                    "type": "array",
-                    "minItems": 0,
-                    "maxItems": 20,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "plan_id": {"type": "string"},
-                            "stock_code": {"type": "string", "pattern": "^[036][0-9]{5}\\.(SH|SZ)$"},
-                            "side": {"type": "string", "enum": ["BUY", "SELL"]},
-                            "trigger": {
-                                "type": "object",
-                                "properties": {
-                                    "type": {
-                                        "type": "string",
-                                        "enum": ["price_lte", "price_gte", "immediate", "price_range"],
-                                    },
-                                    "value": {"type": "number"},
-                                    "upper": {"type": "number"},
-                                    "baseline": {"type": "number"},
-                                },
-                                "required": ["type"],
-                                "additionalProperties": False,
-                            },
-                            "order": {"type": "object", "additionalProperties": True},
-                            "rotate_from": {"type": "string", "pattern": "^[036][0-9]{5}\\.(SH|SZ)$"},
-                            "note": {"type": "string"},
-                        },
-                        "required": ["plan_id", "stock_code", "side", "trigger"],
-                        "additionalProperties": False,
-                    },
-                },
-            },
-            "required": ["operation"],
-            "additionalProperties": False,
-        },
-    },
-}
-AGENT_CALL_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "agent_call",
-        "description": "调用一个固定的金融子 Agent 获取研究、账户组合分析或受控交易结果。子 Agent 使用独立上下文，不能继续委派其他 Agent。",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "role": {
-                    "type": "string",
-                    "description": "可委派的子 Agent 角色；具体取值由宿主按配置的 delegates_to 注入",
-                },
-                "task": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 12000,
-                    "description": "交给子 Agent 的明确任务；不要包含凭据或账户标识",
-                },
-            },
-            "required": ["role", "task"],
-            "additionalProperties": False,
-        },
-    },
-}
-
 TOOL_DEFINITIONS = [
     BASH_TOOL,
     EDITOR_TOOL,
     WEB_SEARCH_TOOL,
     WEB_FETCH_TOOL,
-    FINANCIAL_CALC_TOOL,
-    MINIQMT_QUOTES_TOOL,
-    MINIQMT_SECTORS_TOOL,
-    MINIQMT_SCREEN_TOOL,
-    MINIQMT_SECTOR_RANK_TOOL,
-    MINIQMT_HISTORY_TOOL,
     MINIQMT_ACCOUNT_TOOL,
     MINIQMT_TRADE_TOOL,
     ACCOUNT_JOURNAL_TOOL,
-    ACCOUNT_MONITOR_TOOL,
-    AGENT_CALL_TOOL,
 ]
 TOOL_DEFINITIONS_BY_NAME = {tool["function"]["name"]: tool for tool in TOOL_DEFINITIONS}
 DEFAULT_TOOL_NAMES = ["bash", "str_replace_editor", "web_search", "web_fetch"]
 
 
-def get_tool_definitions(names: list[str] | None, delegate_roles: list[str] | None = None) -> list[dict]:
+def get_tool_definitions(names: list[str] | None) -> list[dict]:
     """按角色配置缩小工具集合；未配置时只保留通用基础工具。"""
     if names is None:
         names = DEFAULT_TOOL_NAMES
     unknown = set(names) - set(TOOL_DEFINITIONS_BY_NAME)
     if unknown:
         raise ValueError(f"未知工具：{', '.join(sorted(unknown))}")
-    definitions = []
-    for name in names:
-        if name != "agent_call":
-            definitions.append(TOOL_DEFINITIONS_BY_NAME[name])
-            continue
-        if not delegate_roles:
-            raise ValueError("配置了 agent_call 工具却没有声明 delegates_to，无法确定可委派的子 Agent")
-        # role 枚举现场按配置生成：模型看到的角色清单和宿主的准入校验必须是同一份。
-        tool = deepcopy(TOOL_DEFINITIONS_BY_NAME[name])
-        tool["function"]["parameters"]["properties"]["role"]["enum"] = list(delegate_roles)
-        definitions.append(tool)
-    return definitions
+    return [TOOL_DEFINITIONS_BY_NAME[name] for name in names]
 
 
 def parse_toolcall_actions(
@@ -466,7 +210,6 @@ def parse_toolcall_actions(
     format_error_template: str,
     template_kwargs: dict | None = None,
     allowed_tools: set[str] | None = None,
-    delegate_roles: list[str] | None = None,
 ) -> list[dict]:
     """Parse tool calls from the response. Raises FormatError if unknown tool or invalid args.
 
@@ -476,194 +219,62 @@ def parse_toolcall_actions(
     """
     template_kwargs = template_kwargs or {}
     if not tool_calls:
-        raise FormatError(
-            {
-                "role": "user",
-                "content": Template(format_error_template, undefined=StrictUndefined).render(
-                    error="响应中没有可执行的工具调用。",
-                    actions=[],
-                    has_tool_calls=False,
-                    **template_kwargs,
-                ),
-                "extra": {"interrupt_type": "FormatError"},
-            }
-        )
+        raise _format_error(format_error_template, "响应中没有可执行的工具调用。", False, template_kwargs)
     actions = []
     for tool_call in tool_calls:
-        error_msg = ""
-        args = {}
+        name = tool_call.function.name
+        spec = TOOL_SPECS.get(name)
+        error = ""
+        args: Any = {}
         try:
             args = json.loads(tool_call.function.arguments)
-        except Exception as e:
-            error_msg = f"无法解析工具参数：{e}。"
-        tool_name = tool_call.function.name
-        if tool_name not in TOOL_DEFINITIONS_BY_NAME:
-            error_msg += f"未知工具：{tool_name}。"
-        elif allowed_tools is not None and tool_name not in allowed_tools:
-            error_msg += f"当前 Agent 不允许使用工具：{tool_name}。"
+        except ValueError as exc:
+            error = f"无法解析工具参数：{exc}。"
+        if spec is None:
+            error += f"未知工具：{name}。"
+        elif allowed_tools is not None and name not in allowed_tools:
+            error += f"当前 Agent 不允许使用工具：{name}。"
         if not isinstance(args, dict):
-            error_msg += f"{tool_name} 工具参数必须是对象。"
-        elif tool_name == "bash":
-            if "command" not in args or not isinstance(args["command"], str) or not args["command"].strip():
-                error_msg += "bash 工具的 command 必须是非空字符串。"
-        elif tool_name == "str_replace_editor":
-            error_msg += _validate_editor_args(args)
-        elif tool_name == "web_search":
-            error_msg += _validate_web_search_args(args)
-        elif tool_name == "web_fetch":
-            error_msg += _validate_web_fetch_args(args)
-        elif tool_name == "financial_calc":
-            error_msg += _validate_financial_calc_args(args)
-        elif tool_name == "miniqmt_quotes":
-            error_msg += _validate_miniqmt_quotes_args(args)
-        elif tool_name == "miniqmt_screen":
-            error_msg += _validate_miniqmt_screen_args(args)
-        elif tool_name == "miniqmt_history":
-            error_msg += _validate_miniqmt_history_args(args)
-        elif tool_name == "miniqmt_account":
-            error_msg += _validate_miniqmt_account_args(args)
-        elif tool_name == "miniqmt_trade":
-            error_msg += _validate_miniqmt_trade_args(args)
-        elif tool_name == "account_journal":
-            error_msg += _validate_account_journal_args(args)
-        elif tool_name == "account_monitor":
-            error_msg += _validate_account_monitor_args(args)
-        elif tool_name == "agent_call":
-            error_msg += _validate_agent_call_args(args, delegate_roles or [])
-        if isinstance(args, dict):
-            if tool_name == "bash":
-                allowed = {"command", "workdir", "timeout", "description"}
-            elif tool_name == "web_search":
-                allowed = {"queries"}
-            elif tool_name == "web_fetch":
-                allowed = {"url"}
-            elif tool_name == "financial_calc":
-                allowed = {"operation", "inputs"}
-            elif tool_name == "miniqmt_quotes":
-                allowed = {"stock_codes"}
-            elif tool_name == "miniqmt_sectors":
-                allowed = {"sector_name", "name_filter", "limit"}
-            elif tool_name == "miniqmt_screen":
-                allowed = {"sector_name", "stock_codes", "sort_by", "limit", "enrich_trend"}
-            elif tool_name == "miniqmt_sector_rank":
-                allowed = {"family", "limit", "min_buyable"}
-            elif tool_name == "miniqmt_history":
-                allowed = {"stock_codes", "period", "start_time", "end_time"}
-            elif tool_name == "miniqmt_account":
-                allowed = {"view"}
-            elif tool_name == "miniqmt_trade":
-                allowed = {"operation", "inputs"}
-            elif tool_name == "account_journal":
-                allowed = {"operation", "record"}
-            elif tool_name == "account_monitor":
-                allowed = {"operation", "plans"}
-            elif tool_name == "agent_call":
-                allowed = {"role", "task"}
-            else:
-                allowed = {
-                    "command",
-                    "path",
-                    "file_text",
-                    "old_str",
-                    "new_str",
-                    "insert_line",
-                    "view_range",
-                    "expected_hash",
-                }
-            unknown_keys = set(args) - allowed
+            error += f"{name} 工具参数必须是对象。"
+        elif spec is not None:
+            unknown_keys = set(args) - spec["keys"]
             if unknown_keys:
-                error_msg += f"{tool_name} 工具包含未知参数：{', '.join(sorted(unknown_keys))}。"
-            if tool_name == "bash" and "workdir" in args and not isinstance(args["workdir"], str):
-                error_msg += "bash 工具的 workdir 必须是字符串。"
-            timeout = args.get("timeout") if tool_name == "bash" else None
-            if timeout is not None and (
-                isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0
-            ):
-                error_msg += "bash 工具的 timeout 必须是正数。"
-            if tool_name == "bash" and "description" in args and not isinstance(args["description"], str):
-                error_msg += "bash 工具的 description 必须是字符串。"
-        if error_msg:
-            raise FormatError(
-                {
-                    "role": "user",
-                    "content": Template(format_error_template, undefined=StrictUndefined).render(
-                        actions=[], error=error_msg.strip(), has_tool_calls=True, **template_kwargs
-                    ),
-                    "extra": {"interrupt_type": "FormatError"},
-                }
-            )
-        action = {"tool": tool_name, "tool_call_id": tool_call.id}
-        if tool_name == "web_search":
-            action["queries"] = args["queries"]
-            actions.append(action)
-            continue
-        if tool_name == "web_fetch":
-            action["url"] = args["url"]
-            actions.append(action)
-            continue
-        if tool_name == "financial_calc":
-            action["operation"] = args["operation"]
-            action["inputs"] = args["inputs"]
-            actions.append(action)
-            continue
-        if tool_name == "miniqmt_quotes":
-            action["stock_codes"] = args["stock_codes"]
-            actions.append(action)
-            continue
-        if tool_name == "miniqmt_account":
-            action["view"] = args["view"]
-            actions.append(action)
-            continue
-        if tool_name == "miniqmt_trade":
-            action["operation"] = args["operation"]
-            action["inputs"] = args["inputs"]
-            actions.append(action)
-            continue
-        if tool_name == "account_journal":
-            action["operation"] = args["operation"]
-            if "record" in args:
-                action["record"] = args["record"]
-            actions.append(action)
-            continue
-        if tool_name == "account_monitor":
-            action["operation"] = args["operation"]
-            if "plans" in args:
-                action["plans"] = args["plans"]
-            actions.append(action)
-            continue
-        if tool_name == "agent_call":
-            action["role"] = args["role"]
-            action["task"] = args["task"]
-            actions.append(action)
-            continue
-        if tool_name in {"miniqmt_sectors", "miniqmt_screen", "miniqmt_sector_rank", "miniqmt_history"}:
-            # 这几个行情发现工具没有必填的 command，参数按 schema 原样透传给宿主。
-            for key in (
-                "sector_name",
-                "name_filter",
-                "stock_codes",
-                "sort_by",
-                "limit",
-                "enrich_trend",
-                "family",
-                "min_buyable",
-                "period",
-                "start_time",
-                "end_time",
-            ):
-                if key in args:
-                    action[key] = args[key]
-            actions.append(action)
-            continue
-        action["command"] = args["command"]
-        keys = ("workdir", "timeout", "description") if tool_name == "bash" else (
-            "path", "file_text", "old_str", "new_str", "insert_line", "view_range", "expected_hash"
+                error += f"{name} 工具包含未知参数：{', '.join(sorted(unknown_keys))}。"
+            error += spec["validate"](args)
+        if error:
+            raise _format_error(format_error_template, error.strip(), True, template_kwargs)
+        # 参数按每个工具声明的键原样透传：宿主自己会再校验一次业务约束，
+        # 这里逐工具重写一遍 action 只会让两处约束慢慢漂移。
+        actions.append(
+            {"tool": name, "tool_call_id": tool_call.id, **{key: args[key] for key in spec["keys"] & set(args)}}
         )
-        for key in keys:
-            if key in args:
-                action[key] = args[key]
-        actions.append(action)
     return actions
+
+
+def _format_error(template: str, error: str, has_tool_calls: bool, template_kwargs: dict) -> FormatError:
+    return FormatError(
+        {
+            "role": "user",
+            "content": Template(template, undefined=StrictUndefined).render(
+                error=error, actions=[], has_tool_calls=has_tool_calls, **template_kwargs
+            ),
+            "extra": {"interrupt_type": "FormatError"},
+        }
+    )
+
+
+def _validate_bash_args(args: dict) -> str:
+    command = args.get("command")
+    if not isinstance(command, str) or not command.strip():
+        return "bash 工具的 command 必须是非空字符串。"
+    if "workdir" in args and not isinstance(args["workdir"], str):
+        return "bash 工具的 workdir 必须是字符串。"
+    if "description" in args and not isinstance(args["description"], str):
+        return "bash 工具的 description 必须是字符串。"
+    timeout = args.get("timeout")
+    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0):
+        return "bash 工具的 timeout 必须是正数。"
+    return ""
 
 
 def _validate_editor_args(args: dict) -> str:
@@ -703,79 +314,8 @@ def _validate_web_search_args(args: dict) -> str:
 
 
 def _validate_web_fetch_args(args: dict) -> str:
-    url = args.get("url")
-    if not isinstance(url, str) or not url.strip():
+    if not isinstance(args.get("url"), str) or not args["url"].strip():
         return "web_fetch 的 url 必须是非空字符串。"
-    return ""
-
-
-def _validate_agent_call_args(args: dict, delegate_roles: list[str]) -> str:
-    role = args.get("role")
-    if role not in delegate_roles:
-        allowed = ", ".join(delegate_roles) or "无"
-        return f"agent_call 的 role 必须是配置允许的子 Agent：{allowed}。"
-    task = args.get("task")
-    if not isinstance(task, str) or not task.strip():
-        return "agent_call 的 task 必须是非空字符串。"
-    if len(task) > 12000:
-        return "agent_call 的 task 不能超过 12000 个字符。"
-    return ""
-
-
-def _validate_financial_calc_args(args: dict) -> str:
-    operation = args.get("operation")
-    if operation not in {"returns", "max_drawdown", "risk_metrics", "dcf", "portfolio_risk"}:
-        return "financial_calc 的 operation 不受支持。"
-    if not isinstance(args.get("inputs"), dict):
-        return "financial_calc 的 inputs 必须是对象。"
-    return ""
-
-
-def _validate_miniqmt_quotes_args(args: dict) -> str:
-    stock_codes = args.get("stock_codes")
-    if not isinstance(stock_codes, list) or not 1 <= len(stock_codes) <= 20:
-        return "miniqmt_quotes 的 stock_codes 必须包含 1 到 20 项。"
-    if any(not isinstance(code, str) or not code.strip() for code in stock_codes):
-        return "miniqmt_quotes 的股票代码必须是非空字符串。"
-    return ""
-
-
-def _validate_miniqmt_screen_args(args: dict) -> str:
-    sector_name = args.get("sector_name")
-    stock_codes = args.get("stock_codes")
-    if bool(isinstance(sector_name, str) and sector_name.strip()) == bool(isinstance(stock_codes, list) and stock_codes):
-        return "miniqmt_screen 必须且只能提供 sector_name 或 stock_codes 之一。"
-    if isinstance(stock_codes, list) and not 1 <= len(stock_codes) <= 300:
-        return "miniqmt_screen 的 stock_codes 最多 300 项。"
-    if "sort_by" in args and args["sort_by"] not in {
-        "change_pct_desc",
-        "change_pct_asc",
-        "amount_desc",
-        "close_position_desc",
-    }:
-        return "miniqmt_screen 的 sort_by 不受支持。"
-    limit = args.get("limit", 20)
-    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
-        return "miniqmt_screen 的 limit 必须是 1 到 50 的整数。"
-    if args.get("enrich_trend") and limit > 20:
-        return "miniqmt_screen 带 enrich_trend 时 limit 最多 20（趋势字段需要逐只读日线）。"
-    return ""
-
-
-def _validate_miniqmt_history_args(args: dict) -> str:
-    stock_codes = args.get("stock_codes")
-    if not isinstance(stock_codes, list) or not 1 <= len(stock_codes) <= 20:
-        return "miniqmt_history 的 stock_codes 必须包含 1 到 20 项。"
-    if any(not isinstance(code, str) or not code.strip() for code in stock_codes):
-        return "miniqmt_history 的股票代码必须是非空字符串。"
-    for name in ("start_time", "end_time"):
-        value = args.get(name)
-        if not isinstance(value, str) or len(value) != 8 or not value.isdigit():
-            return f"miniqmt_history 的 {name} 必须是 YYYYMMDD。"
-    if args["start_time"] > args["end_time"]:
-        return "miniqmt_history 的 start_time 不能晚于 end_time。"
-    if "period" in args and args["period"] not in {"1d", "5m", "1m"}:
-        return "miniqmt_history 的 period 只能是 1d、5m 或 1m。"
     return ""
 
 
@@ -804,15 +344,22 @@ def _validate_account_journal_args(args: dict) -> str:
     return ""
 
 
-def _validate_account_monitor_args(args: dict) -> str:
-    operation = args.get("operation")
-    if operation not in {"read", "replace"}:
-        return "account_monitor 的 operation 必须是 read 或 replace。"
-    if operation == "replace" and not isinstance(args.get("plans"), list):
-        return "account_monitor replace 必须包含 plans 数组，清空时提交空数组。"
-    if operation != "replace" and "plans" in args:
-        return f"account_monitor {operation} 不能包含 plans。"
-    return ""
+# 每个工具一行：模型能传哪些键、怎么校验。新增工具只在这里加一行，不用再改解析流程。
+TOOL_SPECS: dict[str, dict[str, Any]] = {
+    "bash": {"keys": {"command", "workdir", "timeout", "description"}, "validate": _validate_bash_args},
+    "str_replace_editor": {
+        "keys": {"command", "path", "file_text", "old_str", "new_str", "insert_line", "view_range", "expected_hash"},
+        "validate": _validate_editor_args,
+    },
+    "web_search": {"keys": {"queries"}, "validate": _validate_web_search_args},
+    "web_fetch": {"keys": {"url"}, "validate": _validate_web_fetch_args},
+    "miniqmt_account": {"keys": {"view"}, "validate": _validate_miniqmt_account_args},
+    "miniqmt_trade": {"keys": {"operation", "inputs"}, "validate": _validate_miniqmt_trade_args},
+    "account_journal": {"keys": {"operation", "record"}, "validate": _validate_account_journal_args},
+}
+if set(TOOL_SPECS) != set(TOOL_DEFINITIONS_BY_NAME):
+    # 模型看到的工具和宿主能解析的工具必须完全一致，缺一边都是启动即错的配置故障。
+    raise RuntimeError(f"工具定义与解析规则不一致：{set(TOOL_DEFINITIONS_BY_NAME) ^ set(TOOL_SPECS)}")
 
 
 def format_toolcall_observation_messages(

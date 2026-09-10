@@ -3,7 +3,6 @@
 from minisweagent import Environment
 
 from .local import LocalEnvironment
-from .market_monitor import MarketMonitor
 
 
 def get_environment(config: dict | None = None) -> Environment:
@@ -11,4 +10,4 @@ def get_environment(config: dict | None = None) -> Environment:
     return LocalEnvironment(**(config or {}))
 
 
-__all__ = ["LocalEnvironment", "MarketMonitor", "get_environment"]
+__all__ = ["LocalEnvironment", "get_environment"]

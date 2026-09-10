@@ -13,66 +13,47 @@ agents:
       - web_fetch
     system_template_path: prompts/interactive.system.md
     instance_template_path: prompts/interactive.instance.md
-  single_call:
-    description: 不调用工具、每轮只进行一次模型请求的 Agent
+  candidate_scout:
+    description: 盘前从注入的板块热度与个股结构里选出当日待观测清单
     flow: single_shot
+    json_output: true
     tools: []
-    system_template_path: prompts/single_call.system.md
-    instance_template_path: prompts/single_call.instance.md
-  financial_research:
-    description: 先判断市场情绪方向再对照持仓、按需取证的金融研究 Agent
+    system_template_path: prompts/candidate_scout.system.md
+    instance_template_path: prompts/candidate_scout.instance.md
+  chart_reader:
+    description: 看日线图与分钟图，对一组标的直接给出买卖结论
+    flow: single_shot
+    json_output: true
+    tools: []
+    system_template_path: prompts/chart_reader.system.md
+    instance_template_path: prompts/chart_reader.instance.md
+  execution_manager:
+    description: 汇总读图结论、账户与限额并执行交易的唯一角色
     flow: iterative
+    step_limit: 12
+    wall_time_limit_seconds: 480
     tools:
-      - miniqmt_quotes
-      - miniqmt_sectors
-      - miniqmt_sector_rank
-      - miniqmt_screen
-      - miniqmt_history
-      - financial_calc
-      - web_search
-      - web_fetch
-    system_template_path: prompts/financial_research.system.md
-    instance_template_path: prompts/financial_research.instance.md
-  portfolio_manager:
-    description: 根据账户和研究候选制定取舍方案的只读组合经理
-    flow: iterative
-    requires:
-      - financial_research
-    tools:
-      - miniqmt_quotes
-      - miniqmt_history
-      - miniqmt_account
-      - financial_calc
-      - web_search
-      - web_fetch
-    system_template_path: prompts/portfolio_manager.system.md
-    instance_template_path: prompts/portfolio_manager.instance.md
-  account_trader:
-    description: 对组合方案做交易风控判断并按宿主规则执行 MiniQMT 交易 Agent
-    flow: iterative
-    requires:
-      - portfolio_manager
-    tools:
-      - miniqmt_quotes
-      - miniqmt_account
       - miniqmt_trade
-    system_template_path: prompts/account_trader.system.md
-    instance_template_path: prompts/account_trader.instance.md
-  financial_manager:
-    description: 每日基于前一收盘统筹研究、组合取舍和交易风控的账户经理
-    flow: iterative
-    delegates_to:
-      - financial_research
-      - portfolio_manager
-      - account_trader
-    tools:
-      - agent_call
+      - miniqmt_account
       - account_journal
-      - account_monitor
-    system_template_path: prompts/financial_manager.system.md
-    instance_template_path: prompts/financial_manager.instance.md
+    system_template_path: prompts/execution_manager.system.md
+    instance_template_path: prompts/execution_manager.instance.md
+trading:
+  premarket_at: '09:20'
+  round_interval_minutes: 10
+  sector_count: 5
+  picks_per_sector: 2
+  sectors_scanned: 8
+  rows_per_sector: 8
+  index_codes:
+    - 000001.SH
+    - 399006.SZ
+  daily_chart_days: 30
+  max_parallel_groups: 6
+  round_json_attempts: 2
 environment:
-  timeout: 30
+  timeout: 60
+  miniqmt_mode: observe
   web_search_engines:
     - bing_rss
     - baidu_html
@@ -86,5 +67,5 @@ environment:
 model:
   temperature: 0
   thinking: true
-  api_timeout_seconds: 60
+  api_timeout_seconds: 120
   stream_output: true

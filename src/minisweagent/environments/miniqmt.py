@@ -29,7 +29,6 @@ LOT_SIZE = 100
 QUOTE_BATCH_SIZE = 1000
 SCREEN_UNIVERSE_LIMIT = 6000
 HISTORY_CODE_LIMIT = 20
-HISTORY_BAR_LIMIT = 60
 HISTORY_PERIODS = ("1d", "5m", "1m")
 # 排序键与是否倒序。close_position 是"收在当日振幅哪个位置"，收盘贴最高价才是强势；
 # 只靠涨幅榜挑趋势票等于用体温计测血压，涨幅榜给的永远是今天已经涨完的。
@@ -383,7 +382,10 @@ class MiniQMTClient:
     def history(
         self, stock_codes: list[str], *, period: str = "1d", start_time: str = "", end_time: str = ""
     ) -> dict[str, Any]:
-        """先按范围补下载再读本地 K 线；xtdata 不下载就只返回空表，静默的空数据比报错更危险。"""
+        """先按范围补下载再读本地 K 线；xtdata 不下载就只返回空表，静默的空数据比报错更危险。
+
+        不截断 bar 数量：这些 K 线现在只用来在宿主侧渲染图，截断会让分钟图只剩最后一小时。
+        """
         if not 1 <= len(stock_codes) <= HISTORY_CODE_LIMIT:
             return _error("invalid_argument", f"stock_codes 必须包含 1 到 {HISTORY_CODE_LIMIT} 项")
         try:
@@ -410,11 +412,14 @@ class MiniQMTClient:
                 "period": period,
                 "start_time": start_time,
                 "end_time": end_time,
-                "bars": {code: rows[-HISTORY_BAR_LIMIT:] for code, rows in bars.items() if rows},
+                "bars": {code: rows for code, rows in bars.items() if rows},
                 "empty_codes": empty,
             },
         )
 
+    def download_sectors(self) -> dict[str, Any]:
+        """板块数据必须先下载才读得到；没下载时接口返回 200 但成分股是空数组。"""
+        return self._request("POST", "/api/v1/market/sectors/download")
 
     def account(self, view: str) -> dict[str, Any]:
         account_id = os.getenv("MINIQMT_ACCOUNT_ID", "").strip()
@@ -816,6 +821,32 @@ class MiniQMTClient:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return _error("parse_error", "MiniQMT 返回的不是有效 UTF-8 JSON")
         return _success(operation=path, data=_redact(data))
+
+
+def host_limits() -> dict[str, Any]:
+    """宿主的交易硬限额，一份定义两个用途：交易工具照它拦单，prompt 照它注入。
+
+    两处各读一遍环境变量必然会漂移，模型就会按一套限额做计划、撞上另一套被拒。
+    """
+    return {
+        "lot_size": LOT_SIZE,
+        "max_buy_notional": _positive_float_env("MINIQMT_MAX_BUY_NOTIONAL", 20_000.0),
+        "max_buyable_price": round(_positive_float_env("MINIQMT_MAX_BUY_NOTIONAL", 20_000.0) / LOT_SIZE, 2),
+        "max_daily_buy_notional": _positive_float_env("MINIQMT_MAX_DAILY_BUY_NOTIONAL", 50_000.0),
+        "max_orders_per_cycle": _positive_int_env("MINIQMT_MAX_ORDERS_PER_CYCLE", 2),
+        "max_orders_per_day": _positive_int_env("MINIQMT_MAX_ORDERS_PER_DAY", 8),
+        "max_buy_volume": _positive_int_env(
+            "MINIQMT_MAX_BUY_VOLUME", _positive_int_env("MINIQMT_MAX_ORDER_VOLUME", 10_000)
+        ),
+        "max_sell_volume": _positive_int_env(
+            "MINIQMT_MAX_SELL_VOLUME", _positive_int_env("MINIQMT_MAX_ORDER_VOLUME", 10_000)
+        ),
+        "min_cash_ratio": _ratio_env("MINIQMT_MIN_CASH_RATIO", 0.10),
+        "max_price_deviation_bps": _positive_float_env("MINIQMT_MAX_PRICE_DEVIATION_BPS", 50.0),
+        "kill_switch": _truthy_env("MINIQMT_KILL_SWITCH"),
+        "blocked_boards": "科创板 688/689 无交易权限，禁止买入",
+        "min_buy_price": round(TICK_SIZE / (_positive_float_env("MINIQMT_MAX_PRICE_DEVIATION_BPS", 50.0) * LIMIT_PREMIUM_RATIO / 10_000), 2),
+    }
 
 
 def _order_payload(inputs: dict[str, Any], account_id: str) -> dict[str, Any] | str:

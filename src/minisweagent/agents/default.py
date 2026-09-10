@@ -49,10 +49,8 @@ class AgentConfig(BaseModel):
     """角色使用的执行流程。"""
     tools: list[str] | None = None
     """模型可见的工具；None 表示通用基础工具。"""
-    delegates_to: list[str] = []
-    """本角色可以 agent_call 的子角色；空表示不能委派。模型看到的 role 枚举就是这一份。"""
-    requires: list[str] = []
-    """作为子角色被委派前，必须已成功完成的前置角色；由父环境校验。"""
+    json_output: bool = False
+    """要求模型只输出 JSON 对象；宿主要解析答复的角色必须打开它。"""
 
 
 class DefaultAgent:
@@ -104,14 +102,22 @@ class DefaultAgent:
             )
         )
 
-    def run(self, task: str = "", **kwargs) -> dict:
-        """Run step() until agent is finished. Returns dictionary with exit_status, submission keys."""
+    def run(self, task: str = "", *, images: list[str] | None = None, **kwargs) -> dict:
+        """Run step() until agent is finished. Returns dictionary with exit_status, submission keys.
+
+        ``images`` 是宿主渲染好的图片路径，挂在第一条 user 消息上：轨迹里只留路径，
+        发请求时才读成 base64。
+        """
         self.extra_template_vars |= {"task": task, **kwargs}
         self.messages = []
         self._start_turn()
         self.add_messages(
             self.model.format_message(role="system", content=self._render_template(self.config.system_template)),
-            self.model.format_message(role="user", content=self._render_template(self.config.instance_template)),
+            self.model.format_message(
+                role="user",
+                content=self._render_template(self.config.instance_template),
+                extra={"images": list(images)} if images else None,
+            ),
         )
         return self._run_until_exit()
 
@@ -187,8 +193,8 @@ class DefaultAgent:
         kwargs: dict = {}
         if self.config.tools is not None:
             kwargs["tools"] = self.config.tools
-        if self.config.delegates_to:
-            kwargs["delegate_roles"] = self.config.delegates_to
+        if self.config.json_output:
+            kwargs["json_output"] = True
         message = self.model.query(self.messages, **kwargs)
         self.add_messages(message)
         return message
