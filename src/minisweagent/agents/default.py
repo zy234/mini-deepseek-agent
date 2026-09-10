@@ -40,10 +40,19 @@ class AgentConfig(BaseModel):
     """Current directory from which the CLI session was started."""
     agent_name: str = "default"
     """本次运行选择的角色名称。"""
+    cycle_kind: str = ""
+    """调度来源：premarket/midday/intraday_scan/close_review/auto_cycle/monitor_trigger/manual。
+    宿主知道自己为什么启动这一轮，不写下来的话观测端只能去 grep 任务文本猜。"""
+    parent_session_id: str = ""
+    """父会话 id；子 Agent 由宿主注入，用来还原调度树而不依赖文件名规则。"""
     flow: Literal["iterative", "single_shot"] = "iterative"
     """角色使用的执行流程。"""
     tools: list[str] | None = None
     """模型可见的工具；None 表示通用基础工具。"""
+    delegates_to: list[str] = []
+    """本角色可以 agent_call 的子角色；空表示不能委派。模型看到的 role 枚举就是这一份。"""
+    requires: list[str] = []
+    """作为子角色被委派前，必须已成功完成的前置角色；由父环境校验。"""
 
 
 class DefaultAgent:
@@ -175,7 +184,11 @@ class DefaultAgent:
             )
         self.n_calls += 1
         self._turn_calls += 1
-        kwargs = {"tools": self.config.tools} if self.config.tools is not None else {}
+        kwargs: dict = {}
+        if self.config.tools is not None:
+            kwargs["tools"] = self.config.tools
+        if self.config.delegates_to:
+            kwargs["delegate_roles"] = self.config.delegates_to
         message = self.model.query(self.messages, **kwargs)
         self.add_messages(message)
         return message
@@ -194,6 +207,8 @@ class DefaultAgent:
             )
         outputs = []
         for action in actions:
+            # 一批工具调用的观测消息是统一生成的，共用一个 timestamp；批内谁慢只能靠逐个工具的起止时间分辨。
+            started_at = time.time()
             try:
                 output = self.env.execute(action)
             except InterruptAgentFlow as error:
@@ -216,12 +231,16 @@ class DefaultAgent:
                         "operation": None,
                         "content_hash": None,
                         "exception_info": error.messages[-1].get("content", ""),
+                        "started_at": started_at,
+                        "ended_at": time.time(),
                     }
                 )
                 self.add_messages(
                     *self.model.format_observation_messages(message, outputs, self.get_template_vars())
                 )
                 raise
+            output["started_at"] = started_at
+            output["ended_at"] = time.time()
             outputs.append(output)
             self._print_tool_result(output)
         return self.add_messages(*self.model.format_observation_messages(message, outputs, self.get_template_vars()))
@@ -256,6 +275,8 @@ class DefaultAgent:
                     "id": self.config.session_id,
                     "started_at": self.config.session_started_at,
                     "cwd": self.config.session_cwd,
+                    "parent": self.config.parent_session_id,
+                    "kind": self.config.cycle_kind,
                 },
                 "mini_version": __version__,
                 "exit_status": last_extra.get("exit_status", ""),
@@ -273,5 +294,8 @@ class DefaultAgent:
         data = self.serialize(*extra_dicts)
         if path:
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            # 观测端会边跑边读轨迹；直接覆盖写会让它读到半截 JSON，所以先写临时文件再原子替换。
+            tmp = path.with_name(f".{path.name}.tmp")
+            tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(path)
         return data

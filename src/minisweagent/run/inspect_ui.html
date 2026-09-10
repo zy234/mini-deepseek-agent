@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>mini-inspect · 轨迹观测</title>
+<style>
+:root {
+  --bg: #14161a; --panel: #1b1e24; --line: #2b3038; --fg: #d7dbe0; --dim: #7d858f;
+  --accent: #6ea8fe; --ok: #4ec9a0; --err: #f07178; --warn: #e5c07b; --child: #c678dd;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; height: 100vh; display: flex; flex-direction: column;
+  background: var(--bg); color: var(--fg);
+  font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+header {
+  display: flex; align-items: center; gap: 14px; padding: 8px 12px;
+  border-bottom: 1px solid var(--line); background: var(--panel); flex: none;
+}
+header b { color: var(--accent); font-weight: 600; }
+header label { color: var(--dim); display: flex; align-items: center; gap: 4px; }
+select, input[type=search] {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 4px; padding: 3px 6px; font: inherit;
+}
+#status { margin-left: auto; color: var(--dim); }
+main { flex: 1; display: flex; min-height: 0; }
+main > div { flex: 1; display: flex; min-height: 0; }
+main > div[hidden] { display: none; }
+button {
+  background: #252a33; color: var(--fg); border: 1px solid var(--line);
+  border-radius: 4px; padding: 3px 9px; font: inherit; cursor: pointer;
+}
+button:hover { background: #2f3540; }
+button.on { color: var(--accent); border-color: var(--accent); }
+button.go { color: var(--ok); border-color: #2f5d4d; }
+button.kill { color: var(--err); border-color: #5d2f33; }
+button:disabled { color: var(--dim); cursor: not-allowed; }
+#list, #agents { width: 310px; flex: none; overflow-y: auto; border-right: 1px solid var(--line); }
+#path, #agent-form { flex: 1; overflow-y: auto; min-width: 0; }
+#detail {
+  width: 460px; flex: none; overflow-y: auto;
+  border-left: 1px solid var(--line); background: var(--panel);
+}
+#right-col {
+  width: 460px; flex: none; display: flex; flex-direction: column;
+  border-left: 1px solid var(--line); background: var(--panel); min-height: 0;
+}
+#prompts { flex: 1; overflow-y: auto; min-height: 0; }
+#runbox { flex: none; border-top: 1px solid var(--line); padding: 8px 12px; }
+#runbox label { display: block; color: var(--dim); margin-bottom: 4px; }
+#runbox input[type=text] {
+  width: 100%; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; font: inherit;
+}
+#run-log { max-height: 150px; padding: 4px 0; color: var(--dim); }
+.err-text { color: var(--err); }
+#agent-form .box { padding: 10px 12px; border-bottom: 1px solid var(--line); }
+#agent-form .box > label { display: block; color: var(--dim); margin-bottom: 4px; }
+#agent-form input[type=text] {
+  width: 100%; background: var(--bg); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px; font: inherit;
+}
+.checks { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+.checks label { display: flex; align-items: center; gap: 4px; color: var(--fg); }
+.checks label.off { color: var(--dim); }
+#prompts textarea {
+  width: 100%; height: 300px; background: var(--bg); color: var(--fg); resize: vertical;
+  border: 1px solid var(--line); border-radius: 4px; padding: 6px; font: inherit;
+}
+.bar-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.note { color: var(--warn); padding: 6px 12px; }
+.ok-note { color: var(--ok); padding: 6px 12px; }
+.day { padding: 4px 12px; color: var(--dim); background: var(--bg); position: sticky; top: 0; }
+.card { padding: 7px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.card:hover { background: #20242b; }
+.card.on { background: #252a33; box-shadow: inset 2px 0 0 var(--accent); }
+.card .top { display: flex; gap: 8px; align-items: baseline; }
+.card .name { color: var(--fg); }
+.card .dur { margin-left: auto; color: var(--dim); }
+.card .meta, .card .kid { color: var(--dim); font-size: 12px; }
+.card .kid { padding-left: 12px; color: var(--child); }
+.tag {
+  padding: 0 5px; border-radius: 3px; background: #2b3038; color: var(--dim); font-size: 11px;
+}
+.tag.kind { color: var(--accent); }
+.tag.ok { color: var(--ok); }
+.tag.bad { color: var(--err); }
+.live { color: var(--warn); }
+.row {
+  display: flex; align-items: center; gap: 8px; padding: 2px 12px;
+  border-bottom: 1px solid #20242b; cursor: pointer; white-space: nowrap;
+}
+.row:hover { background: #20242b; }
+.row.on { background: #252a33; }
+.row .idx { color: var(--dim); width: 34px; text-align: right; flex: none; }
+.row .who { width: 78px; flex: none; }
+.row .who.assistant { color: var(--accent); }
+.row .who.tool { color: var(--ok); }
+.row .who.exit { color: var(--warn); }
+.row .who.system, .row .who.user { color: var(--dim); }
+.row .bar { flex: 1; min-width: 60px; height: 12px; position: relative; background: #191c21; }
+.row .bar i { position: absolute; top: 0; bottom: 0; background: var(--accent); min-width: 2px; }
+.row .bar i.tool { background: var(--ok); }
+.row .bar i.bad { background: var(--err); }
+.row .bar i.fuzzy { background: repeating-linear-gradient(90deg, #4ec9a0 0 3px, #2b3038 3px 6px); }
+.row .t { width: 66px; text-align: right; color: var(--dim); flex: none; }
+.row .what { width: 300px; overflow: hidden; text-overflow: ellipsis; flex: none; }
+.row .what .arg { color: var(--dim); }
+.row .what .fold { color: var(--child); cursor: pointer; }
+.kids { padding-left: 26px; border-left: 2px solid var(--child); margin-left: 12px; }
+.kids .hd { padding: 3px 12px; color: var(--child); }
+.miss { color: var(--err); padding: 4px 12px; }
+#detail h3 { margin: 0; padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+#detail section { border-bottom: 1px solid var(--line); }
+#detail section > div.k { padding: 5px 12px 0; color: var(--dim); }
+pre {
+  margin: 0; padding: 4px 12px 10px; white-space: pre-wrap; word-break: break-all;
+  max-height: 340px; overflow-y: auto; color: var(--fg);
+}
+pre.err { color: var(--err); }
+.hint { padding: 12px; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <b>mini-inspect</b>
+  <button id="tab-trace" class="on">观测</button>
+  <button id="tab-config">配置</button>
+  <span id="trace-filters" style="display:flex;gap:14px">
+    <label>角色 <select id="f-agent"><option value="">全部</option></select></label>
+    <label>来源 <select id="f-kind"><option value="">全部</option></select></label>
+    <label><input type="checkbox" id="f-bad"> 只看有错的</label>
+    <label><input type="checkbox" id="follow" checked> 实时跟随</label>
+  </span>
+  <span id="run-status"></span>
+  <span id="status">加载中…</span>
+</header>
+<main>
+  <div id="view-trace">
+    <div id="list"></div>
+    <div id="path"><div class="hint">左侧选一个会话查看执行路径。</div></div>
+    <div id="detail"><div class="hint">选一步查看模型思考、工具参数和完整输出。</div></div>
+  </div>
+  <div id="view-config" hidden>
+    <div id="agents"></div>
+    <div id="agent-form"><div class="hint">左侧选一个角色开始编辑。</div></div>
+    <div id="right-col">
+      <div id="prompts"></div>
+      <div id="runbox"></div>
+    </div>
+  </div>
+</main>
+<script>
+const S = { roots: [], id: null, data: null, sel: null, kids: new Set(), rows: {} };
+const $ = (q) => document.querySelector(q);
+const esc = (t) => String(t ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const clock = (iso) => (iso ? iso.slice(11, 19) : "--:--:--");
+const day = (iso) => (iso ? iso.slice(0, 10) : "未知日期");
+const dur = (s) => (s == null ? "—" : s >= 60 ? `${Math.floor(s / 60)}m${String(Math.round(s % 60)).padStart(2, "0")}s` : `${s.toFixed(1)}s`);
+const tok = (n) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n));
+const badly = (r) => r.exit_status !== "Submitted" || r.n_errors > 0 || (r.children || []).some(badly);
+
+// 每个工具的显著参数不同，这是真实差异而不是设计缺陷，所以用表驱动而不是 if 链。
+const BRIEF = {
+  agent_call: (a) => a.role,
+  bash: (a) => a.command,
+  str_replace_editor: (a) => `${a.command} ${a.path}`,
+  web_search: (a) => (a.queries || []).join(" | "),
+  web_fetch: (a) => a.url,
+  account_journal: (a) => a.operation,
+  account_monitor: (a) => `${a.operation}${a.plans ? ` ${a.plans.length} 条计划` : ""}`,
+  miniqmt_account: (a) => a.view,
+  miniqmt_trade: (a) => `${a.operation} ${JSON.stringify(a.inputs || {})}`,
+};
+function brief(a) {
+  if (!a || !a.tool) return "";
+  const fn = BRIEF[a.tool];
+  if (fn) return fn(a) || "";
+  return Object.entries(a).filter(([k]) => k !== "tool").map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(" ");
+}
+
+function cardHTML(r) {
+  const total = r.tokens.prompt + r.tokens.completion;
+  const kids = (r.children || []).map((c) =>
+    `<div class="kid">└ ${esc(c.agent_name)} ${dur(c.duration)} ${c.n_errors ? `<span class="tag bad">${c.n_errors} 错</span>` : "✓"}</div>`).join("");
+  return `<div class="card ${S.id === r.id ? "on" : ""}" data-id="${esc(r.id)}">
+    <div class="top">
+      <span class="name">${r.running ? '<span class="live">●</span> ' : ""}${clock(r.started_at)} ${esc(r.agent_name || "?")}</span>
+      <span class="dur">${dur(r.duration)}</span></div>
+    <div class="meta">${r.kind ? `<span class="tag kind">${esc(r.kind)}</span> ` : ""}<span class="tag ${badly(r) ? "bad" : "ok"}">${esc(r.exit_status || "运行中")}</span>
+      ${r.api_calls} calls · ${tok(total)} tok${r.n_errors ? ` · <span class="tag bad">${r.n_errors} 工具错</span>` : ""}</div>
+    ${r.stale ? `<div class="miss">本轮解析失败，显示的是上一次快照：${esc(r.parse_error)}</div>` : ""}${kids}</div>`;
+}
+
+function renderList() {
+  const agent = $("#f-agent").value, kind = $("#f-kind").value, onlyBad = $("#f-bad").checked;
+  const rows = S.roots.filter((r) => (!agent || r.agent_name === agent) && (!kind || r.kind === kind) && (!onlyBad || badly(r)));
+  let html = "", seen = "";
+  for (const r of rows) {
+    if (day(r.started_at) !== seen) { seen = day(r.started_at); html += `<div class="day">${seen}</div>`; }
+    html += cardHTML(r);
+  }
+  $("#list").innerHTML = html || '<div class="hint">没有匹配的会话。</div>';
+  $("#list").querySelectorAll(".card").forEach((el) => el.onclick = () => openSession(el.dataset.id));
+}
+
+function fillFilters() {
+  for (const [sel, key] of [["#f-agent", "agent_name"], ["#f-kind", "kind"]]) {
+    const box = $(sel), keep = box.value;
+    const values = [...new Set(S.roots.map((r) => r[key]).filter(Boolean))].sort();
+    box.innerHTML = '<option value="">全部</option>' + values.map((v) => `<option>${esc(v)}</option>`).join("");
+    box.value = keep;
+  }
+}
+function rowHTML(s, span, key) {
+  const w = Math.max(((s.duration || 0) / span) * 100, 0.5);
+  const l = Math.min(((s.offset || 0) / span) * 100, 99.5);
+  // fuzzy 条纹表示这条耗时不可信：老轨迹里同一批工具共享一个完成时刻。
+  const fill = s.status ? (s.ok ? (s.timed ? "tool" : "fuzzy") : "bad") : "";
+  const what = s.status
+    ? `${esc(s.tool || "?")} <span class="arg">${esc(brief(s.args))}</span>`
+    : s.role === "assistant"
+      ? (s.tools || []).length ? esc(s.tools.join(" + ")) : '<span class="arg">无工具调用 → 提交</span>'
+      : `<span class="arg">${esc((s.content || "").split("\n")[0].slice(0, 90))}</span>`;
+  const mark = s.child_trace ? `<span class="fold" data-fold="${esc(key)}">${S.kids.has(key) ? "▾" : "▸"}</span> ` : "";
+  return `<div class="row ${S.sel === key ? "on" : ""}" data-key="${esc(key)}">
+    <span class="idx">#${s.index}</span>
+    <span class="who ${s.status ? "tool" : s.role}">${s.status ? "tool" : s.role}</span>
+    <span class="bar"><i class="${fill}" style="left:${l}%;width:${w}%"></i></span>
+    <span class="t">${dur(s.duration)}</span>
+    <span class="what">${mark}${what}${s.error_code ? ` <span class="tag bad">${esc(s.error_code)}</span>` : ""}</span></div>`;
+}
+
+function waterfall(sid, steps, children) {
+  const span = Math.max(...steps.map((s) => (s.offset || 0) + (s.duration || 0)), 0.001);
+  let html = "", kid = 0;
+  for (const s of steps) {
+    const key = `${sid}#${s.index}`;
+    S.rows[key] = s;
+    html += rowHTML(s, span, key);
+    if (!s.child_trace) continue;
+    const child = (children || [])[kid++];
+    if (!S.kids.has(key)) continue;
+    if (!child) { html += '<div class="miss">子轨迹未随本次请求返回。</div>'; continue; }
+    if (child.error) { html += `<div class="miss">子轨迹缺失：${esc(child.error)}</div>`; continue; }
+    const c = child.session;
+    html += `<div class="kids"><div class="hd">${esc(c.agent_name)} · ${c.api_calls} calls · ${dur(c.duration)} · ${esc(c.exit_status)}${c.n_errors ? ` · ${c.n_errors} 工具错` : ""}</div>
+      ${waterfall(c.id, child.steps, child.children)}</div>`;
+  }
+  return html;
+}
+
+function renderPath() {
+  if (!S.data) { $("#path").innerHTML = '<div class="hint">左侧选一个会话查看执行路径。</div>'; return; }
+  S.rows = {};
+  const r = S.data.session;
+  $("#path").innerHTML = `<div class="day">${esc(r.id)} · ${esc(r.agent_name)} · ${esc(r.kind || "来源未记录")} · ${esc(r.miniqmt_mode || "-")} · ${dur(r.duration)} · ${esc(r.exit_status || "运行中")}</div>`
+    + waterfall(r.id, S.data.steps, S.data.children);
+  $("#path").querySelectorAll(".row").forEach((el) => el.onclick = () => { S.sel = el.dataset.key; renderPath(); renderDetail(); });
+  $("#path").querySelectorAll(".fold").forEach((el) => el.onclick = (ev) => {
+    ev.stopPropagation();
+    const key = el.dataset.fold;
+    S.kids.has(key) ? S.kids.delete(key) : S.kids.add(key);
+    renderPath();
+  });
+}
+
+// 轨迹里的工具输出是 tojson 过的 ASCII 转义 JSON，直接贴出来中文全是 \uXXXX，没法读。
+function pretty(text) {
+  const raw = String(text || "").trim();
+  if (!raw.startsWith("{") && !raw.startsWith("[")) return text;
+  try { return JSON.stringify(JSON.parse(raw), null, 2); } catch (e) { return text; }
+}
+
+function renderDetail() {
+  const s = S.rows[S.sel];
+  if (!s) { $("#detail").innerHTML = '<div class="hint">选一步查看模型思考、工具参数和完整输出。</div>'; return; }
+  const parts = [`<h3>#${s.index} ${esc(s.status ? "tool" : s.role)}${s.tool ? ` · ${esc(s.tool)}` : ""} · ${dur(s.duration)}</h3>`];
+  const add = (k, v, cls) => { if (v) parts.push(`<section><div class="k">${k}</div><pre class="${cls || ""}">${esc(v)}</pre></section>`); };
+  if (s.usage && Object.keys(s.usage).length) add("token 用量", JSON.stringify(s.usage));
+  if (s.finish_reason) add("finish_reason", s.finish_reason);
+  add("模型思考 reasoning", s.reasoning);
+  if (s.actions && s.actions.length) add("发起的工具调用", JSON.stringify(s.actions, null, 2));
+  if (s.args && Object.keys(s.args).length) add("本次调用参数", JSON.stringify(s.args, null, 2));
+  if (s.status) {
+    // 工具步骤的 content 只是 stdout 的模板包装，重复贴一遍纯属噪音。
+    const note = s.timed ? "" : "\n注意：这条轨迹没有逐工具起止时间，同批工具的耗时无法分离。";
+    add("结果", `status=${s.status}  error_code=${s.error_code || "-"}${s.truncated ? "  （输出被截断）" : ""}${note}`, s.ok ? "" : "err");
+  } else {
+    add("内容 content", s.content);
+  }
+  add("异常 exception_info", s.exception_info, "err");
+  add("stdout", pretty(s.stdout));
+  add("stderr", s.stderr, "err");
+  add("退出状态", s.exit_status);
+  $("#detail").innerHTML = parts.join("");
+}
+async function openSession(id) {
+  S.id = id; S.sel = null; S.kids.clear();
+  renderList();
+  await reload();
+}
+
+async function reload() {
+  if (!S.id) return;
+  const res = await fetch(`/api/session?id=${encodeURIComponent(S.id)}`);
+  const payload = await res.json();
+  if (!res.ok) { $("#path").innerHTML = `<div class="miss">${esc(payload.error)}</div>`; return; }
+  S.data = payload;
+  renderPath();
+  renderDetail();
+}
+
+async function tick() {
+  try {
+    const payload = await (await fetch("/api/sessions")).json();
+    S.roots = payload.sessions;
+    fillFilters();
+    renderList();
+    const current = S.roots.find((r) => r.id === S.id);
+    if (current && current.running) await reload();
+    $("#status").textContent = `${S.roots.length} 个会话 · 刷新于 ${new Date().toLocaleTimeString()}`;
+  } catch (error) {
+    $("#status").textContent = `服务不可用：${error}`;
+  }
+}
+
+for (const sel of ["#f-agent", "#f-kind", "#f-bad"]) $(sel).onchange = renderList;
+
+// ---- 配置编辑：agents 段在前端内存里改，点保存才整份提交给后端自检 ----
+const C = { agents: null, tools: [], flows: [], role: null, dirty: false };
+const checkHTML = (group, value, on, off) =>
+  `<label class="${off ? "off" : ""}"><input type="checkbox" data-g="${group}" value="${esc(value)}"${on ? " checked" : ""}${off ? " disabled" : ""}> ${esc(value)}</label>`;
+
+async function loadConfig() {
+  const payload = await (await fetch("/api/config")).json();
+  C.agents = payload.agents;
+  C.tools = payload.tool_names;
+  C.flows = payload.flows;
+  renderAgents();
+  renderForm();
+  renderPrompts();
+}
+
+function renderAgents() {
+  const rows = Object.entries(C.agents || {}).map(([name, p]) => `
+    <div class="card ${C.role === name ? "on" : ""}" data-role="${esc(name)}">
+      <div class="top"><span class="name">${esc(name)}</span><span class="dur">${(p.tools || []).length} 工具</span></div>
+      <div class="meta">${esc(p.flow || "iterative")}${(p.delegates_to || []).length ? ` · 委派 ${p.delegates_to.length}` : ""}${(p.requires || []).length ? ` · 前置 ${esc(p.requires.join("/"))}` : ""}</div>
+    </div>`).join("");
+  $("#agents").innerHTML = `<div class="bar-actions">
+      <button id="add">+ 新增角色</button>
+      <button class="go" id="save-cfg">${C.dirty ? "保存配置 *" : "保存配置"}</button>
+    </div><div id="cfg-msg"></div>${rows}`;
+  $("#add").onclick = addAgent;
+  $("#save-cfg").onclick = saveConfig;
+  $("#agents").querySelectorAll(".card").forEach((el) => el.onclick = () => {
+    C.role = el.dataset.role;
+    renderAgents();
+    renderForm();
+    renderPrompts();
+  });
+}
+
+function renderForm() {
+  const box = $("#agent-form");
+  const profile = C.agents && C.role ? C.agents[C.role] : null;
+  if (!profile) { box.innerHTML = '<div class="hint">左侧选一个角色开始编辑。</div>'; return; }
+  const others = Object.keys(C.agents).filter((n) => n !== C.role);
+  const flow = profile.flow || "iterative";
+  const single = flow === "single_shot";
+  box.innerHTML = `
+    <div class="bar-actions"><b>${esc(C.role)}</b><button class="kill" id="rm">删除该角色</button></div>
+    <div class="box"><label>description</label><input type="text" id="fd" value="${esc(profile.description || "")}"></div>
+    <div class="box"><label>flow</label>
+      <select id="ff">${C.flows.map((f) => `<option${f === flow ? " selected" : ""}>${esc(f)}</option>`).join("")}</select>
+      ${single ? '<span class="note">single_shot 不能配置工具</span>' : ""}</div>
+    <div class="box"><label>tools（模型可见的工具）</label>
+      <div class="checks">${C.tools.map((t) => checkHTML("t", t, (profile.tools || []).includes(t), single)).join("")}</div></div>
+    <div class="box"><label>delegates_to（可以 agent_call 谁；勾了就必须同时勾上 agent_call 工具）</label>
+      <div class="checks">${others.map((n) => checkHTML("d", n, (profile.delegates_to || []).includes(n), false)).join("")}</div></div>
+    <div class="box"><label>requires（本角色被委派前，必须已完成哪些角色）</label>
+      <div class="checks">${others.map((n) => checkHTML("r", n, (profile.requires || []).includes(n), false)).join("")}</div></div>`;
+  $("#rm").onclick = removeAgent;
+  box.querySelectorAll("input[type=checkbox], #fd").forEach((el) => el.onchange = applyForm);
+  $("#ff").onchange = () => { applyForm(); renderForm(); };
+}
+
+function applyForm() {
+  const profile = C.agents[C.role];
+  const collect = (g) => [...$("#agent-form").querySelectorAll(`input[data-g="${g}"]:checked`)].map((el) => el.value);
+  profile.description = $("#fd").value;
+  profile.flow = $("#ff").value;
+  // tools 空数组是有意义的配置（single_call 就是它）；委派字段为空则整键删掉，保持 yaml 干净。
+  profile.tools = collect("t");
+  for (const key of ["delegates_to", "requires"]) {
+    const values = collect(key === "delegates_to" ? "d" : "r");
+    if (values.length) profile[key] = values;
+    else delete profile[key];
+  }
+  C.dirty = true;
+  renderAgents();
+}
+async function renderPrompts() {
+  const box = $("#prompts");
+  if (!C.role) { box.innerHTML = '<div class="hint">选一个角色编辑它的 prompt。</div>'; return; }
+  const loaded = {};
+  for (const kind of ["system", "instance"]) {
+    loaded[kind] = await (await fetch(`/api/prompt?role=${encodeURIComponent(C.role)}&kind=${kind}`)).json();
+  }
+  // 记住文件里的原文：改了 prompt 忘了保存就去跑，等于拿旧 prompt 的结果做判断。
+  C.saved = { system: loaded.system.text, instance: loaded.instance.text };
+  box.innerHTML = ["system", "instance"].map((kind) => `
+    <div class="box">
+      <label>${kind} · ${esc(loaded[kind].path)}${loaded[kind].exists ? "" : "（文件尚不存在）"}</label>
+      <textarea id="pt-${kind}">${esc(loaded[kind].text)}</textarea>
+      <div class="bar-actions" style="border:0;padding:6px 0">
+        <button class="go save-prompt" data-kind="${kind}">保存 ${kind}</button><span id="pm-${kind}"></span>
+      </div></div>`).join("");
+  box.querySelectorAll(".save-prompt").forEach((el) => el.onclick = () => savePrompt(el.dataset.kind));
+}
+
+async function savePrompt(kind) {
+  const res = await fetch("/api/prompt", {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ role: C.role, kind, text: $(`#pt-${kind}`).value }),
+  });
+  const out = await res.json();
+  $(`#pm-${kind}`).innerHTML = res.ok
+    ? '<span class="ok-note">已写入文件</span>'
+    : `<span class="note">${esc(out.error)}</span>`;
+  if (res.ok) C.saved[kind] = $(`#pt-${kind}`).value;
+}
+
+function unsavedPrompt() {
+  return ["system", "instance"].find((kind) => {
+    const box = $(`#pt-${kind}`);
+    return box && C.saved && box.value !== C.saved[kind];
+  });
+}
+
+async function saveConfig() {
+  const res = await fetch("/api/config", {
+    method: "PUT", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ agents: C.agents }),
+  });
+  const out = await res.json();
+  if (!res.ok) { $("#cfg-msg").innerHTML = `<span class="note">未保存：${esc(out.error)}</span>`; return; }
+  C.dirty = false;
+  renderAgents();
+  const orphans = out.orphan_prompts || [];
+  $("#cfg-msg").innerHTML = `<span class="ok-note">已写入配置${orphans.length ? `；已无人引用的 prompt：${esc(orphans.join("、"))}` : ""}</span>`;
+}
+
+async function addAgent() {
+  const name = (window.prompt("新角色名（小写字母和下划线）") || "").trim();
+  if (!name) return;
+  if (C.agents[name]) { window.alert("已存在同名角色"); return; }
+  // 新角色必须先有 prompt 文件，否则保存配置时自检会拦下来。
+  for (const [kind, text] of [["system", `你是 ${name}。`], ["instance", "{{ task }}"]]) {
+    const res = await fetch("/api/prompt", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ role: name, kind, text }),
+    });
+    if (!res.ok) { window.alert((await res.json()).error); return; }
+  }
+  C.agents[name] = {
+    description: "", flow: "iterative", tools: [],
+    system_template_path: `prompts/${name}.system.md`,
+    instance_template_path: `prompts/${name}.instance.md`,
+  };
+  C.role = name;
+  C.dirty = true;
+  renderAgents();
+  renderForm();
+  renderPrompts();
+}
+
+function removeAgent() {
+  const gone = C.role;
+  if (!window.confirm(`删除角色 ${gone}？它的 prompt 文件会留在磁盘上。`)) return;
+  delete C.agents[gone];
+  // 别人对它的引用也一起清掉，否则保存时自检会拦住而你还得自己找原因。
+  for (const profile of Object.values(C.agents)) {
+    for (const key of ["delegates_to", "requires"]) {
+      if (!profile[key]) continue;
+      profile[key] = profile[key].filter((name) => name !== gone);
+      if (!profile[key].length) delete profile[key];
+    }
+    if (!profile.delegates_to && profile.tools) {
+      profile.tools = profile.tools.filter((tool) => tool !== "agent_call");
+    }
+  }
+  C.role = null;
+  C.dirty = true;
+  renderAgents();
+  renderForm();
+  renderPrompts();
+}
+
+function showTab(which) {
+  const trace = which === "trace";
+  $("#view-trace").hidden = !trace;
+  $("#view-config").hidden = trace;
+  $("#tab-trace").classList.toggle("on", trace);
+  $("#tab-config").classList.toggle("on", !trace);
+  $("#trace-filters").style.display = trace ? "flex" : "none";
+  if (!trace && !C.agents) loadConfig();
+}
+
+$("#tab-trace").onclick = () => showTab("trace");
+$("#tab-config").onclick = () => showTab("config");
+
+// ---- 就地试跑：子进程跑一轮 mini，轨迹落回观测目录，用观测页看它 ----
+const R = { state: null };
+
+function renderRunbox() {
+  $("#runbox").innerHTML = `
+    <label>试跑（角色用左侧选中的那个；改完 prompt 直接跑）</label>
+    <input type="text" id="run-task" placeholder="任务，例如：说一句你好">
+    <div class="bar-actions" style="border:0;padding:6px 0">
+      <select id="run-mode">
+        <option value="auto_execute">auto_execute · 可真实下单</option>
+        <option value="observe">observe · 只读</option>
+        <option value="execute">execute · 逐笔人工审批</option>
+      </select>
+      <button class="go" id="run-go">运行</button><span id="run-msg"></span>
+    </div>
+    <pre id="run-log"></pre>`;
+  $("#run-go").onclick = startRun;
+}
+
+function renderRunStatus() {
+  const s = R.state;
+  const box = $("#run-status");
+  if (!s || s.idle) { box.innerHTML = ""; return; }
+  const live = s.running;
+  const danger = live && s.mode === "auto_execute";
+  const label = live
+    ? `▶ ${esc(s.role)} 运行中${danger ? " · 可下单" : ` · ${esc(s.mode)}`}`
+    : s.returncode === 0 ? `✓ ${esc(s.role)} 已结束` : `✗ ${esc(s.role)} 退出码 ${s.returncode}`;
+  const cls = danger ? "live" : !live && s.returncode !== 0 ? "err-text" : "";
+  box.innerHTML = `<span id="run-jump" class="${cls}" style="cursor:pointer" title="点击查看它的执行路径">${label}</span>`
+    + (live ? ' <button class="kill" id="run-stop">停止</button>' : "");
+  $("#run-jump").onclick = () => { showTab("trace"); openSession(s.trace_id); };
+  if (live) $("#run-stop").onclick = stopRun;
+}
+
+async function pollRun() {
+  try {
+    R.state = await (await fetch("/api/run")).json();
+  } catch (error) {
+    return;
+  }
+  renderRunStatus();
+  const log = $("#run-log");
+  if (log) log.textContent = (R.state.log_tail || "").slice(-4000);
+}
+
+async function startRun() {
+  if (!C.role) { $("#run-msg").innerHTML = '<span class="note">先在左侧选一个角色</span>'; return; }
+  if (C.dirty) { $("#run-msg").innerHTML = '<span class="note">配置有未保存的改动，先点保存配置</span>'; return; }
+  const stale = unsavedPrompt();
+  if (stale) { $("#run-msg").innerHTML = `<span class="note">${stale} prompt 还没保存，跑出来的是旧版本</span>`; return; }
+  const res = await fetch("/api/run", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ role: C.role, task: $("#run-task").value, mode: $("#run-mode").value }),
+  });
+  const out = await res.json();
+  if (!res.ok) { $("#run-msg").innerHTML = `<span class="note">${esc(out.error)}</span>`; return; }
+  R.state = out;
+  renderRunStatus();
+  $("#run-msg").innerHTML = `<span class="ok-note">已启动 ${esc(out.run_id)}</span>`;
+}
+
+async function stopRun() {
+  const res = await fetch("/api/run/stop", { method: "POST" });
+  const out = await res.json();
+  if (res.ok) R.state = out;
+  renderRunStatus();
+}
+
+renderRunbox();
+pollRun();
+setInterval(pollRun, 2000);
+tick();
+// 轨迹每步覆盖写，mtime 就是心跳；只有当前会话还在跑才重新拉全文。
+setInterval(() => { if ($("#follow").checked && !$("#view-trace").hidden) tick(); }, 2000);
+</script>
+</body>
+</html>

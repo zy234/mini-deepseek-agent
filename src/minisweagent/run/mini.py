@@ -87,11 +87,37 @@ def _select_agent_name(profiles: dict, requested: str | None) -> str:
         console.print("请输入角色名称或列表中的编号。")
 
 
+def _require_agent(settings: dict, role: str) -> dict:
+    """宿主的调度入口写死了角色名；配置里没有它时给出明确错误，而不是一个裸 KeyError。"""
+    profile = (settings.get("agents") or {}).get(role)
+    if profile is None:
+        raise ValueError(f"当前调度需要角色 {role}，但配置的 agents 里没有它")
+    return dict(profile)
+
+
 def _get_agent_settings(settings: dict, agent_name: str) -> dict:
     """将公共 Agent 配置与所选角色配置合并。"""
-    profile = dict(settings["agents"][agent_name])
+    profile = _require_agent(settings, agent_name)
     profile.pop("description", None)
     return recursive_merge(settings.get("agent", {}), profile, {"agent_name": agent_name})
+
+
+def _delegate_profiles(settings: dict, agent_settings: dict) -> dict[str, dict]:
+    """按角色声明的 delegates_to 收集可委派子角色的完整 profile。
+
+    引用不存在的角色是配置错误，必须在启动时就炸掉；等到模型真去 agent_call 才失败，
+    那一轮的研究和组合上下文已经白跑了。
+    """
+    profiles = {}
+    for role in agent_settings.get("delegates_to") or []:
+        profile = (settings.get("agents") or {}).get(role)
+        if profile is None:
+            raise ValueError(f"delegates_to 引用了不存在的 Agent：{role}")
+        profiles[role] = dict(profile)
+    if profiles and "agent_call" not in (agent_settings.get("tools") or []):
+        # 否则 delegates_to 静默失效：模型看不到 agent_call，宿主却准备好了一整套子 Agent。
+        raise ValueError(f"{agent_settings.get('agent_name', '该角色')} 声明了 delegates_to，但 tools 里没有 agent_call")
+    return profiles
 
 
 def _new_session_record() -> tuple[Path, str, str]:
@@ -156,6 +182,18 @@ def _account_cycle(
     """每次创建全新 Agent；跨轮状态只从每日账本和状态库恢复。"""
     started = datetime.now(TRADING_TZ)
     cycle_id = f"{started.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(4)}"
+    # 调度来源写进轨迹：观测端要按窗口对比同一角色的表现，不能靠 grep 任务文本反推。
+    cycle_kind = (
+        "premarket"
+        if premarket
+        else "midday"
+        if midday_review
+        else "intraday_scan"
+        if intraday_scan
+        else "close_review"
+        if close_review
+        else "auto_cycle"
+    )
     agent_name = "financial_manager"
     agent_settings = _get_agent_settings(settings, agent_name)
     session_output, session_id, session_started_at = _new_session_record()
@@ -166,6 +204,7 @@ def _account_cycle(
             "session_id": session_id,
             "session_started_at": session_started_at,
             "session_cwd": str(Path.cwd()),
+            "cycle_kind": cycle_kind,
         },
     )
     journal_dir = Path(os.getenv("MINIQMT_AGENT_STATE_DIR", ".sessions/account-manager"))
@@ -183,19 +222,15 @@ def _account_cycle(
             "account_review_mode": close_review,
         },
     )
-    child_roles = {"financial_research", "portfolio_manager", "account_trader"}
-    agent_profiles = {
-        role: dict(settings["agents"][role])
-        for role in child_roles
-        if role in settings.get("agents", {})
-    }
     environment_settings = recursive_merge(
         environment_settings,
         {
-            "agent_profiles": agent_profiles,
+            "agent_profiles": _delegate_profiles(settings, agent_settings),
             "agent_common_config": settings.get("agent", {}),
             "agent_model_config": settings.get("model", {}),
             "agent_trace_prefix": str(session_output.with_suffix("")),
+            "agent_session_id": session_id,
+            "agent_cycle_kind": cycle_kind,
         },
     )
     if premarket:
@@ -264,7 +299,7 @@ def _account_cycle(
 def _run_trade_trigger(settings: dict, event: dict[str, Any], journal_dir: Path) -> dict[str, Any]:
     """行情触发后只启动 account_trader，不重新调用研究或组合 Agent。"""
     role = "account_trader"
-    profile = dict(settings["agents"][role])
+    profile = _require_agent(settings, role)
     profile.pop("description", None)
     session_output, session_id, session_started_at = _new_session_record()
     cycle_id = f"trigger-{event['plan']['plan_id']}-{secrets.token_hex(4)}"
@@ -277,6 +312,7 @@ def _run_trade_trigger(settings: dict, event: dict[str, Any], journal_dir: Path)
             "session_id": session_id,
             "session_started_at": session_started_at,
             "session_cwd": str(Path.cwd()),
+            "cycle_kind": "monitor_trigger",
         },
     )
     environment_settings = recursive_merge(
@@ -587,6 +623,7 @@ def main(
         "session_id": session_id,
         "session_started_at": session_started_at,
         "session_cwd": str(Path.cwd()),
+        "cycle_kind": "manual",
         "step_limit": step_limit if step_limit is not None else UNSET,
     }
     agent_settings = recursive_merge(agent_settings, agent_overrides)
@@ -594,21 +631,18 @@ def main(
         settings.get("environment", {}),
         {"timeout": timeout if timeout is not None else UNSET},
     )
-    if agent_name == "financial_manager":
-        # 主 Agent 的委派配置由宿主注入；子 Agent 不会继承这两个字段。
-        child_roles = {"financial_research", "portfolio_manager", "account_trader"}
+    if agent_settings.get("delegates_to"):
+        # 委派配置由宿主注入；子 Agent 不会继承这些字段，所以拿不到再往下委派的能力。
         environment_settings = recursive_merge(
             environment_settings,
             {
-                "agent_profiles": {
-                    role: settings["agents"][role]
-                    for role in child_roles
-                    if role in settings.get("agents", {})
-                },
+                "agent_profiles": _delegate_profiles(settings, agent_settings),
                 "agent_common_config": settings.get("agent", {}),
                 "agent_model_config": settings.get("model", {}),
                 # 子 Agent 轨迹跟随父会话轨迹落在同一日期目录下，便于失败后按序号回溯。
                 "agent_trace_prefix": str(Path(agent_settings["output_path"]).with_suffix("")),
+                "agent_session_id": session_id,
+                "agent_cycle_kind": "manual",
             },
         )
     task = task or terminal_prompt("Task: ")

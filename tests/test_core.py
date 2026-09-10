@@ -1,9 +1,15 @@
 import json
 import logging
+import shutil
 import signal
+import subprocess
+import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.environments import account_journal, market_monitor, miniqmt, web_fetch
@@ -11,8 +17,9 @@ from minisweagent.environments.local import LocalEnvironment
 from minisweagent.models.deepseek_model import DEFAULT_OBSERVATION_TEMPLATE, DeepSeekModel
 from minisweagent.models.utils.actions_toolcall import (
     format_toolcall_observation_messages,
+    get_tool_definitions,
 )
-from minisweagent.run import mini
+from minisweagent.run import inspect, mini
 
 
 class FakeModel:
@@ -31,7 +38,7 @@ class FakeModel:
         return {
             "role": "assistant",
             "content": None,
-            "extra": {"actions": [{"command": command, "tool_call_id": f"call_{self.calls}"}]},
+            "extra": {"actions": [{"tool": "bash", "command": command, "tool_call_id": f"call_{self.calls}"}]},
         }
 
     def format_observation_messages(self, message, outputs, template_vars=None):
@@ -74,19 +81,54 @@ def test_agent_runs_bash_and_saves_submission(tmp_path: Path):
     assert any(message.get("role") == "tool" for message in agent.messages)
 
 
-def test_financial_manager_agent_call_order_is_host_enforced():
-    env = LocalEnvironment(timeout=5)
+def test_delegation_graph_comes_from_role_configuration():
+    settings = mini.get_config_from_spec(mini.DEFAULT_CONFIG_FILE)
+    manager = mini._get_agent_settings(settings, "financial_manager")
+    profiles = mini._delegate_profiles(settings, manager)
+    env = LocalEnvironment(timeout=5, agent_profiles=profiles)
 
-    blocked_portfolio = env._validate_agent_call_phase("portfolio_manager")
-    assert blocked_portfolio["status"] == "blocked"
-    assert blocked_portfolio["error"]["code"] == "workflow_order"
+    # 模型看到的 role 枚举、宿主的准入和交接顺序都读同一份配置。
+    assert set(profiles) == {"financial_research", "portfolio_manager", "account_trader"}
+    schema = get_tool_definitions(["agent_call"], manager["delegates_to"])[0]
+    assert schema["function"]["parameters"]["properties"]["role"]["enum"] == manager["delegates_to"]
 
+    assert env._validate_agent_call_phase("portfolio_manager")["error"]["code"] == "workflow_order"
     env._agent_call_roles.append("financial_research")
     assert env._validate_agent_call_phase("portfolio_manager") is None
     assert env._validate_agent_call_phase("account_trader")["error"]["code"] == "workflow_order"
-
     env._agent_call_roles.append("portfolio_manager")
     assert env._validate_agent_call_phase("account_trader") is None
+
+    # 没被声明为可委派的角色直接拒绝，哪怕它在 agents 里存在。
+    rejected = env._execute_agent_call({"tool": "agent_call", "role": "interactive", "task": "x"})
+    assert json.loads(rejected["stdout"])["error"]["code"] == "unknown_role"
+
+    # 换一份配置就换一套委派关系，不需要改代码。
+    custom = {
+        "agent": {"system_template": "s", "instance_template": "{{ task }}"},
+        "agents": {
+            "boss": {"tools": ["agent_call"], "delegates_to": ["scout", "closer"]},
+            "scout": {"tools": []},
+            "closer": {"tools": [], "requires": ["scout"]},
+        },
+    }
+    boss = mini._get_agent_settings(custom, "boss")
+    custom_env = LocalEnvironment(timeout=5, agent_profiles=mini._delegate_profiles(custom, boss))
+    assert custom_env._validate_agent_call_phase("scout") is None
+    assert custom_env._validate_agent_call_phase("closer")["error"]["code"] == "workflow_order"
+
+    # 配置错误必须在启动时炸掉，而不是等模型真去委派才失败。
+    with pytest.raises(ValueError, match="不存在的 Agent"):
+        mini._delegate_profiles({"agents": {}}, {"delegates_to": ["ghost"]})
+    with pytest.raises(ValueError, match="delegates_to"):
+        get_tool_definitions(["agent_call"], [])
+    with pytest.raises(ValueError, match="没有 agent_call"):
+        mini._delegate_profiles(custom, {**boss, "tools": []})
+
+    # 宿主只支持一层委派：子 Agent 自己声明了 delegates_to 时显式报配置错误。
+    nested = LocalEnvironment(timeout=5, agent_profiles={"mid": {"delegates_to": ["scout"]}})
+    blocked = nested._execute_agent_call({"tool": "agent_call", "role": "mid", "task": "x"})
+    assert json.loads(blocked["stdout"])["error"]["code"] == "nested_delegation"
 
 
 def test_financial_agent_profiles_describe_daily_handoff():
@@ -750,7 +792,7 @@ def test_deepseek_model_streams_and_emits_configured_tool_calls(monkeypatch, cap
         ]
     )
 
-    assert captured["model"] == "deepseek-v4-flash"
+    assert captured["model"] == "deepseek-flash"
     assert "max_tokens" not in captured
     assert captured["tool_choice"] == "auto"
     assert captured["stream"] is True
@@ -775,3 +817,230 @@ def test_deepseek_model_streams_and_emits_configured_tool_calls(monkeypatch, cap
         {"role": "user", "content": "x"}
     ]
     assert model._api_messages([message])[0]["reasoning_content"] == "thinking "
+
+
+def _parent_trace(child_path: Path, missing_path: Path, started: datetime) -> dict:
+    """手写一条主 Agent 轨迹：一次 agent_call 成功、一次失败且子轨迹没落盘。"""
+    t0 = started.timestamp()
+    return {
+        "trajectory_format": "mini-swe-agent-1.1",
+        "info": {
+            "session": {
+                "id": "20260909-090000-000000-parent",
+                "started_at": started.isoformat(),
+                "parent": "",
+                "kind": "premarket",
+            },
+            "config": {
+                "agent": {"agent_name": "financial_manager", "flow": "iterative", "tools": ["agent_call"]},
+                "environment": {"miniqmt_mode": "observe", "account_cycle_id": "cycle-1"},
+            },
+            "model_stats": {"api_calls": 1},
+            "exit_status": "Submitted",
+            "submission": "完成",
+        },
+        "messages": [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "t"},
+            {
+                "role": "assistant",
+                "content": "",
+                "extra": {
+                    "timestamp": t0 + 1,
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+                    "actions": [
+                        {"tool": "agent_call", "tool_call_id": "call_a", "role": "financial_research", "task": "研究"},
+                        {"tool": "agent_call", "tool_call_id": "call_b", "role": "portfolio_manager", "task": "组合"},
+                    ],
+                },
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_a",
+                "content": "",
+                "extra": {
+                    "tool": "agent_call", "status": "success", "started_at": t0 + 1, "ended_at": t0 + 31,
+                    "stdout": json.dumps({"ok": True, "data": {"trace_path": str(child_path)}}),
+                },
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_b",
+                "content": "",
+                "extra": {
+                    "tool": "agent_call", "status": "error", "error_code": "TimeExceeded",
+                    "started_at": t0 + 31, "ended_at": t0 + 41,
+                    "stdout": json.dumps({"ok": False, "error": {"trace_path": str(missing_path)}}),
+                },
+            },
+            {"role": "exit", "content": "完成", "extra": {"exit_status": "Submitted", "submission": "完成"}},
+        ],
+    }
+
+
+def test_inspect_indexes_dispatch_tree_and_execution_path(tmp_path: Path):
+    sessions = tmp_path / ".sessions" / "20260909"
+    child_path = sessions / "20260909-090000-000000-parent-01-financial_research.json"
+    agent = DefaultAgent(
+        FakeModel(),
+        LocalEnvironment(timeout=5),
+        system_template="You are an agent.",
+        instance_template="{{ task }}",
+        step_limit=3,
+        output_path=child_path,
+        agent_name="financial_research",
+        session_id="20260909-090000-000000-parent-01-financial_research",
+        session_started_at=datetime.now().astimezone().isoformat(),
+        parent_session_id="20260909-090000-000000-parent",
+        cycle_kind="premarket",
+    )
+    agent.run("跑一个子 Agent")
+
+    # 埋点：子轨迹自己知道父是谁、这一轮为什么被启动，工具结果带工具名和独立起止时间。
+    child = json.loads(child_path.read_text(encoding="utf-8"))
+    assert child["info"]["session"]["parent"] == "20260909-090000-000000-parent"
+    assert child["info"]["session"]["kind"] == "premarket"
+    observation = next(message for message in child["messages"] if message["role"] == "tool")
+    assert observation["extra"]["tool"] == "bash"
+    assert observation["extra"]["ended_at"] >= observation["extra"]["started_at"] > 0
+
+    started = datetime(2026, 9, 9, 9, 0, 0).astimezone()
+    missing_path = sessions / "20260909-090000-000000-parent-02-portfolio_manager.json"
+    parent_path = sessions / "20260909-090000-000000-parent.json"
+    parent_path.write_text(
+        json.dumps(_parent_trace(child_path, missing_path, started), ensure_ascii=False), encoding="utf-8"
+    )
+    (sessions.parent / "account-manager").mkdir(parents=True, exist_ok=True)
+    (sessions.parent / "account-manager" / "market-monitor.json").write_text('{"plans": []}', encoding="utf-8")
+
+    index = inspect.TraceIndex(tmp_path / ".sessions")
+    roots = index.sessions()
+
+    # 状态文件不是轨迹，子轨迹挂到父下面，不再是独立的根。
+    assert [root["id"] for root in roots] == ["20260909/20260909-090000-000000-parent.json"]
+    root = roots[0]
+    assert root["kind"] == "premarket"
+    assert root["n_errors"] == 1
+    assert [child["agent_name"] for child in root["children"]] == ["financial_research"]
+
+    loaded = index.load(root["id"])
+    calls = [step for step in loaded["steps"] if step.get("tool") == "agent_call"]
+    assert [step["duration"] for step in calls] == [30.0, 10.0]
+    assert [step["offset"] for step in calls] == [1.0, 31.0]
+    assert calls[0]["args"]["role"] == "financial_research"
+    assert calls[1]["error_code"] == "TimeExceeded"
+    assert loaded["children"][0]["session"]["agent_name"] == "financial_research"
+    assert loaded["children"][0]["steps"][0]["role"] == "system"
+    # 子 Agent 在落盘前就死掉时，观测端必须把缺失当成结论报出来，而不是静默少一棵子树。
+    assert "portfolio_manager" in loaded["children"][1]["error"]
+
+
+def test_config_store_edits_roles_and_prompts_under_validation(tmp_path: Path):
+    directory = tmp_path / "config"
+    shutil.copytree(Path(mini.DEFAULT_CONFIG_FILE).parent, directory)
+    target = directory / "deepseek.yaml"
+    store = inspect.ConfigStore(target)
+
+    # 新增角色：prompt 文件必须先落盘，否则配置自检过不去。
+    store.write_prompt("risk_auditor", "system", "你是风控审计 Agent。")
+    store.write_prompt("risk_auditor", "instance", "{{ task }}")
+    agents = store.read()["agents"]
+    agents["risk_auditor"] = {
+        "description": "复核交易前置条件",
+        "flow": "iterative",
+        "tools": ["miniqmt_account"],
+        "requires": ["account_trader"],
+        "system_template_path": "prompts/risk_auditor.system.md",
+        "instance_template_path": "prompts/risk_auditor.instance.md",
+    }
+    agents["financial_manager"]["delegates_to"].append("risk_auditor")
+    assert store.write_agents(agents)["ok"] is True
+
+    # 落盘的配置必须能被真实装配链直接吃下，并且新角色立刻可被委派。
+    settings = mini.get_config_from_spec(target)
+    manager = mini._get_agent_settings(settings, "financial_manager")
+    profiles = mini._delegate_profiles(settings, manager)
+    assert "risk_auditor" in profiles
+    env = LocalEnvironment(timeout=5, agent_profiles=profiles)
+    assert env._validate_agent_call_phase("risk_auditor")["error"]["code"] == "workflow_order"
+    env._agent_call_roles.append("account_trader")
+    assert env._validate_agent_call_phase("risk_auditor") is None
+
+    # 自检不通过时一个字节都不许落盘。
+    broken = store.read()["agents"]
+    broken["financial_manager"]["tools"] = ["account_journal"]
+    with pytest.raises(ValueError, match="agent_call"):
+        store.write_agents(broken)
+    assert "agent_call" in store.read()["agents"]["financial_manager"]["tools"]
+
+    # prompt 语法错和越界路径都在写盘前拦掉。
+    with pytest.raises(ValueError, match="模板语法错误"):
+        store.write_prompt("risk_auditor", "system", "{% if %}")
+    with pytest.raises(ValueError, match="非法角色名"):
+        store.write_prompt("../../etc/passwd", "system", "x")
+    assert "风控审计" in store.read_prompt("risk_auditor", "system")["text"]
+
+    # 删角色不删文件，但必须把不再被引用的 prompt 报出来。
+    kept = store.read()["agents"]
+    del kept["risk_auditor"]
+    kept["financial_manager"]["delegates_to"].remove("risk_auditor")
+    orphans = store.write_agents(kept)["orphan_prompts"]
+    assert "prompts/risk_auditor.system.md" in orphans
+    assert (directory / "prompts" / "risk_auditor.system.md").is_file()
+
+
+def _spawn_sleeper(self, trace: Path, role: str, task: str, mode: str) -> None:
+    """替掉真实的 Agent 启动：验证并发拦截和停止只需要一个长命子进程。"""
+    self._close_log()
+    self._log = trace.with_suffix(".log").open("w", encoding="utf-8")
+    self._process = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdin=subprocess.DEVNULL,
+        stdout=self._log,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def test_runner_runs_one_agent_and_surfaces_its_failure(tmp_path: Path, monkeypatch):
+    directory = tmp_path / "config"
+    shutil.copytree(Path(mini.DEFAULT_CONFIG_FILE).parent, directory)
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    runner = inspect.Runner(sessions, inspect.ConfigStore(directory / "deepseek.yaml"))
+
+    assert runner.status() == {"idle": True}
+    with pytest.raises(ValueError, match="没有角色"):
+        runner.start("ghost", "x", "observe")
+    with pytest.raises(ValueError, match="任务不能为空"):
+        runner.start("single_call", "   ", "observe")
+    with pytest.raises(ValueError, match="mode"):
+        runner.start("single_call", "x", "yolo")
+
+    # 真起一次子进程。DS_KEY 置空后模型构造就会失败，失败原因必须能在日志尾部看到——
+    # 否则前端点了运行没反应，用户完全没有线索。
+    monkeypatch.setenv("DS_KEY", "")
+    started = runner.start("single_call", "说一句你好", "observe")
+    assert started["trace_id"].endswith("-inspect-single_call.json")
+    assert started["running"] is True
+    deadline = time.time() + 60
+    while runner.status()["running"] and time.time() < deadline:
+        time.sleep(0.2)
+    finished = runner.status()
+    assert finished["running"] is False
+    assert finished["returncode"] != 0
+    assert "DS_KEY" in finished["log_tail"]
+
+    # 同一时刻只允许一个运行：两轮 Agent 会抢 MiniQMT 连接和当日账本。
+    monkeypatch.setattr(inspect.Runner, "_spawn", _spawn_sleeper)
+    runner.start("single_call", "长任务", "observe")
+    with pytest.raises(inspect.Conflict, match="已有运行中"):
+        runner.start("single_call", "又一个", "observe")
+    assert runner.stop()["running"] is False
+    with pytest.raises(ValueError, match="没有运行中"):
+        runner.stop()
+
+    # 服务退出不留孤儿：auto_execute 的交易 Agent 活着就还能继续下单。
+    runner.start("single_call", "再来一个", "observe")
+    process = runner._process
+    runner.shutdown()
+    assert process.poll() is not None

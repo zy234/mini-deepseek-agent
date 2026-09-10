@@ -9,6 +9,7 @@ import tempfile
 import time
 import traceback
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -79,6 +80,9 @@ class LocalEnvironmentConfig(BaseModel):
     agent_call_limit: int = Field(default=4, ge=1, le=20)
     # 子 Agent 轨迹前缀：宿主传入当次会话轨迹的去后缀路径，子 Agent 轨迹与父会话同目录同前缀。
     agent_trace_prefix: str = ""
+    # 父会话身份：子 Agent 轨迹里显式写下父 id 和调度来源，观测端才不用靠文件名规则倒推调度树。
+    agent_session_id: str = ""
+    agent_cycle_kind: str = ""
 
 
 class LocalEnvironment:
@@ -317,14 +321,21 @@ class LocalEnvironment:
         return _json_tool_output("account_monitor", result)
 
     def _execute_agent_call(self, action: dict) -> dict[str, Any]:
-        """在宿主侧运行固定子 Agent，避免模型自行获得账户工具或递归编排能力。"""
+        """在宿主侧运行配置声明的子 Agent，避免模型自行获得账户工具或递归编排能力。"""
         role = action.get("role", "")
         task = action.get("task", "")
-        allowed_roles = {"financial_research", "portfolio_manager", "account_trader"}
-        if role not in allowed_roles:
+        # 能不能委派只看宿主注入了哪些 profile：一个真相来源，不再另存一份角色枚举。
+        profile = self.config.agent_profiles.get(role)
+        if not isinstance(profile, dict):
+            allowed = ", ".join(sorted(self.config.agent_profiles)) or "无"
             return _json_tool_output(
                 "agent_call",
-                {"ok": False, "status": "invalid_argument", "error": {"code": "unknown_role", "detail": "不允许的子 Agent 角色"}},
+                {"ok": False, "status": "invalid_argument", "error": {"code": "unknown_role", "detail": f"不可委派的子 Agent：{role or '(空)'}；本角色可委派：{allowed}"}},
+            )
+        if profile.get("delegates_to"):
+            return _json_tool_output(
+                "agent_call",
+                {"ok": False, "status": "configuration_error", "error": {"code": "nested_delegation", "detail": f"子 Agent {role} 声明了 delegates_to，但宿主只支持一层委派"}},
             )
         if not isinstance(task, str) or not task.strip() or len(task) > 12000:
             return _json_tool_output(
@@ -335,12 +346,6 @@ class LocalEnvironment:
             return _json_tool_output(
                 "agent_call",
                 {"ok": False, "status": "blocked", "error": {"code": "agent_call_limit", "detail": "已达到本次主 Agent 的子 Agent 调用上限"}},
-            )
-        profile = self.config.agent_profiles.get(role)
-        if not isinstance(profile, dict):
-            return _json_tool_output(
-                "agent_call",
-                {"ok": False, "status": "configuration_error", "error": {"code": "missing_role_profile", "detail": f"未配置子 Agent：{role}"}},
             )
         phase_error = self._validate_agent_call_phase(role)
         if phase_error is not None:
@@ -363,6 +368,11 @@ class LocalEnvironment:
             child_settings["agent_name"] = role
             # 子 Agent 轨迹独立落盘：失败时这是唯一能还原死亡位置和已获材料的证据。
             child_settings["output_path"] = trace_path
+            child_settings["session_id"] = f"{self.config.agent_session_id}-{attempt:02d}-{role}"
+            child_settings["session_started_at"] = datetime.now().astimezone().isoformat()
+            child_settings["session_cwd"] = self.config.cwd or os.getcwd()
+            child_settings["parent_session_id"] = self.config.agent_session_id
+            child_settings["cycle_kind"] = self.config.agent_cycle_kind
             child_environment = LocalEnvironment(
                 cwd=self.config.cwd,
                 env=dict(self.config.env),
@@ -478,26 +488,19 @@ class LocalEnvironment:
         }
 
     def _validate_agent_call_phase(self, role: str) -> dict[str, Any] | None:
-        """检查账户管理工作流的最小顺序，交易权限仍由交易工具再次校验。"""
-        if role == "portfolio_manager" and "financial_research" not in self._agent_call_roles:
-            return {
-                "ok": False,
-                "status": "blocked",
-                "error": {
-                    "code": "workflow_order",
-                    "detail": "必须先完成 financial_research，再调用 portfolio_manager",
-                },
-            }
-        if role == "account_trader" and "portfolio_manager" not in self._agent_call_roles:
-            return {
-                "ok": False,
-                "status": "blocked",
-                "error": {
-                    "code": "workflow_order",
-                    "detail": "必须先完成 portfolio_manager，再调用 account_trader",
-                },
-            }
-        return None
+        """交接顺序由子角色配置的 requires 声明；交易权限仍由交易工具再次校验。"""
+        required = (self.config.agent_profiles.get(role) or {}).get("requires") or []
+        missing = [name for name in required if name not in self._agent_call_roles]
+        if not missing:
+            return None
+        return {
+            "ok": False,
+            "status": "blocked",
+            "error": {
+                "code": "workflow_order",
+                "detail": f"必须先完成 {'、'.join(missing)}，再调用 {role}",
+            },
+        }
 
     def _get_miniqmt(self) -> MiniQMTClient:
         if self._miniqmt is None:

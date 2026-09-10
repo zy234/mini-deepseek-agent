@@ -2,6 +2,7 @@
 
 import json
 import time
+from copy import deepcopy
 
 from jinja2 import StrictUndefined, Template
 
@@ -402,7 +403,7 @@ AGENT_CALL_TOOL = {
             "properties": {
                 "role": {
                     "type": "string",
-                    "enum": ["financial_research", "portfolio_manager", "account_trader"],
+                    "description": "可委派的子 Agent 角色；具体取值由宿主按配置的 delegates_to 注入",
                 },
                 "task": {
                     "type": "string",
@@ -438,14 +439,26 @@ TOOL_DEFINITIONS_BY_NAME = {tool["function"]["name"]: tool for tool in TOOL_DEFI
 DEFAULT_TOOL_NAMES = ["bash", "str_replace_editor", "web_search", "web_fetch"]
 
 
-def get_tool_definitions(names: list[str] | None) -> list[dict]:
+def get_tool_definitions(names: list[str] | None, delegate_roles: list[str] | None = None) -> list[dict]:
     """按角色配置缩小工具集合；未配置时只保留通用基础工具。"""
     if names is None:
         names = DEFAULT_TOOL_NAMES
     unknown = set(names) - set(TOOL_DEFINITIONS_BY_NAME)
     if unknown:
         raise ValueError(f"未知工具：{', '.join(sorted(unknown))}")
-    return [TOOL_DEFINITIONS_BY_NAME[name] for name in names]
+    definitions = []
+    for name in names:
+        if name != "agent_call":
+            definitions.append(TOOL_DEFINITIONS_BY_NAME[name])
+            continue
+        if not delegate_roles:
+            raise ValueError("配置了 agent_call 工具却没有声明 delegates_to，无法确定可委派的子 Agent")
+        # role 枚举现场按配置生成：模型看到的角色清单和宿主的准入校验必须是同一份。
+        tool = deepcopy(TOOL_DEFINITIONS_BY_NAME[name])
+        tool["function"]["parameters"]["properties"]["role"]["enum"] = list(delegate_roles)
+        definitions.append(tool)
+    return definitions
+
 
 def parse_toolcall_actions(
     tool_calls: list,
@@ -453,6 +466,7 @@ def parse_toolcall_actions(
     format_error_template: str,
     template_kwargs: dict | None = None,
     allowed_tools: set[str] | None = None,
+    delegate_roles: list[str] | None = None,
 ) -> list[dict]:
     """Parse tool calls from the response. Raises FormatError if unknown tool or invalid args.
 
@@ -515,7 +529,7 @@ def parse_toolcall_actions(
         elif tool_name == "account_monitor":
             error_msg += _validate_account_monitor_args(args)
         elif tool_name == "agent_call":
-            error_msg += _validate_agent_call_args(args)
+            error_msg += _validate_agent_call_args(args, delegate_roles or [])
         if isinstance(args, dict):
             if tool_name == "bash":
                 allowed = {"command", "workdir", "timeout", "description"}
@@ -695,10 +709,11 @@ def _validate_web_fetch_args(args: dict) -> str:
     return ""
 
 
-def _validate_agent_call_args(args: dict) -> str:
+def _validate_agent_call_args(args: dict, delegate_roles: list[str]) -> str:
     role = args.get("role")
-    if role not in {"financial_research", "portfolio_manager", "account_trader"}:
-        return "agent_call 的 role 必须是 financial_research、portfolio_manager 或 account_trader。"
+    if role not in delegate_roles:
+        allowed = ", ".join(delegate_roles) or "无"
+        return f"agent_call 的 role 必须是配置允许的子 Agent：{allowed}。"
     task = args.get("task")
     if not isinstance(task, str) or not task.strip():
         return "agent_call 的 task 必须是非空字符串。"
@@ -825,6 +840,8 @@ def format_toolcall_observation_messages(
         "operation": None,
         "content_hash": None,
         "exception_info": "操作未执行",
+        "started_at": None,
+        "ended_at": None,
     }
     padded_outputs = outputs + [not_executed] * (len(actions) - len(outputs))
     results = []
@@ -835,6 +852,10 @@ def format_toolcall_observation_messages(
         msg = {
             "content": content,
             "extra": {
+                # 观测消息自带工具名和起止时间：否则回溯执行路径必须拿 tool_call_id 反查上一条 assistant。
+                "tool": action.get("tool", ""),
+                "started_at": output.get("started_at"),
+                "ended_at": output.get("ended_at"),
                 "stdout": output.get("stdout", ""),
                 "stderr": output.get("stderr", ""),
                 "returncode": output.get("returncode"),

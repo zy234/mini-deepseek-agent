@@ -18,7 +18,9 @@ from minisweagent.utils.cli_display import StreamRenderer, render_tool_actions
 from minisweagent.utils.serialize import recursive_merge
 
 logger = logging.getLogger("minisweagent.model")
-MODEL_NAME = "deepseek-v4-flash"
+# DeepSeek 平台只认 deepseek-flash 和 deepseek-v4-pro 两个名字；deepseek-v4.1-flash 这类
+# 版本号写法会被直接 400，模型能力由平台在 deepseek-flash 后面滚动升级。
+MODEL_NAME = "deepseek-flash"
 BASE_URL = "https://api.deepseek.com"
 DEFAULT_API_TIMEOUT_SECONDS = 60.0
 
@@ -57,6 +59,7 @@ class DeepSeekModelConfig(BaseModel):
     retry_attempts: int = 3
     api_timeout_seconds: float = DEFAULT_API_TIMEOUT_SECONDS
     stream_output: bool = True
+    model_name: str = MODEL_NAME
     observation_template: str = DEFAULT_OBSERVATION_TEMPLATE
     format_error_template: str = DEFAULT_FORMAT_ERROR_TEMPLATE
 
@@ -74,9 +77,10 @@ class DeepSeekModel:
 
     def query(self, messages: list[dict[str, Any]], **kwargs) -> dict:
         tool_names = kwargs.get("tools")
-        tools = get_tool_definitions(tool_names)
+        delegate_roles = kwargs.get("delegate_roles")
+        tools = get_tool_definitions(tool_names, delegate_roles)
         request = {
-            "model": MODEL_NAME,
+            "model": self.config.model_name,
             "messages": self._api_messages(messages),
             "temperature": self.config.temperature,
             "stream": True,
@@ -103,6 +107,7 @@ class DeepSeekModel:
                 format_error_template=self.config.format_error_template,
                 template_kwargs={"finish_reason": finish_reason},
                 allowed_tools=set(tool_names) if tool_names is not None else None,
+                delegate_roles=delegate_roles,
             )
             if self.config.stream_output:
                 render_tool_actions(actions)
@@ -258,7 +263,7 @@ class DeepSeekModel:
 
     def get_template_vars(self, **kwargs) -> dict[str, Any]:
         return recursive_merge(
-            {"model_name": MODEL_NAME, **self.config.model_dump()}, kwargs
+            {"model_name": self.config.model_name, **self.config.model_dump()}, kwargs
         )
 
     def serialize(self) -> dict:

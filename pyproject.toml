@@ -40,6 +40,7 @@ Repository = "https://github.com/zhaoyu29/mini-deepseek-agent"
 
 [project.scripts]
 mini = "minisweagent.run.mini:app"
+mini-inspect = "minisweagent.run.inspect:app"
 
 [tool.setuptools]
 include-package-data = true
@@ -52,7 +53,7 @@ where = ["src"]
 include = ["minisweagent*"]
 
 [tool.setuptools.package-data]
-minisweagent = ["config/**/*"]
+minisweagent = ["config/**/*", "run/*.html"]
 
 [tool.ruff]
 line-length = 120
