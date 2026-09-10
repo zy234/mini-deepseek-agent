@@ -7,7 +7,7 @@ import plistlib
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,8 @@ from prompt_toolkit import prompt as terminal_prompt
 from rich.console import Console
 
 from minisweagent.agents import get_agent
+from minisweagent.backtest.replay import BacktestDataError
+from minisweagent.backtest.runner import BacktestError, BacktestRunner
 from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
 from minisweagent.models import get_model
@@ -221,6 +223,10 @@ def main(
     trading_round: bool = typer.Option(False, "--round", help="只跑一轮盘中读图与汇总执行，需要当日待观测清单已存在。"),
     miniqmt_mode: str | None = typer.Option(None, "--miniqmt-mode", help=f"交易权限：{'、'.join(MINIQMT_MODES)}；默认读配置。"),
     install_schedule: bool = typer.Option(False, "--install-schedule", help="安装 macOS 工作日 09:15 自动运行交易日的定时任务。"),
+    backtest: str | None = typer.Option(None, "--backtest", help="回测指定交易日（YYYY-MM-DD）：重放历史行情问模型拿读图结论，纸面模拟收益；不会发真实委托。"),
+    backtest_codes: str | None = typer.Option(None, "--codes", help="回测标的，逗号分隔的股票代码；缺省读该日的待观测清单。"),
+    backtest_at: str | None = typer.Option(None, "--at", help="只回测该时刻的槽位，HH:MM；缺省跑全天全部槽位。"),
+    initial_cash: float = typer.Option(100_000.0, "--initial-cash", min=1000.0, help="回测初始资金。"),
 ) -> Any:
     """Run one agent interactively, or drive the three-stage trading pipeline."""
     _load_dotenv()
@@ -228,7 +234,36 @@ def main(
     if miniqmt_mode is not None and miniqmt_mode not in MINIQMT_MODES:
         raise typer.BadParameter(f"--miniqmt-mode 只能是 {'、'.join(MINIQMT_MODES)}")
     trading_flags = (trading_day, premarket, trading_round)
-    if install_schedule:
+    if backtest:
+        if any(trading_flags) or install_schedule:
+            raise typer.BadParameter("--backtest 不能与交易运行参数同时使用")
+        try:
+            trade_date = date.fromisoformat(backtest)
+        except ValueError as exc:
+            raise typer.BadParameter("--backtest 需要 YYYY-MM-DD 日期") from exc
+        codes = [code.strip() for code in (backtest_codes or "").split(",") if code.strip()] or None
+        try:
+            BacktestRunner(
+                settings,
+                sessions_dir=Path.cwd() / ".sessions",
+                journal_dir=_journal_dir(),
+                echo=lambda text: console.print(text),
+                trade_date=trade_date,
+                codes=codes,
+                at=backtest_at,
+                initial_cash=initial_cash,
+            ).run()
+        except (BacktestError, BacktestDataError) as error:
+            # 业务失败（标的来源不成立、数据缺口）是一句话说清的事，不需要 traceback。
+            console.print(f"[red]回测失败：{error}[/red]")
+            raise typer.Exit(1) from error
+        except Exception as error:
+            # 其他失败：一行人话加完整 traceback，两者都要——只留一行是把故障藏起来，
+            # 只甩裸 traceback 是让人猜。print_exception 在 except 里才有现场。
+            console.print(f"[red]回测失败：{type(error).__name__}: {error}[/red]")
+            console.print_exception()
+            raise typer.Exit(1) from error
+        return None
         if any(trading_flags):
             raise typer.BadParameter("--install-schedule 不能与交易运行参数同时使用")
         _install_schedule(config)

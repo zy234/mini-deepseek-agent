@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +15,7 @@ import pytest
 
 from minisweagent import config
 from minisweagent.agents.default import DefaultAgent
+from minisweagent.backtest.runner import BacktestRunner
 from minisweagent.environments import local as local_env
 from minisweagent.environments import miniqmt, web_fetch
 from minisweagent.environments.local import LocalEnvironment
@@ -1072,6 +1073,8 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
     roots = inspect.TraceIndex(sessions_dir).sessions()
     round_root = next(root for root in roots if root["agent_name"] == "execution_manager")
     assert [child["agent_name"] for child in round_root["children"]] == ["chart_reader"] * 3
+    # 观测端区分并行读图组靠的是轨迹里落下的 label，不是去解析任务文本。
+    assert [child["label"] for child in round_root["children"]] == ["TGN热门一", "TGN热门二", "当前持仓"]
     assert any(child["images"] for child in round_root["children"])
 
     # 轮次槽位对齐时钟，非连续竞价时段不跑；收盘后启动必须直接退出，不能空转到第二天。
@@ -1091,6 +1094,92 @@ class _FrozenClock:
 
     def now(self, _tz=None) -> datetime:
         return self.moment
+
+
+def test_backtest_replays_history_simulates_pnl_and_scores_verdicts(tmp_path, monkeypatch):
+    """回测一个槽位：历史行情按时刻截断渲染、结论走真实校验、纸面成交与收益算得出来。
+
+    模型请求用 ScriptedModel，行情用 FakeMiniQMT 的历史 bar；但 prompt 是真实渲染、
+    校验是真实校验、成交规则是真实的纸面账户——这条测试验的是回测自己的口径。
+    """
+    ScriptedModel.seen.clear()
+    ScriptedModel.images.clear()
+    for key, value in {
+        "MINIQMT_MAX_BUY_NOTIONAL": "20000",
+        "MINIQMT_MAX_ORDER_VOLUME": "10000",
+        "MINIQMT_MAX_BUY_VOLUME": "10000",
+        "MINIQMT_MIN_CASH_RATIO": "0.1",
+        "MINIQMT_MAX_ORDERS_PER_CYCLE": "2",
+        "MINIQMT_MAX_ORDERS_PER_DAY": "8",
+        "MINIQMT_MAX_DAILY_BUY_NOTIONAL": "50000",
+    }.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(pipeline, "MiniQMTClient", FakeMiniQMT)
+    monkeypatch.setattr(local_env, "MiniQMTClient", FakeMiniQMT)
+    monkeypatch.setattr(pipeline, "get_model", lambda config: ScriptedModel(**config))
+    monkeypatch.chdir(tmp_path)
+
+    journal_dir = tmp_path / "state"
+    (journal_dir / "watchlist").mkdir(parents=True)
+    (journal_dir / "watchlist" / "2026-09-10.json").write_text(
+        json.dumps(
+            {
+                "trade_date": "2026-09-10",
+                "sectors": [
+                    {
+                        "sector": "TGN热门一",
+                        "reason": "主线板块",
+                        "picks": [
+                            {
+                                "stock_code": "600001.SH",
+                                "reason": "突破前高",
+                                "risk": "破位",
+                                "trend_gate": "breakout",
+                                "premarket_price": 15.2,
+                            }
+                        ],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    backtest = BacktestRunner(
+        _pipeline_settings(tmp_path),
+        sessions_dir=tmp_path / ".sessions",
+        journal_dir=journal_dir,
+        echo=lambda text: None,
+        trade_date=date(2026, 9, 10),
+        at="10:00",
+    )
+    report = backtest.run()
+
+    # 读图真的发生了：一次带图请求，图按 10:00 截断的历史分钟线渲染。
+    assert ScriptedModel.seen["reader"] == 1
+    assert ScriptedModel.images[0]
+    # 成交价就是模型在图上看到的 10:00 那根 bar 的收盘价；数量按额度与一手取整。
+    order = report["slots"][0]["orders"][0]
+    assert order["action"] == "BUY" and order["stock_code"] == "600001.SH"
+    assert order["price"] == pytest.approx(15.55)
+    assert order["volume"] == 1200
+    # 初始资金 → 最终资金：收盘价估值，佣金按最低 5 元收。
+    assert report["final"]["cash"] == 81335.0
+    assert report["final"]["total"] == 100079.0
+    assert report["final"]["return_pct"] == 0.079
+    # 结论质量：前向收益和 MFE/MAE 来自模型没看到的未来 bar。
+    verdict = report["verdicts"][0]
+    assert (verdict["fwd_pct"], verdict["mfe_pct"], verdict["mae_pct"]) == (0.45, 0.64, -1.29)
+    assert report["stats"]["BUY"] == {
+        "count": 1,
+        "mean_fwd_pct": 0.45,
+        "median_fwd_pct": 0.45,
+        "hit_rate": 1.0,
+        "mean_mfe_pct": 0.64,
+        "mean_mae_pct": -1.29,
+    }
+    assert list((journal_dir / "backtest").glob("20260910-*.json"))
 
 
 def test_pipeline_role_configuration_is_guarded(tmp_path):

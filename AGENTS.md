@@ -24,7 +24,11 @@ src/minisweagent/environments/account_journal.py 每日追加式交易账本
 src/minisweagent/trading/pipeline.py            三阶段编排、校验与交易日循环
 src/minisweagent/trading/context.py             宿主侧取数、账户/账本装配和注入排版
 src/minisweagent/trading/charts.py              日线与分钟线渲染成 PNG
-src/minisweagent/run/mini.py                    CLI：单角色会话与交易日入口
+src/minisweagent/backtest/replay.py             历史行情重放：按时刻截断、指标与图的口径复用实盘函数
+src/minisweagent/backtest/simulate.py           纸面账户：固定成交规则、T+1、费率与硬限额
+src/minisweagent/backtest/evaluate.py           结论的前向收益评估（MFE/MAE）与回测摘要
+src/minisweagent/backtest/runner.py             回测编排：槽位循环、报告落盘，复用流水线装配与校验
+src/minisweagent/run/mini.py                    CLI：单角色会话、交易日入口与回测入口
 src/minisweagent/run/inspect.py                 轨迹观测与角色配置服务：会话索引、并行子会话、执行路径、图片、配置与 prompt 读写
 src/minisweagent/run/inspect_ui.html            观测与配置前端单页，无构建、无外部依赖
 src/minisweagent/utils/cli_display.py           CLI 分段、颜色和摘要展示
@@ -37,11 +41,20 @@ tests/test_core.py                              核心功能测试
 
 - 三个阶段角色的名字写死在宿主调度里：`candidate_scout`（single_shot + json_output）、`chart_reader`（single_shot + json_output）、`execution_manager`（iterative + `miniqmt_trade`）。这三条硬形态由 `config/PIPELINE_ROLES` 在写盘前校验，改坏了不会报错只会安静跑偏。
 - 阶段之间只由宿主传递结构化数据，没有任何 Agent 能调度另一个 Agent。阶段二各组之间没有共享状态，所以直接用线程并行；一组失败不打死整轮，但失败必须跟着数据进阶段三的输入。
+- 并行读图组的板块名通过 `session_label` 落进子轨迹的 `info.session`，观测端靠这个字段区分组；观测端不许去解析任务文本猜名字，那是把显示绑死在 prompt 措辞上。
 - 模型给出的股票代码必须落在宿主注入的池子里，`_validate_watchlist` 和 `_validate_verdicts` 会逐条核对。校验不过就把原因回传给模型重来（默认 2 次），凭记忆编出来的代码会让账户买到完全无关的票。
 - 取数失败进 `errors` 并注入 prompt，让模型知道自己在残缺数据上判断；账户快照取不到则整轮失败——没有可用资金和可卖数量，任何交易判断都是猜的。
 - 图片只以路径存在轨迹里，`_api_messages` 在发请求那一刻才读成 base64。轨迹要能反复读、被观测端加载，塞进几 MB base64 会让它变成不可读的文件。
 - 图上一律不写中文：mac 默认字体没有中文字形，缺字渲染成方块且不会报错。中文说明写在 prompt 里。
 - 交易硬限额只有一份定义（`miniqmt.host_limits`），交易工具照它拦单、prompt 照它注入；两处各读一遍环境变量必然漂移，模型就会按一套限额做计划、撞上另一套被拒。
+
+## 回测约定
+
+- 回测只重放阶段二：板块热度榜读的是实时 tick，历史重放不了；execution_manager 需要真实账户和交易工具，也不回放。回测回答两个问题：读图结论在前向走势上准不准，以及"结论 × 固定仓位规则"一天下来赚不赚钱。
+- 回测的口径必须和实盘同一份代码：行情行、趋势字段、时段进度走 `miniqmt` 的现成函数，图走 `charts`/`context._render_pair`，取数走 `context._bars`，读图与校验复用 `TradingPipeline` 的装配。回测自己另写一套指标，就是在回测一个不存在的策略。
+- 成交价一律用决策时刻最后一根分钟 bar 的收盘价（模型看图时的事实），不引入滑点猜测；佣金和印花税是明说的假设，常量在 `backtest/simulate.py`。
+- 标的来自该日已落盘的待观测清单（`journal_dir/watchlist/<date>.json`）或 `--codes` 显式指定；当日买入 T+1 不可卖，成交与跳过都必须留痕进报告。
+- 回测环境锁死 observe，不存在任何真实下单路径；报告落在 `journal_dir/backtest/`，原子写入。
 
 ## 开发约定
 
