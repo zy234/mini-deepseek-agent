@@ -52,7 +52,7 @@ trading:
   max_parallel_groups: 6
   round_json_attempts: 2
 environment:
-  timeout: 60
+  timeout: 120
   miniqmt_mode: auto_execute
   web_search_engines:
     - bing_rss

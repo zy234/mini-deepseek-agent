@@ -42,6 +42,9 @@ logger = logging.getLogger("minisweagent.trading")
 ACTIONS = ("BUY", "SELL", "HOLD")
 # 连续竞价时段。收盘前最后一轮跑完就结束当天，尾盘集中竞价不参与。
 SESSIONS = ((clock_time(9, 30), clock_time(11, 30)), (clock_time(13, 0), clock_time(15, 0)))
+# 盘前清单缺失时的补跑上限：09:20 首跑一次，之后每个槽位各补一次，共 10 次约覆盖 100 分钟，
+# 足够等一次 Bridge/QMT 抖动恢复，又不至于在真故障时空转到收盘。
+MAX_PREMARKET_ATTEMPTS = 10
 
 
 class PipelineError(RuntimeError):
@@ -297,9 +300,16 @@ class TradingPipeline:
     # ---------- 交易日循环 ----------
 
     def run_day(self) -> None:
-        """按时钟推进一个交易日：先补跑盘前，再按固定间隔跑盘中轮次，收盘后返回。"""
-        premarket_done = False
+        """按时钟推进一个交易日：先跑盘前，再按固定间隔跑盘中轮次，收盘后返回。
+
+        盘前失败不锁死全天：清单缺失时 09:20 首跑一次，之后每个槽位补跑一次，
+        上限 MAX_PREMARKET_ATTEMPTS 次。盘中迟到启动（Bridge 抖动恢复后重启进程）
+        从下一个槽位的补跑开始，watchlist 已存在则直接进盘中轮次。
+        """
         finished_slots: set[str] = set()
+        attempts = 0
+        # 上次盘前尝试对应的触发点（"premarket" 或槽位名）：同一触发点 5 秒一圈的循环里只试一次。
+        attempted_key: str | None = None
         while True:
             now = datetime.now(TRADING_TZ)
             if now.weekday() >= 5:
@@ -309,15 +319,24 @@ class TradingPipeline:
                 # 收盘后直接结束，包括"启动就已经过了收盘"这种迟到启动：否则会空转到明天。
                 self.echo(f"已过收盘时间，交易日结束，本日跑了 {len(finished_slots)} 轮。")
                 return
-            if not premarket_done and now.time() >= self.config.premarket_time():
-                # 盘中启动时也要先跑盘前：没有待观测清单，阶段二没有任何标的可读。
-                premarket_done = True
-                if self._read_watchlist_or_none(now.date()) is None:
-                    self._guarded(self.premarket, "盘前选池")
-                else:
-                    self.echo(f"今日待观测清单已存在，跳过盘前：{self._watchlist_path(now.date().isoformat())}")
             slot = self._round_slot(now)
-            if slot and slot not in finished_slots and premarket_done:
+            # premarket 触发点只存在于 09:20 到开盘之间；开盘后由槽位接管，午休和收盘后都是 None。
+            key = slot or (
+                "premarket" if self.config.premarket_time() <= now.time() < SESSIONS[0][0] else None
+            )
+            missing = self._read_watchlist_or_none(now.date()) is None
+            if key is not None and key != attempted_key:
+                attempted_key = key
+                if not missing:
+                    if key == "premarket":
+                        self.echo(f"今日待观测清单已存在，跳过盘前：{self._watchlist_path(now.date().isoformat())}")
+                elif attempts < MAX_PREMARKET_ATTEMPTS:
+                    attempts += 1
+                    self._guarded(self.premarket, f"盘前选池（第 {attempts}/{MAX_PREMARKET_ATTEMPTS} 次）")
+                else:
+                    self.echo(f"盘前选池补跑已达 {MAX_PREMARKET_ATTEMPTS} 次上限，剩余槽位跳过。")
+            # 清单落盘后当轮立即接上盘中：补跑成功不必等下一个槽位。
+            if slot and slot not in finished_slots and self._read_watchlist_or_none(now.date()) is not None:
                 finished_slots.add(slot)
                 self._guarded(self.run_round, f"{slot} 盘中轮次")
             time.sleep(5)
