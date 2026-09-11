@@ -38,6 +38,7 @@ class BacktestRunner:
         trade_date: date,
         codes: list[str] | None = None,
         at: str | None = None,
+        extra_slots: list[str] | None = None,
         initial_cash: float = 100_000.0,
     ):
         self.pipeline = TradingPipeline(settings, sessions_dir=sessions_dir, journal_dir=journal_dir, echo=echo)
@@ -47,6 +48,10 @@ class BacktestRunner:
         self.trade_date = trade_date
         self.codes = codes
         self.at = self._parse_at(at)
+        if at and extra_slots:
+            raise BacktestError("--at 只跑单个槽位，与额外槽位不能同时指定")
+        # 固定间隔对齐出来的网格覆盖不了的时刻（比如尾盘 14:40）从这里补，逐个校验时段。
+        self.extra_slots = sorted({self._parse_at(moment) for moment in extra_slots or []} - {None})
         self.initial_cash = initial_cash
         self.account = PaperAccount(initial_cash, host_limits())
 
@@ -66,6 +71,8 @@ class BacktestRunner:
         if not index_minutes:
             raise BacktestDataError(f"指数 {config.index_codes[0]} 没有当日分钟线，无法定位槽位")
         slots = [self.at] if self.at else replay.slot_times(index_minutes, self.trade_date, config.round_interval_minutes)
+        if self.extra_slots:
+            slots = sorted(set(slots) | set(self.extra_slots))
         if not slots:
             raise BacktestDataError("没有可跑的槽位：分钟线覆盖不到连续竞价时段")
         self.echo(

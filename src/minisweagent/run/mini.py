@@ -226,6 +226,7 @@ def main(
     backtest: str | None = typer.Option(None, "--backtest", help="回测指定交易日（YYYY-MM-DD）：重放历史行情问模型拿读图结论，纸面模拟收益；不会发真实委托。"),
     backtest_codes: str | None = typer.Option(None, "--codes", help="回测标的，逗号分隔的股票代码；缺省读该日的待观测清单。"),
     backtest_at: str | None = typer.Option(None, "--at", help="只回测该时刻的槽位，HH:MM；缺省跑全天全部槽位。"),
+    extra_slots: str | None = typer.Option(None, "--extra-slots", help="在固定间隔的槽位之外追加的时刻，逗号分隔的 HH:MM，如 14:40。"),
     initial_cash: float = typer.Option(100_000.0, "--initial-cash", min=1000.0, help="回测初始资金。"),
 ) -> Any:
     """Run one agent interactively, or drive the three-stage trading pipeline."""
@@ -242,6 +243,7 @@ def main(
         except ValueError as exc:
             raise typer.BadParameter("--backtest 需要 YYYY-MM-DD 日期") from exc
         codes = [code.strip() for code in (backtest_codes or "").split(",") if code.strip()] or None
+        moments = [moment.strip() for moment in (extra_slots or "").split(",") if moment.strip()] or None
         try:
             BacktestRunner(
                 settings,
@@ -251,6 +253,7 @@ def main(
                 trade_date=trade_date,
                 codes=codes,
                 at=backtest_at,
+                extra_slots=moments,
                 initial_cash=initial_cash,
             ).run()
         except (BacktestError, BacktestDataError) as error:
