@@ -53,7 +53,6 @@ trading:
   round_json_attempts: 2
 environment:
   timeout: 120
-  miniqmt_mode: auto_execute
   web_search_engines:
     - bing_rss
     - baidu_html

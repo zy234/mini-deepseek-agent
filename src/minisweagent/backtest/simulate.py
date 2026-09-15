@@ -7,7 +7,7 @@
 规则（全部来自宿主硬限额 host_limits，与实盘交易工具同一份定义）：
 
 - SELL 结论：可卖部分全部卖出；当日买入的部分 T+1 不可卖，记跳过。
-- BUY 结论：按 confidence 降序尝试，受单笔金额、周期/当日买单数、当日买入总额、现金
+- BUY 结论：按 confidence 降序尝试，受单笔金额、周期订单数、当日买入总额、现金
   保留比例约束；数量按一手取整。已持仓的票允许加仓。
 """
 
@@ -32,7 +32,6 @@ class PaperAccount:
         self.limits = limits
         # {code: {"volume": 总量, "bought_today": 当日买入量, "avg_cost": 均价, "last_price": 最近成交价}}
         self.positions: dict[str, dict[str, Any]] = {}
-        self.buys_today = 0
         self.daily_buy_notional = 0.0
         self._buys_this_slot = 0
 
@@ -142,9 +141,6 @@ class PaperAccount:
         if len(orders) >= self.limits["max_orders_per_cycle"]:
             skipped.append({**entry, "reason": "本周期订单数已满"})
             return
-        if self.buys_today >= self.limits["max_orders_per_day"]:
-            skipped.append({**entry, "reason": "当日买单数已满"})
-            return
         total_asset = self.cash + self._market_value(prices)
         budget = min(self.limits["max_buy_notional"], self.cash - self.limits["min_cash_ratio"] * total_asset)
         if budget < price * LOT_SIZE:
@@ -166,12 +162,14 @@ class PaperAccount:
         if volume < LOT_SIZE or cost + fee > self.cash:
             skipped.append({**entry, "reason": "现金不足"})
             return
+        if cost < self.limits["min_order_notional"]:
+            skipped.append({**entry, "reason": "低于单笔最低金额"})
+            return
         if self.daily_buy_notional + cost > self.limits["max_daily_buy_notional"]:
             skipped.append({**entry, "reason": "当日买入金额已满"})
             return
         self.cash -= cost + fee
         self.daily_buy_notional += cost
-        self.buys_today += 1
         self._buys_this_slot += 1
         position = self.positions.setdefault(
             code, {"volume": 0, "bought_today": 0, "avg_cost": 0.0, "last_price": price}

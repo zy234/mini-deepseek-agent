@@ -60,6 +60,8 @@ SECTOR_RANK_MIN_MEMBERS = 5
 # 申万每个行业都有一个"加权"孪生板块，成分股完全相同，留着只会让热度榜一半是重复项。
 SECTOR_NAME_SUFFIX_SKIP = ("加权",)
 logger = logging.getLogger("minisweagent.miniqmt")
+_PROJECT_ENV_VALUES: dict[str, str] = {}
+_PROJECT_ENV_VALUES: dict[str, str] = {}
 
 
 class MiniQMTClient:
@@ -173,7 +175,7 @@ class MiniQMTClient:
         returned = 0
         # 单笔买入上限决定了哪些票根本买不起：候选发现阶段就把它交给模型，别等下单被 blocked 才知道。
         try:
-            max_buy_notional = _positive_float_env("MINIQMT_MAX_BUY_NOTIONAL", 20_000.0)
+            max_buy_notional = _positive_float_env("MINIQMT_MAX_BUY_NOTIONAL")
         except ValueError as exc:
             return _error("configuration_error", str(exc))
         for start in range(0, len(universe), QUOTE_BATCH_SIZE):
@@ -272,7 +274,7 @@ class MiniQMTClient:
         if not members:
             return _error("empty_universe", f"{family} 板块族没有取到任何成分股")
         try:
-            max_buy_notional = _positive_float_env("MINIQMT_MAX_BUY_NOTIONAL", 20_000.0)
+            max_buy_notional = _positive_float_env("MINIQMT_MAX_BUY_NOTIONAL")
         except ValueError as exc:
             return _error("configuration_error", str(exc))
         ticks = self._market_ticks()
@@ -422,6 +424,7 @@ class MiniQMTClient:
         return self._request("POST", "/api/v1/market/sectors/download")
 
     def account(self, view: str) -> dict[str, Any]:
+        _load_project_env()
         account_id = os.getenv("MINIQMT_ACCOUNT_ID", "").strip()
         if not account_id:
             return _error("configuration_error", "宿主未配置 MINIQMT_ACCOUNT_ID")
@@ -450,10 +453,15 @@ class MiniQMTClient:
         )
 
     def trade(self, operation: str, inputs: dict[str, Any]) -> dict[str, Any]:
+        _load_project_env()
         if self.mode != "execute":
             if self.mode != "auto_execute":
                 return self._audited(operation, inputs, _error("blocked", "交易工具处于 observe 模式"))
-        if _truthy_env("MINIQMT_KILL_SWITCH"):
+        try:
+            kill_switch = _truthy_env("MINIQMT_KILL_SWITCH")
+        except ValueError as exc:
+            return self._audited(operation, inputs, _error("configuration_error", str(exc)))
+        if kill_switch:
             return self._audited(operation, inputs, _error("blocked", "宿主 kill switch 已开启"))
         if self.mode == "auto_execute" and not _is_trading_time(datetime.now(TRADING_TZ)):
             return self._audited(operation, inputs, _error("blocked", "auto_execute 只允许在 A 股连续竞价时段交易"))
@@ -545,10 +553,7 @@ class MiniQMTClient:
         price = payload.get("price")
         max_volume_name = "MINIQMT_MAX_BUY_VOLUME" if side == "BUY" else "MINIQMT_MAX_SELL_VOLUME"
         try:
-            max_volume = _positive_int_env(
-                max_volume_name,
-                _positive_int_env("MINIQMT_MAX_ORDER_VOLUME", 10_000),
-            )
+            max_volume = _positive_int_env(max_volume_name)
         except ValueError as exc:
             return _error("configuration_error", str(exc))
         if volume > max_volume:
@@ -562,7 +567,8 @@ class MiniQMTClient:
             return _error("blocked", "最新行情缺少有效价格或时间，禁止交易")
         last_price, quote_at = quote
         try:
-            max_deviation_bps = _positive_float_env("MINIQMT_MAX_PRICE_DEVIATION_BPS", 50.0)
+            max_deviation_bps = _positive_float_env("MINIQMT_MAX_PRICE_DEVIATION_BPS")
+            min_order_notional = _positive_float_env("MINIQMT_MIN_ORDER_NOTIONAL")
         except ValueError as exc:
             return _error("configuration_error", str(exc))
         if price_cap is not None:
@@ -580,7 +586,7 @@ class MiniQMTClient:
                 )
         if self.mode == "auto_execute":
             try:
-                max_age = _positive_int_env("MINIQMT_MAX_QUOTE_AGE_SECONDS", 30)
+                max_age = _positive_int_env("MINIQMT_MAX_QUOTE_AGE_SECONDS")
             except ValueError as exc:
                 return _error("configuration_error", str(exc))
             age = (datetime.now(TRADING_TZ) - quote_at.astimezone(TRADING_TZ)).total_seconds()
@@ -599,12 +605,14 @@ class MiniQMTClient:
                 return _error("blocked", "账户没有科创板交易权限，禁止买入 688/689 代码")
             notional = round(float(price) * volume, 2)
             try:
-                max_notional = _positive_float_env("MINIQMT_MAX_BUY_NOTIONAL", 20_000.0)
-                min_cash_ratio = _ratio_env("MINIQMT_MIN_CASH_RATIO", 0.10)
+                max_notional = _positive_float_env("MINIQMT_MAX_BUY_NOTIONAL")
+                min_cash_ratio = _ratio_env("MINIQMT_MIN_CASH_RATIO")
             except ValueError as exc:
                 return _error("configuration_error", str(exc))
             if notional > max_notional:
                 return _error("blocked", f"BUY 金额超过宿主单笔上限 {max_notional:.2f}")
+            if notional < min_order_notional:
+                return _error("blocked", f"BUY 金额低于宿主单笔下限 {min_order_notional:.2f}")
             asset_result = self._request("GET", "/api/v1/trader/asset", query={"account_id": account_id})
             asset = _extract_asset(asset_result.get("data")) if asset_result["ok"] else None
             if asset is None:
@@ -625,10 +633,17 @@ class MiniQMTClient:
             return _error("blocked", f"SELL 数量超过可卖数量 {can_use_volume}")
         # 趋势跟踪策略要求小亏就走，所以不再按浮亏比例阻断卖出；亏损幅度只上报，退出纪律由组合计划负责。
         loss_ratio = (last_price - avg_cost) / avg_cost
+        notional = round(last_price * volume, 2)
+        try:
+            min_order_notional = _positive_float_env("MINIQMT_MIN_ORDER_NOTIONAL")
+        except ValueError as exc:
+            return _error("configuration_error", str(exc))
+        if notional < min_order_notional:
+            return _error("blocked", f"SELL 金额低于宿主单笔下限 {min_order_notional:.2f}")
         return _success(
             operation="order_safety",
             data={
-                "notional": round(last_price * volume, 2),
+                "notional": notional,
                 "last_price": last_price,
                 "loss_ratio": loss_ratio,
                 "price": price,
@@ -647,9 +662,8 @@ class MiniQMTClient:
         notional: float,
     ) -> dict[str, Any]:
         try:
-            max_cycle = _positive_int_env("MINIQMT_MAX_ORDERS_PER_CYCLE", 2)
-            max_day = _positive_int_env("MINIQMT_MAX_ORDERS_PER_DAY", 8)
-            max_daily_buy = _positive_float_env("MINIQMT_MAX_DAILY_BUY_NOTIONAL", 50_000.0)
+            max_cycle = _positive_int_env("MINIQMT_MAX_ORDERS_PER_CYCLE")
+            max_daily_buy = _positive_float_env("MINIQMT_MAX_DAILY_BUY_NOTIONAL")
         except ValueError as exc:
             return _error("configuration_error", str(exc))
         self.state_dir.mkdir(parents=True, exist_ok=True)
@@ -687,18 +701,12 @@ class MiniQMTClient:
                     "SELECT COUNT(*) FROM intents WHERE account_hash = ? AND cycle_id = ?",
                     (account_hash, self.cycle_id),
                 ).fetchone()[0]
-                day_count = conn.execute(
-                    "SELECT COUNT(*) FROM intents WHERE account_hash = ? AND trading_day = ?",
-                    (account_hash, trading_day),
-                ).fetchone()[0]
                 daily_buy = conn.execute(
                     "SELECT COALESCE(SUM(notional), 0) FROM intents WHERE account_hash = ? AND trading_day = ? AND side = 'BUY'",
                     (account_hash, trading_day),
                 ).fetchone()[0]
                 if cycle_count >= max_cycle:
                     return _error("blocked", f"本轮写操作已达到上限 {max_cycle}")
-                if day_count >= max_day:
-                    return _error("blocked", f"当日写操作已达到上限 {max_day}")
                 if side == "BUY" and float(daily_buy) + notional > max_daily_buy:
                     return _error("blocked", f"当日累计买入金额将超过上限 {max_daily_buy:.2f}")
                 conn.execute(
@@ -784,6 +792,7 @@ class MiniQMTClient:
         payload: dict[str, Any] | None = None,
         unknown_on_network_error: bool = False,
     ) -> dict[str, Any]:
+        _load_project_env()
         url = self.base_url + path
         if query:
             url += "?" + urlencode(query)
@@ -830,22 +839,18 @@ def host_limits() -> dict[str, Any]:
     """
     return {
         "lot_size": LOT_SIZE,
-        "max_buy_notional": _positive_float_env("MINIQMT_MAX_BUY_NOTIONAL", 20_000.0),
-        "max_buyable_price": round(_positive_float_env("MINIQMT_MAX_BUY_NOTIONAL", 20_000.0) / LOT_SIZE, 2),
-        "max_daily_buy_notional": _positive_float_env("MINIQMT_MAX_DAILY_BUY_NOTIONAL", 50_000.0),
-        "max_orders_per_cycle": _positive_int_env("MINIQMT_MAX_ORDERS_PER_CYCLE", 2),
-        "max_orders_per_day": _positive_int_env("MINIQMT_MAX_ORDERS_PER_DAY", 8),
-        "max_buy_volume": _positive_int_env(
-            "MINIQMT_MAX_BUY_VOLUME", _positive_int_env("MINIQMT_MAX_ORDER_VOLUME", 10_000)
-        ),
-        "max_sell_volume": _positive_int_env(
-            "MINIQMT_MAX_SELL_VOLUME", _positive_int_env("MINIQMT_MAX_ORDER_VOLUME", 10_000)
-        ),
-        "min_cash_ratio": _ratio_env("MINIQMT_MIN_CASH_RATIO", 0.10),
-        "max_price_deviation_bps": _positive_float_env("MINIQMT_MAX_PRICE_DEVIATION_BPS", 50.0),
+        "max_buy_notional": _positive_float_env("MINIQMT_MAX_BUY_NOTIONAL"),
+        "max_buyable_price": round(_positive_float_env("MINIQMT_MAX_BUY_NOTIONAL") / LOT_SIZE, 2),
+        "max_daily_buy_notional": _positive_float_env("MINIQMT_MAX_DAILY_BUY_NOTIONAL"),
+        "max_orders_per_cycle": _positive_int_env("MINIQMT_MAX_ORDERS_PER_CYCLE"),
+        "min_order_notional": _positive_float_env("MINIQMT_MIN_ORDER_NOTIONAL"),
+        "max_buy_volume": _positive_int_env("MINIQMT_MAX_BUY_VOLUME"),
+        "max_sell_volume": _positive_int_env("MINIQMT_MAX_SELL_VOLUME"),
+        "min_cash_ratio": _ratio_env("MINIQMT_MIN_CASH_RATIO"),
+        "max_price_deviation_bps": _positive_float_env("MINIQMT_MAX_PRICE_DEVIATION_BPS"),
         "kill_switch": _truthy_env("MINIQMT_KILL_SWITCH"),
         "blocked_boards": "科创板 688/689 无交易权限，禁止买入",
-        "min_buy_price": round(TICK_SIZE / (_positive_float_env("MINIQMT_MAX_PRICE_DEVIATION_BPS", 50.0) * LIMIT_PREMIUM_RATIO / 10_000), 2),
+        "min_buy_price": round(TICK_SIZE / (_positive_float_env("MINIQMT_MAX_PRICE_DEVIATION_BPS") * LIMIT_PREMIUM_RATIO / 10_000), 2),
     }
 
 
@@ -865,11 +870,9 @@ def _order_payload(inputs: dict[str, Any], account_id: str) -> dict[str, Any] | 
     if isinstance(volume, bool) or not isinstance(volume, int) or volume <= 0:
         return "volume 必须是正整数"
     try:
-        max_volume = int(os.getenv("MINIQMT_MAX_ORDER_VOLUME", "10000"))
-    except ValueError:
-        return "宿主 MINIQMT_MAX_ORDER_VOLUME 配置无效"
-    if max_volume <= 0:
-        return "宿主 MINIQMT_MAX_ORDER_VOLUME 必须大于 0"
+        max_volume = _positive_int_env("MINIQMT_MAX_ORDER_VOLUME")
+    except ValueError as exc:
+        return str(exc)
     if volume > max_volume:
         return f"volume 超过宿主单笔上限 {max_volume}"
     if side == "BUY" and volume % 100 != 0:
@@ -1178,14 +1181,49 @@ def _now() -> str:
     return datetime.now(TRADING_TZ).isoformat(timespec="seconds")
 
 
+def _load_project_env() -> None:
+    """每次宿主读配置前刷新项目 .env，让长驻的下午进程也能立即使用新值。"""
+    path = Path.cwd() / ".env"
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            value = value[1:-1]
+        # 项目 .env 是长驻进程的默认来源；测试或调用方显式改过的值不被刷新覆盖。
+        current = os.environ.get(name)
+        if current is None or current == _PROJECT_ENV_VALUES.get(name):
+            # .env 是长驻进程的配置来源；调用方显式改过的环境值不被覆盖。
+            current = os.environ.get(name)
+            if current is None or current == _PROJECT_ENV_VALUES.get(name):
+                os.environ[name] = value
+            _PROJECT_ENV_VALUES[name] = value
+        _PROJECT_ENV_VALUES[name] = value
+
+
+def _required_env(name: str, *, allow_empty: bool = False) -> str:
+    _load_project_env()
+    value = os.getenv(name)
+    if value is None or (not allow_empty and not value.strip()):
+        raise ValueError(f"宿主未配置 {name}，请在项目 .env 中填写")
+    return value.strip()
+
+
 def _truthy_env(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    return _required_env(name).lower() in {"1", "true", "yes", "on"}
 
 
-def _positive_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name)
+def _positive_int_env(name: str) -> int:
+    raw = _required_env(name)
     try:
-        value = default if raw is None or not raw.strip() else int(raw)
+        value = int(raw)
     except ValueError as exc:
         raise ValueError(f"宿主 {name} 配置无效") from exc
     if value <= 0:
@@ -1193,10 +1231,10 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
-def _positive_float_env(name: str, default: float) -> float:
-    raw = os.getenv(name)
+def _positive_float_env(name: str) -> float:
+    raw = _required_env(name)
     try:
-        value = default if raw is None or not raw.strip() else float(raw)
+        value = float(raw)
     except ValueError as exc:
         raise ValueError(f"宿主 {name} 配置无效") from exc
     if not math.isfinite(value) or value <= 0:
@@ -1204,8 +1242,8 @@ def _positive_float_env(name: str, default: float) -> float:
     return value
 
 
-def _ratio_env(name: str, default: float) -> float:
-    value = _positive_float_env(name, default)
+def _ratio_env(name: str) -> float:
+    value = _positive_float_env(name)
     if value >= 1:
         raise ValueError(f"宿主 {name} 必须小于 1")
     return value

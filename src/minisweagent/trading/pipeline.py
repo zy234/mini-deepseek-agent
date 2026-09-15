@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import secrets
 import time
 from collections.abc import Callable
@@ -367,7 +368,7 @@ class TradingPipeline:
         """
         environment = LocalEnvironmentConfig(**(self.settings.get("environment") or {}))
         return MiniQMTClient(
-            base_url=environment.miniqmt_bridge_url,
+            base_url=environment.miniqmt_bridge_url or os.environ["MINIQMT_BRIDGE_URL"],
             timeout=environment.timeout,
             mode="observe",
             state_dir=self.journal_dir,

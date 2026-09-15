@@ -6,7 +6,7 @@
 
 ```bash
 python3 -m pip install -e .
-export DS_KEY="your-key"
+# 按 .env.example 建立项目 .env，并填写 DS_KEY、Bridge 和账户信息
 ```
 
 ## 三阶段流水线
@@ -28,7 +28,7 @@ mini --round             # 只跑一轮阶段二 + 阶段三
 mini --miniqmt-mode auto_execute --trading-day   # 显式打开真实下单
 ```
 
-默认 `miniqmt_mode: observe`（配置里写着），交易工具会返回 `blocked` 但整条链路照跑并写账本，用来先看"本来会下什么单"。确认无误后再用 `--miniqmt-mode auto_execute` 或改配置放开。同一状态目录只允许一个交易进程，重复启动会被运行锁拒绝；需要立即停止所有写操作时设置 `MINIQMT_KILL_SWITCH=1`。
+`MINIQMT_AGENT_MODE` 在项目 `.env` 中明确设置：`observe` 只观察，`execute` 或 `auto_execute` 才允许真实交易。同一状态目录只允许一个交易进程，重复启动会被运行锁拒绝；需要立即停止所有写操作时把 `.env` 中的 `MINIQMT_KILL_SWITCH` 改为 `1`。
 
 在 macOS 上安装工作日自动任务（从当前工作目录 `.env` 读取 `DS_KEY`、MiniQMT Bridge 和账户配置）：
 
@@ -64,21 +64,15 @@ mini-inspect
 
 ## MiniQMT 与交易安全
 
-```bash
-export MINIQMT_ACCOUNT_ID="your-account-id"
-export MINIQMT_BRIDGE_URL="http://127.0.0.1:8023"
-export MINIQMT_BRIDGE_API_KEY="your-api-key"
-```
+所有运行参数都必须写在项目 `.env` 中；代码不再为交易参数静默补默认值。`miniqmt.host_limits` 是唯一定义，交易工具和 prompt 读的是同一份：
 
-默认限额，可由环境变量进一步收紧（`miniqmt.host_limits` 是唯一定义，交易工具和 prompt 读的是同一份）：
-
-- `MINIQMT_MAX_ORDER_VOLUME=10000`：所有订单的绝对股数上限。
-- `MINIQMT_MAX_BUY_VOLUME` / `MINIQMT_MAX_SELL_VOLUME`：买卖方向股数上限，默认继承绝对上限。
-- `MINIQMT_MAX_BUY_NOTIONAL=20000`：单笔买入金额上限。
-- `MINIQMT_MAX_DAILY_BUY_NOTIONAL=50000`：单日累计买入金额上限。
-- `MINIQMT_MAX_ORDERS_PER_CYCLE=2` / `MINIQMT_MAX_ORDERS_PER_DAY=8`：写操作次数上限。
-- `MINIQMT_MIN_CASH_RATIO=0.10`：买入后的最低现金比例。
-- `MINIQMT_MAX_QUOTE_AGE_SECONDS=30` / `MINIQMT_MAX_PRICE_DEVIATION_BPS=50`：行情新鲜度和限价偏离上限。
+- `MINIQMT_MAX_ORDER_VOLUME` / `MINIQMT_MAX_BUY_VOLUME` / `MINIQMT_MAX_SELL_VOLUME`：所有订单及买卖方向的股数上限。
+- `MINIQMT_MAX_BUY_NOTIONAL`：单笔买入金额上限。
+- `MINIQMT_MAX_DAILY_BUY_NOTIONAL`：单日累计买入金额上限。
+- `MINIQMT_MAX_ORDERS_PER_CYCLE`：本轮写操作次数上限；不设置每日委托笔数上限。
+- `MINIQMT_MIN_ORDER_NOTIONAL`：每笔买卖委托金额下限，单位为元。
+- `MINIQMT_MIN_CASH_RATIO`：买入后的最低现金比例。
+- `MINIQMT_MAX_QUOTE_AGE_SECONDS` / `MINIQMT_MAX_PRICE_DEVIATION_BPS`：行情新鲜度和限价偏离上限。
 
 买入限价不由调用方给定：`miniqmt_trade` 的买入只接受 `price_cap`（追高上限），宿主在提交那一刻按最新价推导实际限价——上浮偏离额度的 80% 保证吃得到卖盘，向下取整到 0.01 元报价网格，并且不越过 `price_cap`。模型自己算固定限价必然踩坑：价格一漂移就撞破 50bp 偏离上限被拒。
 

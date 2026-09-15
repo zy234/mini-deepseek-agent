@@ -25,9 +25,7 @@ from minisweagent.trading.pipeline import TradingPipeline
 from minisweagent.utils.cli_display import clear_recent_full_blocks, render_recent_full_blocks
 from minisweagent.utils.serialize import UNSET, recursive_merge
 
-DEFAULT_CONFIG_FILE = Path(
-    os.getenv("MSWEA_MINI_CONFIG_PATH", builtin_config_dir / "deepseek.yaml")
-)
+DEFAULT_CONFIG_FILE = builtin_config_dir / "deepseek.yaml"
 MINIQMT_MODES = ("observe", "execute", "auto_execute")
 console = Console(highlight=False)
 app = typer.Typer(add_completion=False)
@@ -139,7 +137,7 @@ def _run_session(agent: Any, task: str, *, interactive: bool) -> None:
 
 
 def _journal_dir() -> Path:
-    directory = Path(os.getenv("MINIQMT_AGENT_STATE_DIR", ".sessions/account-manager"))
+    directory = Path(os.environ["MINIQMT_AGENT_STATE_DIR"])
     return directory if directory.is_absolute() else Path.cwd() / directory
 
 

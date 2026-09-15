@@ -50,23 +50,25 @@ TERMINATION_GRACE_SECONDS = 0.25
 logger = logging.getLogger("minisweagent.environment")
 
 
+def _configured_env(name: str, *, allow_empty: bool = False) -> str:
+    """读取项目 .env 已明确配置的值，缺项时把变量名直接暴露给启动错误。"""
+    value = os.getenv(name)
+    if value is None or (not allow_empty and not value.strip()):
+        raise ValueError(f"宿主未配置 {name}，请在项目 .env 中填写")
+    return value.strip()
+
+
 class LocalEnvironmentConfig(BaseModel):
     cwd: str = ""
     env: dict[str, str] = {}
     timeout: float = 30
     web_search_engines: list[str] = Field(default_factory=lambda: list(DEFAULT_SEARCH_ENGINES))
     web_search_max_results: int = Field(default=8, ge=1)
-    web_as_of: str = Field(default_factory=lambda: os.getenv("MSWEA_WEB_AS_OF", "").strip())
-    web_fetch_browser_enabled: bool = Field(
-        default_factory=lambda: os.getenv("MSWEA_WEB_FETCH_BROWSER", "1").strip().lower()
-        not in {"0", "false", "no", "off"}
-    )
-    miniqmt_bridge_url: str = Field(
-        default_factory=lambda: os.getenv("MINIQMT_BRIDGE_URL", "http://127.0.0.1:8023")
-    )
-    # 账户是自主运行的，默认就该能下单；测试时显式 MINIQMT_AGENT_MODE=observe 关掉执行。
-    miniqmt_mode: str = Field(default_factory=lambda: os.getenv("MINIQMT_AGENT_MODE", "auto_execute"))
-    account_journal_dir: str = ".sessions/account-manager"
+    web_as_of: str | None = None
+    web_fetch_browser_enabled: bool | None = None
+    miniqmt_bridge_url: str | None = None
+    miniqmt_mode: str | None = None
+    account_journal_dir: str | None = None
     account_cycle_id: str = Field(default_factory=lambda: f"manual-{time.time_ns()}")
 
 
@@ -90,11 +92,22 @@ class LocalEnvironment:
         if action.get("tool") == "web_search":
             return self._execute_web_search(action, timeout=timeout)
         if action.get("tool") == "web_fetch":
+            web_as_of = self.config.web_as_of
+            browser_enabled = self.config.web_fetch_browser_enabled
+            if web_as_of is None:
+                web_as_of = _configured_env("MSWEA_WEB_AS_OF", allow_empty=True)
+            if browser_enabled is None:
+                browser_enabled = _configured_env("MSWEA_WEB_FETCH_BROWSER").lower() not in {
+                    "0",
+                    "false",
+                    "no",
+                    "off",
+                }
             return execute_web_fetch(
                 action.get("url", ""),
                 timeout=timeout if timeout is not None else self.config.timeout,
-                as_of=self.config.web_as_of,
-                browser_enabled=self.config.web_fetch_browser_enabled,
+                as_of=web_as_of,
+                browser_enabled=browser_enabled,
             )
         if action.get("tool") == "miniqmt_account":
             return _json_tool_output("miniqmt_account", self._get_miniqmt().account(action.get("view", "")))
@@ -190,13 +203,16 @@ class LocalEnvironment:
             timeout=search_timeout,
             engines=self.config.web_search_engines,
             max_results=self.config.web_search_max_results,
-            as_of=self.config.web_as_of,
+            as_of=self.config.web_as_of
+            if self.config.web_as_of is not None
+            else _configured_env("MSWEA_WEB_AS_OF", allow_empty=True),
         )
 
     def _execute_miniqmt_trade(self, action: dict) -> dict[str, Any]:
         operation = action.get("operation", "")
         inputs = action.get("inputs", {})
-        if self.config.miniqmt_mode == "execute":
+        mode = self.config.miniqmt_mode or _configured_env("MINIQMT_AGENT_MODE")
+        if mode == "execute":
             summary = json.dumps(
                 {"tool": "miniqmt_trade", "operation": operation, "inputs": inputs},
                 ensure_ascii=False,
@@ -213,11 +229,12 @@ class LocalEnvironment:
 
     def _execute_account_journal(self, action: dict) -> dict[str, Any]:
         operation = action.get("operation", "")
+        journal_dir = self.config.account_journal_dir or _configured_env("MINIQMT_AGENT_STATE_DIR")
         if operation == "read":
-            result = read_account_journal(self.config.account_journal_dir)
+            result = read_account_journal(journal_dir)
         elif operation == "append":
             result = append_account_cycle(
-                self.config.account_journal_dir,
+                journal_dir,
                 self.config.account_cycle_id,
                 action.get("record"),
             )
@@ -234,10 +251,10 @@ class LocalEnvironment:
     def _get_miniqmt(self) -> MiniQMTClient:
         if self._miniqmt is None:
             self._miniqmt = MiniQMTClient(
-                base_url=self.config.miniqmt_bridge_url,
+                base_url=self.config.miniqmt_bridge_url or _configured_env("MINIQMT_BRIDGE_URL"),
                 timeout=self.config.timeout,
-                mode=self.config.miniqmt_mode,
-                state_dir=self.config.account_journal_dir,
+                mode=self.config.miniqmt_mode or _configured_env("MINIQMT_AGENT_MODE"),
+                state_dir=self.config.account_journal_dir or _configured_env("MINIQMT_AGENT_STATE_DIR"),
                 cycle_id=self.config.account_cycle_id,
             )
         return self._miniqmt
