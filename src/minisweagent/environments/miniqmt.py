@@ -1346,3 +1346,7 @@ def _parse_time(value: Any) -> datetime | None:
         except ValueError:
             continue
     return None
+
+
+# 直接导入宿主模块时也读取项目配置；CLI 和长驻进程会在每次请求前继续刷新。
+_load_project_env()
