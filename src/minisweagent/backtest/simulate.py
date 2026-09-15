@@ -7,7 +7,7 @@
 规则（全部来自宿主硬限额 host_limits，与实盘交易工具同一份定义）：
 
 - SELL 结论：可卖部分全部卖出；当日买入的部分 T+1 不可卖，记跳过。
-- BUY 结论：按 confidence 降序尝试，受单笔金额、周期订单数、当日买入总额、现金
+- BUY 结论：按 confidence 降序尝试，受单笔金额、当日买入总额、现金
   保留比例约束；数量按一手取整。已持仓的票允许加仓。
 """
 
@@ -33,13 +33,11 @@ class PaperAccount:
         # {code: {"volume": 总量, "bought_today": 当日买入量, "avg_cost": 均价, "last_price": 最近成交价}}
         self.positions: dict[str, dict[str, Any]] = {}
         self.daily_buy_notional = 0.0
-        self._buys_this_slot = 0
 
     def apply(self, slot: str, verdicts: list[dict], prices: dict[str, float]) -> tuple[list[dict], list[dict]]:
         """应用一个槽位的全部结论，返回（成交，跳过）。"""
         orders: list[dict] = []
         skipped: list[dict] = []
-        self._buys_this_slot = 0
         sells = [verdict for verdict in verdicts if verdict.get("action") == "SELL"]
         # 买单按 confidence 降序：最有把握的先占额度，排后面的额度不够就记跳过，和实盘
         # "额度用完被工具拒单"是同一件事。
@@ -136,11 +134,6 @@ class PaperAccount:
         code = verdict["stock_code"]
         price = prices[code]
         entry = {"slot": slot, "stock_code": code, "action": "BUY"}
-        # 卖单也占周期订单额度：orders 只装本槽位的成交，len 就是本轮已用额度，
-        # 和实盘工具的 max_orders_per_cycle 是同一个计数口径。
-        if len(orders) >= self.limits["max_orders_per_cycle"]:
-            skipped.append({**entry, "reason": "本周期订单数已满"})
-            return
         total_asset = self.cash + self._market_value(prices)
         budget = min(self.limits["max_buy_notional"], self.cash - self.limits["min_cash_ratio"] * total_asset)
         if budget < price * LOT_SIZE:
@@ -162,15 +155,11 @@ class PaperAccount:
         if volume < LOT_SIZE or cost + fee > self.cash:
             skipped.append({**entry, "reason": "现金不足"})
             return
-        if cost < self.limits["min_order_notional"]:
-            skipped.append({**entry, "reason": "低于单笔最低金额"})
-            return
         if self.daily_buy_notional + cost > self.limits["max_daily_buy_notional"]:
             skipped.append({**entry, "reason": "当日买入金额已满"})
             return
         self.cash -= cost + fee
         self.daily_buy_notional += cost
-        self._buys_this_slot += 1
         position = self.positions.setdefault(
             code, {"volume": 0, "bought_today": 0, "avg_cost": 0.0, "last_price": price}
         )

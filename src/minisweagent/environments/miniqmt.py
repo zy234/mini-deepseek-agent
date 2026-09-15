@@ -568,7 +568,6 @@ class MiniQMTClient:
         last_price, quote_at = quote
         try:
             max_deviation_bps = _positive_float_env("MINIQMT_MAX_PRICE_DEVIATION_BPS")
-            min_order_notional = _positive_float_env("MINIQMT_MIN_ORDER_NOTIONAL")
         except ValueError as exc:
             return _error("configuration_error", str(exc))
         if price_cap is not None:
@@ -611,8 +610,6 @@ class MiniQMTClient:
                 return _error("configuration_error", str(exc))
             if notional > max_notional:
                 return _error("blocked", f"BUY 金额超过宿主单笔上限 {max_notional:.2f}")
-            if notional < min_order_notional:
-                return _error("blocked", f"BUY 金额低于宿主单笔下限 {min_order_notional:.2f}")
             asset_result = self._request("GET", "/api/v1/trader/asset", query={"account_id": account_id})
             asset = _extract_asset(asset_result.get("data")) if asset_result["ok"] else None
             if asset is None:
@@ -634,12 +631,6 @@ class MiniQMTClient:
         # 趋势跟踪策略要求小亏就走，所以不再按浮亏比例阻断卖出；亏损幅度只上报，退出纪律由组合计划负责。
         loss_ratio = (last_price - avg_cost) / avg_cost
         notional = round(last_price * volume, 2)
-        try:
-            min_order_notional = _positive_float_env("MINIQMT_MIN_ORDER_NOTIONAL")
-        except ValueError as exc:
-            return _error("configuration_error", str(exc))
-        if notional < min_order_notional:
-            return _error("blocked", f"SELL 金额低于宿主单笔下限 {min_order_notional:.2f}")
         return _success(
             operation="order_safety",
             data={
@@ -662,7 +653,6 @@ class MiniQMTClient:
         notional: float,
     ) -> dict[str, Any]:
         try:
-            max_cycle = _positive_int_env("MINIQMT_MAX_ORDERS_PER_CYCLE")
             max_daily_buy = _positive_float_env("MINIQMT_MAX_DAILY_BUY_NOTIONAL")
         except ValueError as exc:
             return _error("configuration_error", str(exc))
@@ -697,16 +687,10 @@ class MiniQMTClient:
                 ).fetchone()
                 if duplicate:
                     return _error("duplicate_intent", "该 client_intent_id 已被持久化处理，禁止重复提交")
-                cycle_count = conn.execute(
-                    "SELECT COUNT(*) FROM intents WHERE account_hash = ? AND cycle_id = ?",
-                    (account_hash, self.cycle_id),
-                ).fetchone()[0]
                 daily_buy = conn.execute(
                     "SELECT COALESCE(SUM(notional), 0) FROM intents WHERE account_hash = ? AND trading_day = ? AND side = 'BUY'",
                     (account_hash, trading_day),
                 ).fetchone()[0]
-                if cycle_count >= max_cycle:
-                    return _error("blocked", f"本轮写操作已达到上限 {max_cycle}")
                 if side == "BUY" and float(daily_buy) + notional > max_daily_buy:
                     return _error("blocked", f"当日累计买入金额将超过上限 {max_daily_buy:.2f}")
                 conn.execute(
@@ -842,7 +826,6 @@ def host_limits() -> dict[str, Any]:
         "max_buy_notional": _positive_float_env("MINIQMT_MAX_BUY_NOTIONAL"),
         "max_buyable_price": round(_positive_float_env("MINIQMT_MAX_BUY_NOTIONAL") / LOT_SIZE, 2),
         "max_daily_buy_notional": _positive_float_env("MINIQMT_MAX_DAILY_BUY_NOTIONAL"),
-        "max_orders_per_cycle": _positive_int_env("MINIQMT_MAX_ORDERS_PER_CYCLE"),
         "min_order_notional": _positive_float_env("MINIQMT_MIN_ORDER_NOTIONAL"),
         "max_buy_volume": _positive_int_env("MINIQMT_MAX_BUY_VOLUME"),
         "max_sell_volume": _positive_int_env("MINIQMT_MAX_SELL_VOLUME"),

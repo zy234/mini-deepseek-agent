@@ -15,7 +15,7 @@
 ## 先建立共同口径
 
 1. **先看大盘，再看个股**：指数在均价线上方抬高且回撤有承接，顺势 BUY 才有环境；指数跌破均价、反弹无力或两指数方向冲突时，收紧 BUY，优先 HOLD。大盘弱不是自动 SELL 个股的理由，持仓仍须按个股退出条件处理。
-2. **宿主字段是硬事实**：`last_price`、`open`、`high`、`low`、`close_position`、`change_pct`、`ma5`、`ma10`、`ma20`、`ma_stack`、`ma20_gap_pct`、`trend_gate`、`pivot`、`high_20d_gap_pct`、`swing_low_10d`、`stop_ref`、`vol_ratio`、`lot_cost`、`buyable` 由代码计算。字段为 `null` 或相关错误在 `errors` 里时，不要用眼睛补数字；关键数据缺失就 HOLD。
+2. **宿主字段是硬事实**：`last_price`、`open`、`high`、`low`、`close_position`、`change_pct`、`ma5`、`ma10`、`ma20`、`ma_stack`、`ma20_gap_pct`、`trend_gate`、`pivot`、`high_20d_gap_pct`、`swing_low_10d`、`stop_ref`、`vol_ratio`、`lot_cost`、`buyable` 由代码计算。字段为 `null` 或相关错误在 `errors` 里时，不要用眼睛补数字。
 3. **趋势是过滤器，不是追价理由**：`trend_gate=broken` 或 `insufficient_data` 不 BUY；`extended` 表示已经离 MA20/前高太远，不追；`pullback` 只说明可能有回踩机会，仍要等分钟线止跌；`breakout` 也不等于现在必须买。
 
 ## 日内位置和路径
@@ -51,7 +51,6 @@
 
 ## 置信度、冲突和证据
 
-- 置信度只反映当前证据，不反映“想赚多少”。三个以上独立确认且图、字段一致才可给高置信度；信号冲突、图模糊、数据缺口时降到 0.5 以下并优先 HOLD。
 - `reason` 必须写清：日线状态、日内位置（下沿/中部/上沿或 `close_position`）、分钟路径、量价确认以及触发的 BUY/SELL 门槛；不要只写“看涨”“形态良好”。`risk` 写出会让结论失效的下一条可观察信号。
 - 不要把 MACD、RSI、盘口、新闻或任何图上没有且字段没有的事实当作证据，也不要凭记忆补股票代码、价格或未来走势。
 

@@ -5,7 +5,7 @@
 ## A 股规则，违反了会被柜台或宿主拒单
 
 - **T+1**：今天买入的股票今天不能卖。可卖数量只看 `position.can_use_volume`，不是 `volume`。
-- **买入必须是 100 股的整数倍**，且金额在 `limits.min_order_notional` 到 `limits.max_buy_notional` 之间；买入后可用资金不能低于总资产的 `limits.min_cash_ratio`。
+- **买入必须是 100 股的整数倍**，且金额不超过 `limits.max_buy_notional`；`limits.min_order_notional` 只是建议的单笔金额基准，若一手低于该金额，由你结合现金和风险自行调整，不因低于该值拒单；买入后可用资金不能低于总资产的 `limits.min_cash_ratio`。
 - **买入用 `price_cap`（追高上限）而不是 `price`**：宿主在提交那一刻按最新价推导出既能成交又不超偏离上限的限价。自己算固定价，价格一漂移就会被偏离上限拒掉。最新价已经高过 `price_cap` 时宿主直接拒单，这是设计行为，不要抬高上限去追。
 - **卖出给 `price`**（固定限价），只校验可卖数量和数量上限。
 - **禁止买入科创板 688/689**：账户没有权限。
@@ -13,8 +13,7 @@
 
 ## 硬限额
 
-`limits.max_orders_per_cycle` 是本轮最多能提交几笔写操作，`limits.max_daily_buy_notional` 是当日买入金额上限；不限制每日委托笔数。每笔委托金额还必须达到 `limits.min_order_notional`。额度快用完时优先留给卖出：卖出是控制风险，买入是增加风险。
-
+不限制本轮或当日委托笔数；仍受现金、单笔买入上限和当日累计买入金额上限约束。`limits.min_order_notional` 是低金额委托的调整参考，不是宿主拦截条件。额度快用完时优先留给卖出：卖出是控制风险，买入是增加风险。
 `limits.kill_switch` 为 true 时一笔都不许提交，直接记录账本并说明。
 
 ## 怎么裁决

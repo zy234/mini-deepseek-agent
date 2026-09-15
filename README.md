@@ -69,8 +69,8 @@ mini-inspect
 - `MINIQMT_MAX_ORDER_VOLUME` / `MINIQMT_MAX_BUY_VOLUME` / `MINIQMT_MAX_SELL_VOLUME`：所有订单及买卖方向的股数上限。
 - `MINIQMT_MAX_BUY_NOTIONAL`：单笔买入金额上限。
 - `MINIQMT_MAX_DAILY_BUY_NOTIONAL`：单日累计买入金额上限。
-- `MINIQMT_MAX_ORDERS_PER_CYCLE`：本轮写操作次数上限；不设置每日委托笔数上限。
-- `MINIQMT_MIN_ORDER_NOTIONAL`：每笔买卖委托金额下限，单位为元。
+- 不设置本轮或每日委托笔数上限。
+- `MINIQMT_MIN_ORDER_NOTIONAL`：低金额委托的调整参考值，单位为元，不是拦截下限。
 - `MINIQMT_MIN_CASH_RATIO`：买入后的最低现金比例。
 - `MINIQMT_MAX_QUOTE_AGE_SECONDS` / `MINIQMT_MAX_PRICE_DEVIATION_BPS`：行情新鲜度和限价偏离上限。
 
