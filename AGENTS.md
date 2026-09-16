@@ -24,7 +24,7 @@ src/minisweagent/environments/account_journal.py 每日追加式交易账本
 src/minisweagent/trading/pipeline.py            三阶段编排、校验与交易日循环
 src/minisweagent/trading/context.py             宿主侧取数、账户/账本装配和注入排版
 src/minisweagent/trading/charts.py              日线与分钟线渲染成 PNG
-src/minisweagent/trading/notify.py              交易日四个汇报点推送企业微信自建应用（markdown），旁路通道，未配置即跳过
+src/minisweagent/trading/notify.py              交易日四个汇报点推送企业微信群机器人 Webhook（markdown），旁路通道，未配置即跳过
 src/minisweagent/backtest/replay.py             历史行情重放：按时刻截断、指标与图的口径复用实盘函数
 src/minisweagent/backtest/simulate.py           纸面账户：固定成交规则、T+1、费率与硬限额
 src/minisweagent/backtest/evaluate.py           结论的前向收益评估（MFE/MAE）与回测摘要
@@ -62,7 +62,7 @@ tests/test_core.py                              核心功能测试
 - 目标 Python 版本为 3.10 或更高，并使用类型注解。
 - 优先采用显式构造，不要增加工厂或兼容性垫片。
 - 配置保存在 `deepseek.yaml`，角色 prompt 单独放在 `config/prompts/`；改 Agent 行为改 prompt，改安全和硬约束改工具层。密钥从 `DS_KEY` 读取。
-- 微信通知是交易主路径外的旁路：走企业微信自建应用（官方通道，敏感财务数据不过第三方），凭证 `WECOM_CORPID`、`WECOM_CORPSECRET`、`WECOM_AGENTID`、可选 `WECOM_TOUSER` 只进 `.env`，缺任一 `notify.enabled()` 即为假，宿主跳过全部取数与排版；access_token 进程内缓存并在失效时刷新重试一次；推送失败只回显加日志，绝不 raise 打死交易日。消息类型用 markdown（在企业微信 App 里看），content 硬上限 2048 字节先本地按字节裁。汇报内容直接用流水线里已产生的模型输出（候选 reason、执行 submission、复盘报告），不额外发模型请求。
+- 微信通知是交易主路径外的旁路：走企业微信群机器人 Webhook（官方通道，敏感财务数据不过第三方；Webhook 不校验可信 IP、不要域名/回调）。凭证是整条 Webhook URL，存 `.env` 的 `WECOM_WEBHOOK`，只认官方 `qyapi.weixin.qq.com/cgi-bin/webhook/send` 前缀，配错不发；缺失 `notify.enabled()` 即为假，宿主跳过全部取数与排版；推送失败只回显加日志，绝不 raise 打死交易日。消息类型 markdown，content 硬上限 4096 字节先本地按字节裁。汇报内容直接用流水线里已产生的模型输出（候选 reason、执行 submission、复盘报告），不额外发模型请求。
 - 永远不要序列化或记录 `DS_KEY`。
 - GitHub API Token 由用户在 `~/.zshrc` 中导出为 `GITHUB_TOKEN`；非交互命令创建 PR 时需通过交互 `zsh` 加载，但不得打印、序列化或记录其值。
 - 代码注释应用中文，清楚的解释为什么这么开发。
