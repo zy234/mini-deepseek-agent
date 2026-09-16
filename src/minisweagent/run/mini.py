@@ -21,6 +21,7 @@ from minisweagent.backtest.runner import BacktestError, BacktestRunner
 from minisweagent.config import builtin_config_dir, get_config_from_spec
 from minisweagent.environments import get_environment
 from minisweagent.models import get_model
+from minisweagent.trading.daily_report import build_daily_report
 from minisweagent.trading.pipeline import TradingPipeline
 from minisweagent.utils.cli_display import clear_recent_full_blocks, render_recent_full_blocks
 from minisweagent.utils.serialize import UNSET, recursive_merge
@@ -188,6 +189,9 @@ def _install_schedule(config: Path) -> Path:
             "-m",
             "minisweagent.run.mini",
             "--trading-day",
+            "--miniqmt-mode",
+            # 定时任务是无人值守的交易日主路径，执行阶段要能真实下单；手动 --round/--premarket 不带此参数，仍只读。
+            "auto_execute",
             "--config",
             str(config.resolve()),
         ],
@@ -222,6 +226,7 @@ def main(
     miniqmt_mode: str | None = typer.Option(None, "--miniqmt-mode", help=f"交易权限：{'、'.join(MINIQMT_MODES)}；默认读配置。"),
     install_schedule: bool = typer.Option(False, "--install-schedule", help="安装 macOS 工作日 09:15 自动运行交易日的定时任务。"),
     backtest: str | None = typer.Option(None, "--backtest", help="回测指定交易日（YYYY-MM-DD）：重放历史行情问模型拿读图结论，纸面模拟收益；不会发真实委托。"),
+    report: str | None = typer.Option(None, "--report", help="生成指定交易日的固定复盘报告（YYYY-MM-DD）。"),
     backtest_codes: str | None = typer.Option(None, "--codes", help="回测标的，逗号分隔的股票代码；缺省读该日的待观测清单。"),
     backtest_at: str | None = typer.Option(None, "--at", help="只回测该时刻的槽位，HH:MM；缺省跑全天全部槽位。"),
     extra_slots: str | None = typer.Option(None, "--extra-slots", help="在固定间隔的槽位之外追加的时刻，逗号分隔的 HH:MM，如 14:40。"),
@@ -229,6 +234,13 @@ def main(
 ) -> Any:
     """Run one agent interactively, or drive the three-stage trading pipeline."""
     _load_dotenv()
+    if report:
+        try:
+            report_day = date.fromisoformat(report)
+        except ValueError as exc:
+            raise typer.BadParameter("--report 需要 YYYY-MM-DD 日期") from exc
+        console.print(f"复盘报告已生成：{build_daily_report(_journal_dir(), report_day)}")
+        return None
     settings = get_config_from_spec(config)
     if miniqmt_mode is not None and miniqmt_mode not in MINIQMT_MODES:
         raise typer.BadParameter(f"--miniqmt-mode 只能是 {'、'.join(MINIQMT_MODES)}")
@@ -265,6 +277,7 @@ def main(
             console.print_exception()
             raise typer.Exit(1) from error
         return None
+    if install_schedule:
         if any(trading_flags):
             raise typer.BadParameter("--install-schedule 不能与交易运行参数同时使用")
         _install_schedule(config)
