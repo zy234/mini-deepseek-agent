@@ -35,7 +35,7 @@ from minisweagent.environments.account_journal import append_account_cycle, appe
 from minisweagent.environments.local import LocalEnvironmentConfig
 from minisweagent.environments.miniqmt import TRADING_TZ, MiniQMTClient
 from minisweagent.models import get_model
-from minisweagent.trading import context
+from minisweagent.trading import context, notify
 from minisweagent.utils.serialize import recursive_merge
 
 logger = logging.getLogger("minisweagent.trading")
@@ -148,6 +148,7 @@ class TradingPipeline:
             },
         )
         self.echo(f"待观测清单已落盘：{self._watchlist_path(watchlist['trade_date'])}")
+        notify.premarket(watchlist, pack, echo=self.echo)
         return watchlist
 
     # ---------- 阶段二与阶段三：盘中一轮 ----------
@@ -296,7 +297,23 @@ class TradingPipeline:
         # 账本必须有本轮记录：模型没写就宿主补写，否则下一轮读账本会以为这一轮没跑。
         append_cycle_fallback(self.journal_dir, cycle_id, result.get("submission", ""), result.get("exit_status", "unknown"))
         self.echo(f"{datetime.now(TRADING_TZ).strftime('%H:%M:%S')} 本轮结束：{result.get('exit_status', 'unknown')}")
+        self._notify_trades(pack, result, started)
         return result
+
+    def _notify_trades(self, pack: dict[str, Any], result: dict[str, Any], started: datetime) -> None:
+        """拿执行后的委托和轮前委托做差集，交给通知模块决定推不推。这里只负责取数，排版在 notify。"""
+        if not notify.enabled():
+            return
+        before = {order["order_id"] for order in pack["account"].get("orders") or []}
+        try:
+            fresh = context.account_context(self._data_client(), [])
+        except Exception as error:
+            # 交易已经做完，取账户只为发通知；失败不回炉交易主路径，留痕即可。
+            logger.warning("交易通知取账户失败：%s", type(error).__name__)
+            self.echo(f"[通知] 交易通知取账户失败：{type(error).__name__}")
+            return
+        new_orders = [order for order in fresh["orders"] if order["order_id"] not in before]
+        notify.trades(new_orders, result.get("submission", ""), started, echo=self.echo)
 
     # ---------- 交易日循环 ----------
 
@@ -309,6 +326,8 @@ class TradingPipeline:
         """
         finished_slots: set[str] = set()
         attempts = 0
+        # 盘前彻底失败只通知一次：耗尽补跑后的每个新槽位都会再走一遍 else 分支，不加这个标志会刷屏。
+        premarket_failed_notified = False
         # 上次盘前尝试对应的触发点（"premarket" 或槽位名）：同一触发点 5 秒一圈的循环里只试一次。
         attempted_key: str | None = None
         while True:
@@ -319,6 +338,9 @@ class TradingPipeline:
             if now.time() > SESSIONS[-1][1]:
                 # 收盘后直接结束，包括"启动就已经过了收盘"这种迟到启动：否则会空转到明天。
                 self.echo(f"已过收盘时间，交易日结束，本日跑了 {len(finished_slots)} 轮。")
+                # 只在当天真跑过轮次时推盘后总结：迟到启动到收盘后什么都没跑，没有可总结的东西。
+                if finished_slots:
+                    notify.summary(self.journal_dir, now.date(), echo=self.echo)
                 return
             slot = self._round_slot(now)
             # premarket 触发点只存在于 09:20 到开盘之间；开盘后由槽位接管，午休和收盘后都是 None。
@@ -336,6 +358,9 @@ class TradingPipeline:
                     self._guarded(self.premarket, f"盘前选池（第 {attempts}/{MAX_PREMARKET_ATTEMPTS} 次）")
                 else:
                     self.echo(f"盘前选池补跑已达 {MAX_PREMARKET_ATTEMPTS} 次上限，剩余槽位跳过。")
+                    if not premarket_failed_notified:
+                        premarket_failed_notified = True
+                        notify.premarket_failed(MAX_PREMARKET_ATTEMPTS, echo=self.echo)
             # 清单落盘后当轮立即接上盘中：补跑成功不必等下一个槽位。
             if slot and slot not in finished_slots and self._read_watchlist_or_none(now.date()) is not None:
                 finished_slots.add(slot)
