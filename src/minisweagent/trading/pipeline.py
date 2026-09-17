@@ -432,6 +432,12 @@ class TradingPipeline:
         model_settings = dict(self.settings.get("model", {}))
         # 并行读图时多个流会交错刷屏，所以除了汇总执行都关掉流式输出。
         model_settings["stream_output"] = bool(model_settings.get("stream_output")) and role == "execution_manager"
+        # thinking 强度按角色实测调档（20260917 真实输入）：完全关思考会把读图的 BUY/SELL 打成 HOLD，
+        # 所以一律保留思考、只降档。chart_reader 判断买卖最敏感，medium 决策不变省约 13% 输出；
+        # candidate_scout 与 execution_manager 对强度不敏感（选池换池、下单只是按限额机械化），low 更省。
+        effort = {"chart_reader": "medium", "candidate_scout": "low", "execution_manager": "low"}.get(role)
+        if effort:
+            model_settings["reasoning_effort"] = effort
         environment = get_environment(
             environment_settings
             if environment_settings is not None

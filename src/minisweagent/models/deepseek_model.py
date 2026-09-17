@@ -58,6 +58,8 @@ class DeepSeekModelConfig(BaseModel):
 
     temperature: float = 0.0
     thinking: bool = False
+    # 官方支持的思考强度档位（low/medium/high）；仅在 thinking 开启时生效，None 表示不显式传、用平台默认。
+    reasoning_effort: str | None = None
     retry_attempts: int = 3
     api_timeout_seconds: float = DEFAULT_API_TIMEOUT_SECONDS
     stream_output: bool = True
@@ -96,6 +98,9 @@ class DeepSeekModel:
         request["extra_body"] = {
             "thinking": {"type": "enabled" if self.config.thinking else "disabled"}
         }
+        # 思考强度只在开启思考时有意义；关掉思考还传 effort 会自相矛盾，直接不传。
+        if self.config.thinking and self.config.reasoning_effort:
+            request["reasoning_effort"] = self.config.reasoning_effort
 
         response = self._request(request)
         content, reasoning_content, tool_calls, finish_reason, usage = self._consume_stream(response)
