@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -164,7 +165,7 @@ def round_context(
         raise MarketDataError("本轮既没有候选也没有持仓，无可观测标的")
     codes = [stock["stock_code"] for group in groups for stock in group["stocks"]]
     metrics = _screen_metrics(client, codes, errors)
-    daily, intraday = _bars(client, codes + index_codes, now, errors)
+    daily, intraday = _bars(client, codes + index_codes, now, errors, index_codes=index_codes)
     for group in groups:
         for stock in group["stocks"]:
             code = stock["stock_code"]
@@ -265,23 +266,33 @@ def _screen_metrics(client: MiniQMTClient, codes: list[str], errors: list[str]) 
 
 
 def _bars(
-    client: MiniQMTClient, codes: list[str], now: datetime, errors: list[str]
+    client: MiniQMTClient, codes: list[str], now: datetime, errors: list[str], *, index_codes: Iterable[str] = ()
 ) -> tuple[dict[str, list], dict[str, list]]:
-    """取渲染用的日线和当日分钟线。日线窗口给足 90 天，保证 30 根图上的 MA20 从第一根就有值。"""
+    """取渲染用的日线和当日分钟线。日线窗口给足 90 天，保证 30 根图上的 MA20 从第一根就有值。
+
+    日线走 akshare（东财）：大 QMT 撤极简接口后终端只剩当日 1 根，历史取不到。分钟线仍走
+    bridge——bigqmt 靠实时订阅回补当日 bar。index_codes 里的代码按指数取日线。
+    """
     today = now.strftime("%Y%m%d")
     start = (now - timedelta(days=DAILY_LOOKBACK_DAYS)).strftime("%Y%m%d")
     daily: dict[str, list] = {}
+    try:
+        daily = akshare_board.daily_history(codes, start, today, index_codes=index_codes)
+    except akshare_board.BoardDataError as exc:
+        errors.append(f"日线取数失败（akshare）：{exc}")
+    for code in codes:
+        if not daily.get(code):
+            errors.append(f"{code} 没有 1d K 线数据")
     intraday: dict[str, list] = {}
     for begin in range(0, len(codes), QUOTE_BATCH):
         batch = codes[begin : begin + QUOTE_BATCH]
-        for period, target, window in (("1d", daily, start), ("1m", intraday, today)):
-            result = client.history(batch, period=period, start_time=window, end_time=today)
-            if not result["ok"]:
-                errors.append(f"{period} K 线取数失败（{'、'.join(batch)}）：{(result.get('error') or {}).get('detail', '')}")
-                continue
-            target.update(result["data"]["bars"])
-            for code in result["data"].get("empty_codes") or []:
-                errors.append(f"{code} 没有 {period} K 线数据")
+        result = client.history(batch, period="1m", start_time=today, end_time=today)
+        if not result["ok"]:
+            errors.append(f"1m K 线取数失败（{'、'.join(batch)}）：{(result.get('error') or {}).get('detail', '')}")
+            continue
+        intraday.update(result["data"]["bars"])
+        for code in result["data"].get("empty_codes") or []:
+            errors.append(f"{code} 没有 1m K 线数据")
     return daily, intraday
 
 

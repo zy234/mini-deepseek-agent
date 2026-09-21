@@ -17,8 +17,9 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import Any
 
@@ -186,3 +187,69 @@ def board_rank(
         "member_fetch_failures": failed[:10],
         "sectors": ranked[:limit],
     }
+
+
+def _date_int(value: Any) -> int | None:
+    """东财日期列（'2026-09-21' 或 date）统一成 int(YYYYMMDD)：charts 和 _trend_metrics 对 date 用整数。"""
+    text = str(value).strip()[:10].replace("-", "")
+    return int(text) if len(text) == 8 and text.isdigit() else None
+
+
+def _num(value: Any) -> float | None:
+    """转 float，NaN/inf/非数一律给 None：残缺 bar 由 usable_bars 整根丢掉，不能混进均线。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _daily_rows(frame: Any) -> list[dict[str, Any]]:
+    """东财日线表映射成 client.history 的 bars 行形状：{date:int, open, high, low, close, volume, amount}。"""
+    rows: list[dict[str, Any]] = []
+    for _, row in frame.iterrows():
+        date = _date_int(row.get("日期"))
+        if date is None:
+            continue
+        rows.append(
+            {
+                "date": date,
+                "open": _num(row.get("开盘")),
+                "high": _num(row.get("最高")),
+                "low": _num(row.get("最低")),
+                "close": _num(row.get("收盘")),
+                "volume": _num(row.get("成交量")),
+                "amount": _num(row.get("成交额")),
+            }
+        )
+    return rows
+
+
+def daily_history(
+    codes: list[str], start_time: str, end_time: str, *, index_codes: Iterable[str] = ()
+) -> dict[str, list[dict[str, Any]]]:
+    """日线历史走 akshare（东财），返回 {code: [rows]}，行形状与 client.history 的 bars 完全对齐。
+
+    大 QMT 撤极简接口后日线在终端只剩当日 1 根，历史只能从东财取。指数（index_codes 里的代码，
+    如 000001.SH 上证指数）走 index_zh_a_hist，个股走 stock_zh_a_hist；两个接口的日期与量价列同名。
+    个股不复权：趋势判定和图都用原始价，复权后昨收对不上实时 tick。start_time/end_time 是 YYYYMMDD。
+    取不到的 code 给空列表，让调用方按缺图/insufficient_data 留痕，不静默糊过去。
+    """
+    ak = _load_ak()
+    index_set = {str(code) for code in index_codes}
+    out: dict[str, list[dict[str, Any]]] = {}
+    for code in codes:
+        symbol = code[:6]  # 东财只认 6 位纯代码，去掉 .SH/.SZ 后缀
+        kwargs: dict[str, Any] = {"symbol": symbol, "period": "daily", "start_date": start_time, "end_date": end_time}
+        if code in index_set:
+            fetch = ak.index_zh_a_hist
+        else:
+            fetch = ak.stock_zh_a_hist
+            kwargs["adjust"] = ""
+        try:
+            frame = _retry(fetch, **kwargs)
+        except BoardDataError:
+            out[code] = []
+            continue
+        out[code] = _daily_rows(frame)
+    return out

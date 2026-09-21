@@ -231,22 +231,23 @@ class MiniQMTClient:
         return _success(operation="market_screen", data=data)
 
     def _enrich_trend(self, rows: list[dict[str, Any]], quote_at: str) -> list[str]:
-        """给榜单行补日线趋势字段，把是否顺势从模型的目测变成代码判定。"""
+        """给榜单行补日线趋势字段，把是否顺势从模型的目测变成代码判定。
+
+        日线走 akshare（东财）：大 QMT 撤极简接口后，bridge 的日线只剩当日 1 根，算不出均线和前高。
+        akshare_board 反向依赖本模块常量，模块顶层互相 import 会成环，所以在这里延迟导入。
+        """
+        from minisweagent.environments import akshare_board
+
         end = datetime.now(TRADING_TZ)
         start = end - timedelta(days=TREND_LOOKBACK_DAYS)
-        bars = self.history(
-            [row["stock_code"] for row in rows],
-            period="1d",
-            start_time=start.strftime("%Y%m%d"),
-            end_time=end.strftime("%Y%m%d"),
-        )
-        if not bars["ok"]:
-            detail = (bars.get("error") or {}).get("detail") or "未知原因"
+        codes = [row["stock_code"] for row in rows]
+        try:
+            frames = akshare_board.daily_history(codes, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+        except akshare_board.BoardDataError as exc:
             for row in rows:
                 row["trend_gate"] = "insufficient_data"
-            return [f"日线读取失败，全部行按 insufficient_data 处理：{detail}"]
-        frames = bars["data"].get("bars") or {}
-        errors = [f"{code} 无本地日线" for code in bars["data"].get("empty_codes") or []]
+            return [f"日线读取失败（akshare），全部行按 insufficient_data 处理：{exc}"]
+        errors = [f"{code} 无日线" for code in codes if not frames.get(code)]
         # 当日 bar 会混进历史里：pivot 必须是不含今天的前高，否则永远等于今天自己的最高价。
         today, elapsed = _session_progress(quote_at)
         for row in rows:

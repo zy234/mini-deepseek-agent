@@ -66,7 +66,13 @@ class BacktestRunner:
         if not codes:
             raise BacktestError("回测标的是空的")
         errors: list[str] = []
-        daily, intraday = replay.fetch_bars(self.pipeline._data_client(), codes + config.index_codes, self.trade_date, errors)
+        daily, intraday = replay.fetch_bars(
+            self.pipeline._data_client(),
+            codes + config.index_codes,
+            self.trade_date,
+            errors,
+            index_codes=config.index_codes,
+        )
         index_minutes = intraday.get(config.index_codes[0]) or []
         if not index_minutes:
             raise BacktestDataError(f"指数 {config.index_codes[0]} 没有当日分钟线，无法定位槽位")

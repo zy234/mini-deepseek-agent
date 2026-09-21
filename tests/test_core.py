@@ -16,8 +16,8 @@ import pytest
 from minisweagent import config
 from minisweagent.agents.default import DefaultAgent
 from minisweagent.backtest.runner import BacktestRunner
+from minisweagent.environments import akshare_board, miniqmt, web_fetch
 from minisweagent.environments import local as local_env
-from minisweagent.environments import miniqmt, web_fetch
 from minisweagent.environments.local import LocalEnvironment
 from minisweagent.exceptions import FormatError
 from minisweagent.models.deepseek_model import DEFAULT_OBSERVATION_TEMPLATE, DeepSeekModel
@@ -286,25 +286,28 @@ def test_screen_trend_enrichment_labels_breakout_and_broken(monkeypatch):
     def fake_request(method, path, payload=None, params=None):
         if path == "/api/v1/market/full-tick":
             return {"ok": True, "status": "success", "operation": "t", "data": {"ticks": ticks}, "error": None}
-        if path == "/api/v1/market/history/download2":
-            return {"ok": True, "status": "success", "operation": "d", "data": {}, "error": None}
-        if path == "/api/v1/market/history/local":
-            frame = {"columns": ["close", "high", "low", "volume"], "index": dates}
-            return {
-                "ok": True,
-                "status": "success",
-                "operation": "h",
-                "data": {
-                    "data": {
-                        "600001.SH": {**frame, "data": [list(bar.values()) for bar in rising]},
-                        "600002.SH": {**frame, "data": [list(bar.values()) for bar in falling]},
-                    }
-                },
-                "error": None,
-            }
         raise AssertionError(f"未预期的请求 {path}")
 
+    def fake_daily(codes, start_time, end_time, *, index_codes=()):
+        # 日线现在走 akshare（东财），不再打 bridge：把构造的 rising/falling 直接按 code 返回。
+        def rows(bars):
+            return [
+                {
+                    "date": date,
+                    "open": bar["close"],
+                    "high": bar["high"],
+                    "low": bar["low"],
+                    "close": bar["close"],
+                    "volume": bar["volume"],
+                    "amount": 0.0,
+                }
+                for bar, date in zip(bars, dates, strict=False)
+            ]
+
+        return {"600001.SH": rows(rising), "600002.SH": rows(falling)}
+
     monkeypatch.setattr(client, "_request", fake_request)
+    monkeypatch.setattr(akshare_board, "daily_history", fake_daily)
     result = client.screen(stock_codes=list(ticks), sort_by="amount_desc", limit=2, enrich_trend=True)
     assert result["ok"] is True
     rows = {row["stock_code"]: row for row in result["data"]["rows"]}
@@ -863,6 +866,40 @@ def _minute_bars():
     ]
 
 
+# 板块热度榜和日线现在走 akshare（东财），不打 bridge：端到端测试里用构造数据替掉，
+# 既不依赖网络，也不依赖 600001.SH 这类假代码在东财真的存在。
+_FAKE_POOL = {
+    "TGN热门一": ["600001.SH", "600002.SH", "600003.SH"],
+    "TGN热门二": ["000004.SZ", "000005.SZ", "000006.SZ"],
+}
+
+
+def _fake_board_rank(family, *, limit=12, min_buyable=3, max_buy_notional, scan_boards=15):
+    sectors = [
+        {
+            "sector": name,
+            "members": len(codes),
+            "members_quoted": len(codes),
+            "up_count": len(codes),
+            "up_ratio": 0.8,
+            "median_change_pct": 3.1,
+            "amount": 1.2e9,
+            "buyable_count": len(codes),
+            "buyable_median_change_pct": 4.2 - index,
+            "main_net_inflow_yi": 1.5 - index,
+            "main_net_inflow_pct": 3.0 - index,
+            "fund_rank": index + 1,
+            "member_codes": codes,
+        }
+        for index, (name, codes) in enumerate(_FAKE_POOL.items())
+    ]
+    return {"family": family, "sectors": sectors[:limit]}
+
+
+def _fake_daily_history(codes, start_time, end_time, *, index_codes=()):
+    return {code: _daily_bars() for code in codes}
+
+
 class ScriptedModel:
     """按 system prompt 分辨角色的假模型。第一次选池故意编一个池子外的代码，验证宿主会打回。"""
 
@@ -1035,6 +1072,8 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(local_env, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(pipeline, "get_model", lambda config: ScriptedModel(**config))
+    monkeypatch.setattr(akshare_board, "board_rank", _fake_board_rank)
+    monkeypatch.setattr(akshare_board, "daily_history", _fake_daily_history)
     monkeypatch.chdir(tmp_path)
 
     sessions_dir = tmp_path / ".sessions"
@@ -1117,6 +1156,7 @@ def test_backtest_replays_history_simulates_pnl_and_scores_verdicts(tmp_path, mo
     monkeypatch.setattr(pipeline, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(local_env, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(pipeline, "get_model", lambda config: ScriptedModel(**config))
+    monkeypatch.setattr(akshare_board, "daily_history", _fake_daily_history)
     monkeypatch.chdir(tmp_path)
 
     journal_dir = tmp_path / "state"

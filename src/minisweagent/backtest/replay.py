@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date, datetime
 from typing import Any
 
@@ -29,15 +30,21 @@ class BacktestDataError(RuntimeError):
 
 
 def fetch_bars(
-    client: MiniQMTClient, codes: list[str], trade_date: date, errors: list[str]
+    client: MiniQMTClient,
+    codes: list[str],
+    trade_date: date,
+    errors: list[str],
+    *,
+    index_codes: Iterable[str] = (),
 ) -> tuple[dict[str, list], dict[str, list]]:
     """拉全部日线（90 天窗口）和当日分钟线。槽位截断在内存里做，不重复请求。
 
-    走 context._bars 而不是另写一份取数：它按 20 只一批、先下载再读、空数据报错，这些
+    走 context._bars 而不是另写一份取数：日线走 akshare、分钟走 bridge、空数据报错，这些
     行为回测和实盘必须一致，抄第二份必然漂移。传"当日 15:00"当 now，窗口正好落在回测日。
+    index_codes 里的代码按指数取日线，和实盘同一口径。
     """
     clock = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 0, tzinfo=TRADING_TZ)
-    return _bars(client, codes, clock, errors)
+    return _bars(client, codes, clock, errors, index_codes=index_codes)
 
 
 def slot_times(index_minutes: list[dict], trade_date: date, interval_minutes: int) -> list[str]:
