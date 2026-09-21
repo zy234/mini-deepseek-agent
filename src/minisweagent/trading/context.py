@@ -15,12 +15,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from minisweagent.environments import akshare_board
 from minisweagent.environments.account_journal import read_account_journal
 from minisweagent.environments.miniqmt import TRADING_TZ, MiniQMTClient, host_limits
 from minisweagent.trading import charts
 
-# 概念板块定当日主线（短线资金炒概念），申万二级交叉验证背后有没有行业级资金。
-SECTOR_FAMILIES = ("TGN", "SW2")
+# 概念板块定当日主线（短线资金炒概念），行业板块交叉验证背后有没有行业级资金。
+# 数据源：akshare（东财）。大 QMT 撤极简接口后，QMT 已取不到申万/通达信板块数据，见 akshare_board。
+SECTOR_FAMILIES = ("概念", "行业")
 SECTOR_RANK_LIMIT = 12
 DAILY_LOOKBACK_DAYS = 90
 QUOTE_BATCH = 20
@@ -60,23 +62,29 @@ def premarket_context(
     """
     now = datetime.now(TRADING_TZ)
     errors: list[str] = []
-    # 板块成分股必须先下载才读得到，没下载时接口返回空数组而不是报错。
-    download = client.download_sectors()
-    if not download["ok"]:
-        errors.append(f"板块数据下载失败：{(download.get('error') or {}).get('detail', '')}")
+    limits = host_limits()
+    # 板块热度榜与成分股走 akshare（东财）；成分股的实时行情/趋势仍走 ZMQ（client.screen）。
     ranks: dict[str, list[dict]] = {}
     for family in SECTOR_FAMILIES:
-        result = client.sector_rank(family=family, limit=SECTOR_RANK_LIMIT, min_buyable=3)
-        if not result["ok"]:
-            errors.append(f"{family} 板块热度榜失败：{(result.get('error') or {}).get('detail', '')}")
+        try:
+            result = akshare_board.board_rank(
+                family, limit=SECTOR_RANK_LIMIT, min_buyable=3, max_buy_notional=limits["max_buy_notional"]
+            )
+        except akshare_board.BoardDataError as exc:
+            errors.append(f"{family} 板块热度榜失败：{exc}")
             continue
-        ranks[family] = result["data"]["sectors"]
+        ranks[family] = result["sectors"]
     if not ranks.get(SECTOR_FAMILIES[0]):
         raise MarketDataError(f"{SECTOR_FAMILIES[0]} 板块热度榜没有数据，盘前无法选池：{'；'.join(errors)}")
     candidates = []
     for sector in ranks[SECTOR_FAMILIES[0]][:sectors_scanned]:
+        # 成分股由 akshare 给出代码，实时行情与日线趋势字段走 ZMQ：拿代码列表让 client.screen 出确定性结论。
+        codes = sector.get("member_codes") or []
+        if not codes:
+            errors.append(f"板块 {sector['sector']} 无可用成分股代码")
+            continue
         screened = client.screen(
-            sector_name=sector["sector"],
+            stock_codes=codes,
             sort_by="close_position_desc",
             limit=rows_per_sector,
             enrich_trend=True,
@@ -88,8 +96,17 @@ def premarket_context(
             {
                 "sector": sector["sector"],
                 "sector_stats": {
-                    key: sector[key]
-                    for key in ("members_quoted", "up_ratio", "median_change_pct", "buyable_count", "buyable_median_change_pct", "amount")
+                    key: sector.get(key)
+                    for key in (
+                        "members_quoted",
+                        "up_ratio",
+                        "median_change_pct",
+                        "buyable_count",
+                        "buyable_median_change_pct",
+                        "amount",
+                        "main_net_inflow_yi",
+                        "main_net_inflow_pct",
+                    )
                 },
                 "quote_at": screened["data"]["quote_at"],
                 "rows": screened["data"]["rows"],
@@ -105,7 +122,7 @@ def premarket_context(
         "sector_ranks": ranks,
         "sector_candidates": candidates,
         "account": account,
-        "limits": host_limits(),
+        "limits": limits,
         "journal": read_account_journal(journal_dir)["data"],
         "errors": errors,
     }
