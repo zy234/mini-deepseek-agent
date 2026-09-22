@@ -906,6 +906,10 @@ def _order_payload(inputs: dict[str, Any], account_id: str) -> dict[str, Any] | 
         "price_type": "LATEST" if price is None and price_cap is None else "FIX",
         "price": price,
         "price_cap": price_cap,
+        # 意图 id 直接当券商侧的 order_remark：Bridge 提交后不再等 QMT 回填合同编号
+        # （那一步要付 10s 级的委托全量查询），返回时可能没有 order_id，只能靠这个
+        # remark 在下一轮的委托列表里把委托认出来。
+        "order_remark": str(inputs.get("client_intent_id") or ""),
     }
 
 

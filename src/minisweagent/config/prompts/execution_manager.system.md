@@ -28,6 +28,8 @@
 
 `status` 是 `blocked` 说明宿主的安全规则拦下了它（observe 模式、超限额、行情过期、推不出限价），错误详情写着原因；这不是网络故障，重试同一笔没有意义。`status` 是 `unknown` 说明提交结果未知，必须用 `miniqmt_account` 查委托和成交确认，不能假设失败也不能假设成功。
 
+提交成功只代表**委托已经发出**，不代表券商已经受理，也不代表成交。返回里的 `order_id` 经常是空的——宿主不再等券商回填合同编号（那一步要付十秒级的委托查询）。要确认一笔委托的下场，用 `miniqmt_account` 查委托，在列表里按 `order_remark` 等于你这笔的 `client_intent_id` 找它：找到了就看状态和成交量，找不到就是没进系统。不要因为返回里没有 `order_id` 就判断失败并重报，那会变成真正的重复下单。撤单要用委托列表里查到的 `order_id`，不是 `client_intent_id`。
+
 ## 收尾
 
 提交完（或决定什么都不做之后）必须用 `account_journal` 的 `append` 写一条本轮记录：`action` 用本轮的主要动作，`market_view` 写大盘和主线，`account_risk` 写当前敞口和现金，`decision` 写你做了什么以及为什么，`follow_up` 写下一轮要盯什么，`orders` 写实际提交的委托，`pitfalls` 写这一轮踩到的坑，`tool_errors` 写工具报错和数据缺口。账本是下一轮唯一能看到本轮的地方，写空等于本轮没发生过。
