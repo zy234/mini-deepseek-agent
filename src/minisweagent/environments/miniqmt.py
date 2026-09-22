@@ -733,17 +733,33 @@ class MiniQMTClient:
         return _success(operation="intent_lookup", data={"exists": exists})
 
     def _finish_intent(self, account_id: str, intent_id: str, result: dict[str, Any]) -> None:
+        # 当日买入额度只该统计真正占用了市场的委托。下单被券商拒、或干净地失败（根本没发出去），
+        # 都不占额度——否则失败单会把额度白白吃满，把整天买入锁死。释放时把 notional 归零即可：
+        # 审计行仍在（保留决策留痕与去重），SUM(notional) 自然不再计入。
+        # 唯一例外是 status=unknown（5xx/断网，提交结果未知）：宁可保守占额度，也不能因为误判没成交而重复下单撞穿上限。
+        committed = _intent_committed(result)
         try:
             with sqlite3.connect(self.state_dir / "trade_state.sqlite3", timeout=10) as conn:
-                conn.execute(
-                    "UPDATE intents SET status = ?, result_json = ? WHERE account_hash = ? AND intent_id = ?",
-                    (
-                        str(result.get("status") or "unknown"),
-                        json.dumps(result, ensure_ascii=False, sort_keys=True),
-                        _account_hash(account_id),
-                        intent_id,
-                    ),
-                )
+                if committed:
+                    conn.execute(
+                        "UPDATE intents SET status = ?, result_json = ? WHERE account_hash = ? AND intent_id = ?",
+                        (
+                            str(result.get("status") or "unknown"),
+                            json.dumps(result, ensure_ascii=False, sort_keys=True),
+                            _account_hash(account_id),
+                            intent_id,
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE intents SET status = ?, result_json = ?, notional = 0 WHERE account_hash = ? AND intent_id = ?",
+                        (
+                            str(result.get("status") or "unknown"),
+                            json.dumps(result, ensure_ascii=False, sort_keys=True),
+                            _account_hash(account_id),
+                            intent_id,
+                        ),
+                    )
                 conn.commit()
         except sqlite3.Error:
             # 意图已经冻结；更新失败也不能通过重试再次下单。
@@ -1159,6 +1175,25 @@ def _success(*, operation: str, data: Any) -> dict[str, Any]:
 def _error(code: str, detail: str) -> dict[str, Any]:
     status = "unknown" if code == "unknown" else ("blocked" if code == "blocked" else "error")
     return {"ok": False, "status": status, "operation": None, "data": None, "error": {"code": code, "detail": detail}}
+
+
+def _intent_committed(result: dict[str, Any]) -> bool:
+    """这笔委托是否真正占用了市场（决定它算不算当日买入额度）。
+
+    只有拿到"确定没成交"的正面证据才释放额度，否则一律保守占用——漏计会导致重复下单撞穿上限，
+    比偶尔少买一次严重得多：
+    - status=unknown（5xx/断网，提交结果未知）：保守占用。
+    - HTTP 200 且 Bridge 明确回报 accepted=False：券商拒单、没占市场，释放。
+    - 非 unknown 的干净错误（4xx 等请求被拒、根本没提交）：释放。
+    - 其余（accepted=True，或旧响应没这个字段的 200）：保守占用。
+    """
+    status = result.get("status")
+    if status == "unknown":
+        return True
+    if status != "success":
+        return False
+    data = result.get("data")
+    return not (isinstance(data, dict) and data.get("accepted") is False)
 
 
 def _now() -> str:
