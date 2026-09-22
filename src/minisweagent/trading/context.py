@@ -42,6 +42,10 @@ ORDER_STATUS = {
 }
 # offset_flag 48 是开仓（买入），49 是平仓（卖出）。
 OFFSET_SIDE = {48: "BUY", 49: "SELL"}
+# 终态委托：已经尘埃落定，不会再产生新成交。其余状态（在途、部成、撤单在途，以及任何不认识的码）
+# 都当"可能还有在途委托"处理。成交明细（trades）单次查询要付约 10.5s，而它 ⊆ orders 的世界——
+# 能确定没有在途委托时，这一轮跳过 trades 不丢任何决策信息：成没成、有没有重复下单都靠 orders 判断。
+TERMINAL_ORDER_STATUS = {"部撤", "已撤", "已成", "废单"}
 
 
 class MarketDataError(RuntimeError):
@@ -205,6 +209,23 @@ def account_context(client: MiniQMTClient, errors: list[str]) -> dict[str, Any]:
         for item in (result.get("positions") or {}).get("items") or []
         if float(item.get("volume") or 0) > 0
     ]
+    # orders 每轮必查：它既是重复下单的判据（注入里带 order_remark，等于自己上一轮那笔的 client_intent_id），
+    # 又带 traded_volume/status 直接回答"成没成"。trades 只是成交价明细。
+    # 判据写成"能不能确定没有在途委托"，而不是"有没有在途委托"：查询失败、状态码不认识时判不准，
+    # 一律按"可能还有在途、可能再冒新成交"处理，照查 trades——判不准就别省那一次查询。
+    before = len(errors)
+    orders = _order_views(client, "orders", errors)
+    orders_failed = len(errors) > before
+    maybe_pending = orders_failed or any(order["status"] not in TERMINAL_ORDER_STATUS for order in orders)
+    trades_note = None
+    if maybe_pending:
+        trades = _order_views(client, "trades", errors)
+    else:
+        # 有委托但全部终态：本轮没刷成交明细。这不是取数故障，不进 errors（errors 是"数据残缺、判断打折"信号，
+        # 混进来会持续投喂假的降级暗示）；单独用 trades_note 显式说明，别让空 trades 被读成"今天没成交"。
+        trades = []
+        if orders:
+            trades_note = "本轮无未成交委托，未刷新成交明细；成交结果以 orders 的 status/traded_volume 为准。"
     return {
         "snapshot_at": snapshot["data"]["snapshot_at"],
         "asset": {
@@ -214,8 +235,9 @@ def account_context(client: MiniQMTClient, errors: list[str]) -> dict[str, Any]:
             "frozen_cash": asset.get("frozen_cash"),
         },
         "positions": positions,
-        "orders": _order_views(client, "orders", errors),
-        "trades": _order_views(client, "trades", errors),
+        "orders": orders,
+        "trades": trades,
+        "trades_note": trades_note,
     }
 
 
@@ -363,6 +385,9 @@ def _order_views(client: MiniQMTClient, view: str, errors: list[str]) -> list[di
                 "stock_code": item.get("stock_code"),
                 "name": item.get("instrument_name"),
                 "side": OFFSET_SIDE.get(item.get("offset_flag"), str(item.get("offset_flag"))),
+                # order_remark 原样带回宿主下单时发下去的 client_intent_id：模型据此在注入里直接认出自己上一轮那笔委托，
+                # 不用再单独调 miniqmt_account 去对账。
+                "order_remark": item.get("order_remark"),
                 "price": item.get("price"),
                 "order_volume": item.get("order_volume"),
                 "traded_volume": item.get("traded_volume"),

@@ -23,7 +23,7 @@ from minisweagent.exceptions import FormatError
 from minisweagent.models.deepseek_model import DEFAULT_OBSERVATION_TEMPLATE, DeepSeekModel
 from minisweagent.models.utils.actions_toolcall import format_toolcall_observation_messages
 from minisweagent.run import inspect, mini
-from minisweagent.trading import pipeline
+from minisweagent.trading import context, pipeline
 
 # 1x1 透明 PNG：只用来验证图片被读成 base64 塞进请求，不需要真图。
 TINY_PNG = (
@@ -702,6 +702,9 @@ class FakeMiniQMT:
     """
 
     submissions: list[dict] = []
+    # 当日委托列表由测试按分支需要注入；trades_queried 记录成交明细被真的查了几次。
+    orders_items: list[dict] = []
+    trades_queried: int = 0
 
     def __init__(self, **kwargs):
         self.mode = kwargs.get("mode", "observe")
@@ -796,6 +799,10 @@ class FakeMiniQMT:
                     },
                 }
             )
+        if view == "orders":
+            return _ok({"snapshot_at": "2026-09-10T10:00:03+08:00", "result": {"items": FakeMiniQMT.orders_items}})
+        if view == "trades":
+            FakeMiniQMT.trades_queried += 1
         return _ok({"snapshot_at": "2026-09-10T10:00:03+08:00", "result": {"items": []}})
 
     def trade(self, operation, inputs):
@@ -1067,6 +1074,8 @@ def _pipeline_settings(tmp_path: Path) -> dict:
 def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
     """盘前选池 → 并行读图 → 汇总执行的完整一天：图真的渲染，单真的提交，账本真的落盘。"""
     FakeMiniQMT.submissions.clear()
+    FakeMiniQMT.orders_items = []
+    FakeMiniQMT.trades_queried = 0
     ScriptedModel.seen.clear()
     ScriptedModel.images.clear()
     monkeypatch.setattr(pipeline, "MiniQMTClient", FakeMiniQMT)
@@ -1115,6 +1124,28 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
     # 观测端区分并行读图组靠的是轨迹里落下的 label，不是去解析任务文本。
     assert [child["label"] for child in round_root["children"]] == ["TGN热门一", "TGN热门二", "当前持仓"]
     assert any(child["images"] for child in round_root["children"])
+
+    # 成交明细按需查：orders 全终态时跳过 trades 并挂 note；一旦有在途委托（含不认识的状态码）就照查。
+    client = FakeMiniQMT()
+    FakeMiniQMT.orders_items = [
+        {"order_id": "1", "stock_code": "600001.SH", "offset_flag": 48, "order_status": 56,
+         "order_remark": "intent-aaa", "traded_volume": 100},
+    ]
+    FakeMiniQMT.trades_queried = 0
+    errors: list[str] = []
+    account = context.account_context(client, errors)
+    assert account["trades"] == [] and FakeMiniQMT.trades_queried == 0
+    assert account["trades_note"] and not errors  # 未刷明细的说明走 trades_note，不污染 errors
+    assert account["orders"][0]["order_remark"] == "intent-aaa"  # 注入里直接带上对账用的 intent id
+
+    # 状态码 99 不在映射表里：未知状态的安全默认是"可能在途"，必须照查 trades，不能被当成终态跳过。
+    FakeMiniQMT.orders_items = [{"order_id": "2", "stock_code": "600001.SH", "offset_flag": 48, "order_status": 99}]
+    FakeMiniQMT.trades_queried = 0
+    account = context.account_context(client, [])
+    assert FakeMiniQMT.trades_queried == 1 and account["trades_note"] is None
+
+    FakeMiniQMT.orders_items = []
+    FakeMiniQMT.trades_queried = 0
 
     # 轮次槽位对齐时钟，非连续竞价时段不跑；收盘后启动必须直接退出，不能空转到第二天。
     tz = pipeline.TRADING_TZ
