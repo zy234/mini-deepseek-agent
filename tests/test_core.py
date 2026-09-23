@@ -1127,11 +1127,10 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
     # 两个候选板块各一组，加上持仓组，一共三组并行读图。
     assert ScriptedModel.seen["reader"] == 3
     assert len(outcome["readings"]) == 3
-    # 每组都收到了大盘两张图加本组每只票两张图。
-    assert all(len(images) >= 4 for images in ScriptedModel.images)
+    # 每只标的（含大盘指数）只有一张日线+分钟合图，所以每组 = 指数图 + 本组每只票各一张。
+    assert all(len(images) >= 2 for images in ScriptedModel.images)
     charts = sorted(path.name for path in (sessions_dir).rglob("*.png"))
-    assert "600001.SH-daily.png" in charts and "600001.SH-intraday.png" in charts
-    assert "000001.SH-intraday.png" in charts and "603386.SH-daily.png" in charts
+    assert "600001.SH.png" in charts and "000001.SH.png" in charts and "603386.SH.png" in charts
 
     # 汇总执行真的提交了买单，且用的是 price_cap 而不是自己算的固定价。
     assert len(FakeMiniQMT.submissions) == 1

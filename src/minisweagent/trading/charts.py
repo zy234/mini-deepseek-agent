@@ -21,7 +21,8 @@ from matplotlib.ticker import FuncFormatter  # noqa: E402
 UP_COLOR = "#d32f2f"
 DOWN_COLOR = "#2e7d32"
 MA_COLORS = {5: "#f57c00", 10: "#1976d2", 20: "#7b1fa2"}
-FIGSIZE = (7.6, 4.6)
+# 一只标的的日线和分钟线并排画进一张图：左列日线、右列当日分钟线，所以要比单图宽一倍。
+FIGSIZE = (13.4, 4.6)
 DPI = 100
 BAR_FIELDS = ("open", "high", "low", "close", "volume")
 # A 股一手 100 股：xtdata 的分钟成交量是手，成交额是元，算均价必须乘回来。
@@ -41,7 +42,45 @@ def usable_bars(bars: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
-def render_daily(path: Path, code: str, bars: list[dict[str, Any]], *, days: int = 30) -> Path:
+def render_pair(
+    path: Path,
+    code: str,
+    daily_bars: list[dict[str, Any]],
+    intraday_bars: list[dict[str, Any]],
+    *,
+    daily_days: int = 30,
+    prev_close: float | None = None,
+    show_average: bool = True,
+) -> Path:
+    """把同一只标的的日线和当日分钟线画进一张图：左列日线蜡烛+量，右列分钟线+量。
+
+    读图 Agent 一次拿到中期结构和当日盘口，不用再跨两张图对齐同一个代码。某一侧数据不足
+    就只画另一侧、缺失侧标英文 NO DATA（图上不写中文）；两侧都缺才抛，让上层记进 errors。
+    """
+    figure, axes = _make_pair_axes()
+    panels = (
+        ("NO DAILY DATA", axes[0, 0], axes[1, 0], lambda: _draw_daily(axes[0, 0], axes[1, 0], code, daily_bars, daily_days)),
+        (
+            "NO INTRADAY DATA",
+            axes[0, 1],
+            axes[1, 1],
+            lambda: _draw_intraday(axes[0, 1], axes[1, 1], code, intraday_bars, prev_close, show_average),
+        ),
+    )
+    drawn = 0
+    for label, price_ax, volume_ax, draw in panels:
+        try:
+            draw()
+            drawn += 1
+        except ChartDataMissing:
+            _mark_missing(price_ax, volume_ax, label)
+    if not drawn:
+        plt.close(figure)
+        raise ChartDataMissing(f"{code} 日线与分钟线都画不出，无图可交")
+    return _save(figure, path)
+
+
+def _draw_daily(price_ax, volume_ax, code: str, bars: list[dict[str, Any]], days: int) -> None:
     """日线蜡烛图：均线在完整序列上算，只显示最近 days 根，避免首根均线是空的。"""
     rows = usable_bars(bars)
     if len(rows) < 2:
@@ -51,7 +90,6 @@ def render_daily(path: Path, code: str, bars: list[dict[str, Any]], *, days: int
     start = max(0, len(rows) - days)
     shown = rows[start:]
     labels = [_day_label(row["date"]) for row in shown]
-    figure, (price_ax, volume_ax) = _make_axes()
     _draw_candles(price_ax, shown)
     for window, color in MA_COLORS.items():
         series = mas[window][start:]
@@ -75,12 +113,11 @@ def render_daily(path: Path, code: str, bars: list[dict[str, Any]], *, days: int
     price_ax.legend(fontsize=7, loc="upper left", framealpha=0.6)
     _draw_volumes(volume_ax, shown)
     _apply_labels(volume_ax, labels, max(1, len(shown) // 6))
-    return _save(figure, path)
 
 
-def render_intraday(
-    path: Path, code: str, bars: list[dict[str, Any]], *, prev_close: float | None, show_average: bool = True
-) -> Path:
+def _draw_intraday(
+    price_ax, volume_ax, code: str, bars: list[dict[str, Any]], prev_close: float | None, show_average: bool
+) -> None:
     """当日分钟线：收盘价折线加均价线。中午休市在 x 轴上按位置排列，不留空洞。
 
     指数没有"每股价格"这个概念，成交额除成交量算不出点位，所以指数图必须 show_average=False。
@@ -90,7 +127,6 @@ def render_intraday(
         raise ChartDataMissing(f"{code} 当日分钟线只有 {len(rows)} 根，画不出分钟图")
     closes = [float(row["close"]) for row in rows]
     labels = [_minute_label(row["date"]) for row in rows]
-    figure, (price_ax, volume_ax) = _make_axes()
     price_ax.plot(range(len(rows)), closes, color="#212121", linewidth=1.1, label="close")
     average = _running_vwap(rows, closes) if show_average else None
     if average:
@@ -117,18 +153,31 @@ def render_intraday(
         width=1.0,
     )
     _apply_labels(volume_ax, labels, max(1, len(rows) // 6))
-    return _save(figure, path)
 
 
-def _make_axes():
+def _mark_missing(price_ax, volume_ax, label: str) -> None:
+    """一侧数据缺失时，在对应两格中间写英文占位，并清空刻度，别让空白格被读成"没画好"。"""
+    price_ax.text(0.5, 0.5, label, transform=price_ax.transAxes, ha="center", va="center", fontsize=11, color="#9e9e9e")
+    for axis in (price_ax, volume_ax):
+        axis.set_xticks([])
+        axis.set_yticks([])
+
+
+def _make_pair_axes():
     figure, axes = plt.subplots(
-        2, 1, figsize=FIGSIZE, dpi=DPI, sharex=True, gridspec_kw={"height_ratios": [3, 1], "hspace": 0.05}
+        2,
+        2,
+        figsize=FIGSIZE,
+        dpi=DPI,
+        sharex="col",  # 日线和分钟线横轴口径不同，只在各自列内让量价共享 x
+        gridspec_kw={"height_ratios": [3, 1], "hspace": 0.05, "wspace": 0.14},
     )
-    for axis in axes:
+    for axis in axes.flat:
         axis.grid(True, linewidth=0.4, alpha=0.35)
         axis.tick_params(labelsize=8)
-    axes[1].set_ylabel("vol", fontsize=8)
-    axes[1].yaxis.set_major_formatter(FuncFormatter(_compact_number))
+    for volume_ax in (axes[1, 0], axes[1, 1]):
+        volume_ax.set_ylabel("vol", fontsize=8)
+        volume_ax.yaxis.set_major_formatter(FuncFormatter(_compact_number))
     return figure, axes
 
 

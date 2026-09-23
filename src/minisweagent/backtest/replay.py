@@ -172,7 +172,7 @@ def _prior_close(daily_bars: list[dict], day: str) -> float | None:
 def _daily_as_of(daily_bars: list[dict], minutes: list[dict], day: str) -> list[dict]:
     """当日日 bar 用截断分钟线重构：实盘里它本来就是盘中实时长出来的，重放必须同样处理。
 
-    _trend_metrics 和 render_daily 都会把最后一根当"当日 bar"排除出 pivot 计算，所以
+    _trend_metrics 和 _draw_daily 都会把最后一根当"当日 bar"排除出 pivot 计算，所以
     重构 bar 放在末尾即可与实盘口径对齐。
     """
     bars = [bar for bar in daily_bars if bar.get("date") != int(day)]

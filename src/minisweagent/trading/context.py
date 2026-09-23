@@ -428,22 +428,22 @@ def _render_pair(
     *,
     average: bool = True,
 ) -> dict[str, str]:
-    """渲染一只标的的日线图和分钟图。缺图必须报出来：读图 Agent 看不到图只会瞎猜。"""
-    result: dict[str, str] = {}
-    prev_close = _prev_close(daily_bars)
-    for kind, render in (
-        ("daily", lambda path: charts.render_daily(path, code, daily_bars, days=daily_days)),
-        (
-            "intraday",
-            lambda path: charts.render_intraday(path, code, intraday_bars, prev_close=prev_close, show_average=average),
-        ),
-    ):
-        path = chart_dir / f"{code}-{kind}.png"
-        try:
-            result[kind] = str(render(path))
-        except (charts.ChartDataMissing, OSError, ValueError) as error:
-            errors.append(f"{code} {kind} 图渲染失败：{type(error).__name__}: {error}")
-    return result
+    """把一只标的的日线和当日分钟线渲染进同一张图。缺图必须报出来：读图 Agent 看不到图只会瞎猜。"""
+    path = chart_dir / f"{code}.png"
+    try:
+        rendered = charts.render_pair(
+            path,
+            code,
+            daily_bars,
+            intraday_bars,
+            daily_days=daily_days,
+            prev_close=_prev_close(daily_bars),
+            show_average=average,
+        )
+        return {"chart": str(rendered)}
+    except (charts.ChartDataMissing, OSError, ValueError) as error:
+        errors.append(f"{code} 图渲染失败：{type(error).__name__}: {error}")
+        return {}
 
 
 def _prev_close(daily_bars: list[dict]) -> float | None:
