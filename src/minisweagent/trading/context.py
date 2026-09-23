@@ -175,13 +175,13 @@ def round_context(
             code = stock["stock_code"]
             stock.update(metrics.get(code) or {})
             stock["position"] = held.get(code)
-            stock["charts"] = _render_pair(
+            stock["chart"], stock["chart_missing"] = _render_pair(
                 chart_dir, code, daily.get(code) or [], intraday.get(code) or [], daily_days, errors
             )
     indexes = index_quotes(client, index_codes, errors)
     for index in indexes:
         code = index["stock_code"]
-        index["charts"] = _render_pair(
+        index["chart"], index["chart_missing"] = _render_pair(
             chart_dir, code, daily.get(code) or [], intraday.get(code) or [], daily_days, errors, average=False
         )
     return {
@@ -427,11 +427,15 @@ def _render_pair(
     errors: list[str],
     *,
     average: bool = True,
-) -> dict[str, str]:
-    """把一只标的的日线和当日分钟线渲染进同一张图。缺图必须报出来：读图 Agent 看不到图只会瞎猜。"""
+) -> tuple[str | None, list[str]]:
+    """把一只标的的日线和当日分钟线渲染进同一张图。
+
+    返回 (图路径或 None, 缺失侧列表)。缺失侧是结构化事实、要注进 prompt 文本：图上灰字模型可能
+    看漏，而"缺日线不给 BUY"是常态触发的硬风控，必须有文本兜底。整张图都渲染不出时进 errors。
+    """
     path = chart_dir / f"{code}.png"
     try:
-        rendered = charts.render_pair(
+        rendered, missing = charts.render_pair(
             path,
             code,
             daily_bars,
@@ -440,10 +444,10 @@ def _render_pair(
             prev_close=_prev_close(daily_bars),
             show_average=average,
         )
-        return {"chart": str(rendered)}
+        return str(rendered), missing
     except (charts.ChartDataMissing, OSError, ValueError) as error:
         errors.append(f"{code} 图渲染失败：{type(error).__name__}: {error}")
-        return {}
+        return None, ["daily", "intraday"]
 
 
 def _prev_close(daily_bars: list[dict]) -> float | None:

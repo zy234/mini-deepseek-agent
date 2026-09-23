@@ -141,7 +141,7 @@ class BacktestRunner:
         chart_dir = trace.parent / "charts" / hhmm
         for group in groups:
             for stock in group["stocks"]:
-                stock["charts"] = replay.render_pair(
+                stock["chart"], stock["chart_missing"] = replay.render_pair(
                     chart_dir, stock["stock_code"], view["stocks"][stock["stock_code"]], config.daily_chart_days, errors
                 )
         index_charts: list[str] = []
@@ -149,10 +149,11 @@ class BacktestRunner:
             entry = view["index_data"].get(index["stock_code"])
             if entry is None:
                 continue
-            index["charts"] = replay.render_pair(
+            index["chart"], index["chart_missing"] = replay.render_pair(
                 chart_dir, index["stock_code"], entry, config.daily_chart_days, errors, average=False
             )
-            index_charts.extend((index.get("charts") or {}).values())
+            if index["chart"]:
+                index_charts.append(index["chart"])
         pack = {
             "as_of": view["as_of"],
             "trade_date": self.trade_date.isoformat(),

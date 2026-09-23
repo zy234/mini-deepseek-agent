@@ -117,8 +117,10 @@ def slot_view(
     }
 
 
-def render_pair(chart_dir, code: str, entry: dict, daily_days: int, errors: list[str], *, average: bool = True) -> dict[str, str]:
-    """渲染一只标的的日线图和分钟图，直接走实盘的 _render_pair。"""
+def render_pair(
+    chart_dir, code: str, entry: dict, daily_days: int, errors: list[str], *, average: bool = True
+) -> tuple[str | None, list[str]]:
+    """把一只标的的日线和分钟线画进同一张图，直接走实盘的 _render_pair。返回 (图路径或 None, 缺失侧列表)。"""
     return _render_pair(chart_dir, code, entry["daily"], entry["minutes"], daily_days, errors, average=average)
 
 

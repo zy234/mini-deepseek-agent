@@ -23,7 +23,9 @@ DOWN_COLOR = "#2e7d32"
 MA_COLORS = {5: "#f57c00", 10: "#1976d2", 20: "#7b1fa2"}
 # 一只标的的日线和分钟线并排画进一张图：左列日线、右列当日分钟线，所以要比单图宽一倍。
 FIGSIZE = (13.4, 4.6)
-DPI = 100
+# 合图后每侧宽度从原单图 7.6in 降到 6.7in，DPI 提到 130 补回像素：单侧约 870px 高于原来的 760px，
+# 保住分钟线"跌破均价/放量跳水"这类细节的可读性，不被并排挤没了分辨率。
+DPI = 130
 BAR_FIELDS = ("open", "high", "low", "close", "volume")
 # A 股一手 100 股：xtdata 的分钟成交量是手，成交额是元，算均价必须乘回来。
 LOT_SIZE = 100
@@ -51,33 +53,32 @@ def render_pair(
     daily_days: int = 30,
     prev_close: float | None = None,
     show_average: bool = True,
-) -> Path:
+) -> tuple[Path, list[str]]:
     """把同一只标的的日线和当日分钟线画进一张图：左列日线蜡烛+量，右列分钟线+量。
 
     读图 Agent 一次拿到中期结构和当日盘口，不用再跨两张图对齐同一个代码。某一侧数据不足
-    就只画另一侧、缺失侧标英文 NO DATA（图上不写中文）；两侧都缺才抛，让上层记进 errors。
+    就只画另一侧、缺失侧标英文 NO DATA（图上不写中文），并把缺了哪侧作为结构化事实返回，让
+    宿主注进 prompt 文本——图上灰字模型可能看漏，"缺日线不给 BUY"是硬风控，必须有文本兜底。
+    两侧都缺才抛，让上层记进 errors。返回 (图路径, 缺失侧列表)，缺失侧取值 daily / intraday。
     """
     figure, axes = _make_pair_axes()
-    panels = (
-        ("NO DAILY DATA", axes[0, 0], axes[1, 0], lambda: _draw_daily(axes[0, 0], axes[1, 0], code, daily_bars, daily_days)),
-        (
-            "NO INTRADAY DATA",
-            axes[0, 1],
-            axes[1, 1],
-            lambda: _draw_intraday(axes[0, 1], axes[1, 1], code, intraday_bars, prev_close, show_average),
-        ),
-    )
-    drawn = 0
-    for label, price_ax, volume_ax, draw in panels:
-        try:
-            draw()
-            drawn += 1
-        except ChartDataMissing:
-            _mark_missing(price_ax, volume_ax, label)
-    if not drawn:
-        plt.close(figure)
-        raise ChartDataMissing(f"{code} 日线与分钟线都画不出，无图可交")
-    return _save(figure, path)
+    missing: list[str] = []
+    try:
+        _draw_daily(axes[0, 0], axes[1, 0], code, daily_bars, daily_days)
+    except ChartDataMissing:
+        missing.append("daily")
+        _mark_missing(axes[0, 0], axes[1, 0], "NO DAILY DATA")
+    try:
+        _draw_intraday(axes[0, 1], axes[1, 1], code, intraday_bars, prev_close, show_average)
+    except ChartDataMissing:
+        missing.append("intraday")
+        _mark_missing(axes[0, 1], axes[1, 1], "NO INTRADAY DATA")
+    try:
+        if len(missing) == 2:
+            raise ChartDataMissing(f"{code} 日线与分钟线都画不出，无图可交")
+        return _save(figure, path), missing
+    finally:
+        plt.close(figure)  # 无论落盘成功、savefig 抛错还是两侧全缺抛错，figure 都不能漏在 pyplot 全局表里
 
 
 def _draw_daily(price_ax, volume_ax, code: str, bars: list[dict[str, Any]], days: int) -> None:
@@ -209,8 +210,7 @@ def _apply_labels(axis, labels: list[str], step: int) -> None:
 def _save(figure, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     figure.savefig(path, bbox_inches="tight")
-    plt.close(figure)
-    return path
+    return path  # 释放交给调用方的 finally：savefig 抛错时也不能把 figure 漏在全局表里
 
 
 def _moving_average(values: list[float], window: int) -> list[float | None]:

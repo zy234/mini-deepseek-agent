@@ -192,7 +192,7 @@ class TradingPipeline:
             chart_dir=trace.parent / "charts" / started.strftime("%H%M%S"),
             daily_days=self.config.daily_chart_days,
         )
-        index_charts = [path for index in pack["indexes"] for path in (index.get("charts") or {}).values()]
+        index_charts = [path for index in pack["indexes"] if (path := index.get("chart"))]
         self.echo(
             f"{started.strftime('%H:%M:%S')} 本轮 {len(pack['groups'])} 组、"
             f"{sum(len(group['stocks']) for group in pack['groups'])} 只标的，图已渲染"
@@ -236,9 +236,7 @@ class TradingPipeline:
         """一个板块（或持仓组）一次带图请求。返回结论或错误文本，不在这里抛。"""
         child = trace.with_name(f"{trace.stem}-{position:02d}-chart_reader.json")
         codes = [stock["stock_code"] for stock in group["stocks"]]
-        images = index_charts + [
-            path for stock in group["stocks"] for path in (stock.get("charts") or {}).values()
-        ]
+        images = index_charts + [path for stock in group["stocks"] if (path := stock.get("chart"))]
         agent = self._build_agent(
             "chart_reader",
             trace=child,
