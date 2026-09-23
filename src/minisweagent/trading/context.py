@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -302,33 +303,13 @@ def _bars(
 
     日线历史（截至昨日）当日不变，走 akshare（东财）全天取一次、按代码缓存住，各轮只补没取过的
     代码——东财对单 IP 有突发限流，每轮把整份 watchlist 的日线重打一遍必被掐连（见 2026-09-23
-    盘中日线整批缺失）。当日那根 bar 不问东财，用 bridge 已经取到的当日 1m 现合成接在历史后面。
-    分钟线仍走 bridge：bigqmt 靠实时订阅回补当日 bar。index_codes 里的代码按指数取日线。
+    盘中日线整批缺失）。盘前 prefetch_daily 已把待观测清单的历史预热进缓存，盘中这里通常直接命中，
+    只有持仓票这类不在清单里的代码才在这补取。当日那根 bar 不问东财，用 bridge 已经取到的当日
+    1m 现合成接在历史后面。分钟线仍走 bridge：bigqmt 靠实时订阅回补当日 bar。
     """
     today = now.strftime("%Y%m%d")
     today_int = int(today)
-    start = (now - timedelta(days=DAILY_LOOKBACK_DAYS)).strftime("%Y%m%d")
-    cache_path = _daily_cache_path(journal_dir, now.date().isoformat())
-    history = _load_daily_cache(cache_path)
-    index_set = {str(code) for code in index_codes}
-    # 指数排在待取列表最前：批量尾部最容易撞上限流墙，别让大盘图每轮都吃这一记。
-    ordered = [code for code in codes if code in index_set] + [code for code in codes if code not in index_set]
-    missing = [code for code in ordered if code not in history]
-    if missing:
-        try:
-            fetched = akshare_board.daily_history(missing, start, today, index_codes=index_codes)
-        except akshare_board.BoardDataError as exc:
-            errors.append(f"日线取数失败（akshare）：{exc}")
-            fetched = {}
-        changed = False
-        for code, rows in fetched.items():
-            # 只把截至昨日的历史写进缓存；当日 bar 由 1m 合成，取空的代码不固化进缓存，下一轮继续补。
-            prior = [bar for bar in rows if isinstance(bar.get("date"), int) and bar["date"] < today_int]
-            if prior:
-                history[code] = prior
-                changed = True
-        if changed:
-            _save_daily_cache(cache_path, history)
+    history = _ensure_daily_history(journal_dir, codes, now, errors, index_codes=index_codes)
     intraday: dict[str, list] = {}
     for begin in range(0, len(codes), QUOTE_BATCH):
         batch = codes[begin : begin + QUOTE_BATCH]
@@ -347,6 +328,79 @@ def _bars(
         if not daily[code]:
             errors.append(f"{code} 没有 1d K 线数据")
     return daily, intraday
+
+
+def _ensure_daily_history(
+    journal_dir: str | Path,
+    codes: Iterable[str],
+    now: datetime,
+    errors: list[str],
+    *,
+    index_codes: Iterable[str] = (),
+) -> dict[str, list[dict[str, Any]]]:
+    """把这些代码「截至昨日」的日线历史取齐并持久化到当日缓存，返回 {code: rows}。
+
+    日线一天只需取一次：命中缓存的直接复用，只对没取过的代码打东财。东财对单 IP 有突发限流，
+    这是把请求数压到最低的关键（见记忆 akshare-eastmoney-ip-burst-rate-limit）。取空的代码
+    不写进缓存，留给调用方（盘前多跑几遍、盘中下一轮）继续补，不把失败固化下来。
+    """
+    codes = list(codes)
+    today_int = int(now.strftime("%Y%m%d"))
+    start = (now - timedelta(days=DAILY_LOOKBACK_DAYS)).strftime("%Y%m%d")
+    cache_path = _daily_cache_path(journal_dir, now.date().isoformat())
+    history = _load_daily_cache(cache_path)
+    index_set = {str(code) for code in index_codes}
+    # 指数排在待取列表最前：批量尾部最容易撞上限流墙，别让大盘图老吃这一记。
+    ordered = [code for code in codes if code in index_set] + [code for code in codes if code not in index_set]
+    missing = [code for code in ordered if code not in history]
+    if not missing:
+        return history
+    try:
+        fetched = akshare_board.daily_history(missing, start, now.strftime("%Y%m%d"), index_codes=index_codes)
+    except akshare_board.BoardDataError as exc:
+        errors.append(f"日线取数失败（akshare）：{exc}")
+        fetched = {}
+    changed = False
+    for code, rows in fetched.items():
+        # 只把截至昨日的历史写进缓存；当日 bar 由 1m 合成，取空的代码不固化进缓存，留给下一遍继续补。
+        prior = [bar for bar in rows if isinstance(bar.get("date"), int) and bar["date"] < today_int]
+        if prior:
+            history[code] = prior
+            changed = True
+    if changed:
+        _save_daily_cache(cache_path, history)
+    return history
+
+
+def prefetch_daily(
+    journal_dir: str | Path,
+    codes: Iterable[str],
+    now: datetime,
+    errors: list[str],
+    *,
+    index_codes: Iterable[str] = (),
+    passes: int = 4,
+    pause_seconds: float = 3.0,
+) -> list[str]:
+    """盘前把待观测清单的日线历史取齐并持久化，返回最终仍缺的代码。
+
+    日线和板块热度榜是同一类问题：一天只需取一次，盘前请求成功过一次就落盘，盘中各轮直接读缓存，
+    不再每轮打东财撞限流。东财封控是间歇的（同一节奏时好时坏），所以对还没取到的代码多跑几遍、
+    每遍之间歇一下，靠"多试几次"而不是"控速"绕过去。每遍中途失败不进 errors，只在耗尽后把最终
+    还缺的代码报一次；这些留给盘中各轮继续补，不打死盘前。
+    """
+    codes = list(codes)
+    missing = codes
+    for attempt in range(passes):
+        history = _ensure_daily_history(journal_dir, codes, now, [], index_codes=index_codes)
+        missing = [code for code in codes if not history.get(code)]
+        if not missing:
+            break
+        if attempt + 1 < passes:
+            time.sleep(pause_seconds)
+    if missing:
+        errors.append(f"盘前日线预取仍缺 {len(missing)} 只（东财限流，盘中各轮会继续补）：{'、'.join(missing[:10])}")
+    return missing
 
 
 def _today_daily_bar(intraday_bars: list[dict], today_int: int) -> dict[str, Any] | None:

@@ -130,6 +130,22 @@ class TradingPipeline:
             "data_errors": pack["errors"],
         }
         self._write_watchlist(watchlist)
+        # 日线和板块热度榜同属"一天只取一次"的东财数据：热度榜产出清单已落盘，紧接着把清单里
+        # 这些票的日线历史也预热进缓存（多试几遍绕过东财间歇限流）。盘中各轮直接读缓存，不再每轮
+        # 打东财——这是 2026-09-23 盘中日线整批缺失的根治。持仓票不在清单里，留给盘中按需补取。
+        watch_codes = [pick["stock_code"] for sector in watchlist["sectors"] for pick in sector["picks"]]
+        daily_errors: list[str] = []
+        missing_daily = context.prefetch_daily(
+            self.journal_dir,
+            watch_codes + self.config.index_codes,
+            started,
+            daily_errors,
+            index_codes=self.config.index_codes,
+        )
+        self.echo(
+            f"盘前日线预热：{len(watch_codes) + len(self.config.index_codes) - len(missing_daily)} 只已缓存"
+            + (f"，{len(missing_daily)} 只仍缺待盘中补" if missing_daily else "，全部就绪")
+        )
         append_account_cycle(
             self.journal_dir,
             f"premarket-{started.strftime('%H%M%S')}",
