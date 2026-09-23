@@ -36,15 +36,17 @@ def fetch_bars(
     errors: list[str],
     *,
     index_codes: Iterable[str] = (),
+    journal_dir: str,
 ) -> tuple[dict[str, list], dict[str, list]]:
     """拉全部日线（90 天窗口）和当日分钟线。槽位截断在内存里做，不重复请求。
 
     走 context._bars 而不是另写一份取数：日线走 akshare、分钟走 bridge、空数据报错，这些
     行为回测和实盘必须一致，抄第二份必然漂移。传"当日 15:00"当 now，窗口正好落在回测日。
-    index_codes 里的代码按指数取日线，和实盘同一口径。
+    日线历史按 journal_dir 下的当日缓存复用：同一回测日重跑不必再打东财。当日 bar 由分钟线
+    合成后接在历史末尾，各槽位再自行截断重构，与实盘同一口径。index_codes 里的代码按指数取日线。
     """
     clock = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 0, tzinfo=TRADING_TZ)
-    return _bars(client, codes, clock, errors, index_codes=index_codes)
+    return _bars(client, codes, clock, errors, index_codes=index_codes, journal_dir=journal_dir)
 
 
 def slot_times(index_minutes: list[dict], trade_date: date, interval_minutes: int) -> list[str]:

@@ -72,6 +72,7 @@ class BacktestRunner:
             self.trade_date,
             errors,
             index_codes=config.index_codes,
+            journal_dir=self.journal_dir,
         )
         index_minutes = intraday.get(config.index_codes[0]) or []
         if not index_minutes:

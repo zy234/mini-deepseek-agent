@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from collections.abc import Iterable
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -169,7 +171,7 @@ def round_context(
         raise MarketDataError("本轮既没有候选也没有持仓，无可观测标的")
     codes = [stock["stock_code"] for group in groups for stock in group["stocks"]]
     metrics = _screen_metrics(client, codes, errors)
-    daily, intraday = _bars(client, codes + index_codes, now, errors, index_codes=index_codes)
+    daily, intraday = _bars(client, codes + index_codes, now, errors, index_codes=index_codes, journal_dir=journal_dir)
     for group in groups:
         for stock in group["stocks"]:
             code = stock["stock_code"]
@@ -288,23 +290,45 @@ def _screen_metrics(client: MiniQMTClient, codes: list[str], errors: list[str]) 
 
 
 def _bars(
-    client: MiniQMTClient, codes: list[str], now: datetime, errors: list[str], *, index_codes: Iterable[str] = ()
+    client: MiniQMTClient,
+    codes: list[str],
+    now: datetime,
+    errors: list[str],
+    *,
+    index_codes: Iterable[str] = (),
+    journal_dir: str | Path,
 ) -> tuple[dict[str, list], dict[str, list]]:
     """取渲染用的日线和当日分钟线。日线窗口给足 90 天，保证 30 根图上的 MA20 从第一根就有值。
 
-    日线走 akshare（东财）：大 QMT 撤极简接口后终端只剩当日 1 根，历史取不到。分钟线仍走
-    bridge——bigqmt 靠实时订阅回补当日 bar。index_codes 里的代码按指数取日线。
+    日线历史（截至昨日）当日不变，走 akshare（东财）全天取一次、按代码缓存住，各轮只补没取过的
+    代码——东财对单 IP 有突发限流，每轮把整份 watchlist 的日线重打一遍必被掐连（见 2026-09-23
+    盘中日线整批缺失）。当日那根 bar 不问东财，用 bridge 已经取到的当日 1m 现合成接在历史后面。
+    分钟线仍走 bridge：bigqmt 靠实时订阅回补当日 bar。index_codes 里的代码按指数取日线。
     """
     today = now.strftime("%Y%m%d")
+    today_int = int(today)
     start = (now - timedelta(days=DAILY_LOOKBACK_DAYS)).strftime("%Y%m%d")
-    daily: dict[str, list] = {}
-    try:
-        daily = akshare_board.daily_history(codes, start, today, index_codes=index_codes)
-    except akshare_board.BoardDataError as exc:
-        errors.append(f"日线取数失败（akshare）：{exc}")
-    for code in codes:
-        if not daily.get(code):
-            errors.append(f"{code} 没有 1d K 线数据")
+    cache_path = _daily_cache_path(journal_dir, now.date().isoformat())
+    history = _load_daily_cache(cache_path)
+    index_set = {str(code) for code in index_codes}
+    # 指数排在待取列表最前：批量尾部最容易撞上限流墙，别让大盘图每轮都吃这一记。
+    ordered = [code for code in codes if code in index_set] + [code for code in codes if code not in index_set]
+    missing = [code for code in ordered if code not in history]
+    if missing:
+        try:
+            fetched = akshare_board.daily_history(missing, start, today, index_codes=index_codes)
+        except akshare_board.BoardDataError as exc:
+            errors.append(f"日线取数失败（akshare）：{exc}")
+            fetched = {}
+        changed = False
+        for code, rows in fetched.items():
+            # 只把截至昨日的历史写进缓存；当日 bar 由 1m 合成，取空的代码不固化进缓存，下一轮继续补。
+            prior = [bar for bar in rows if isinstance(bar.get("date"), int) and bar["date"] < today_int]
+            if prior:
+                history[code] = prior
+                changed = True
+        if changed:
+            _save_daily_cache(cache_path, history)
     intraday: dict[str, list] = {}
     for begin in range(0, len(codes), QUOTE_BATCH):
         batch = codes[begin : begin + QUOTE_BATCH]
@@ -315,7 +339,59 @@ def _bars(
         intraday.update(result["data"]["bars"])
         for code in result["data"].get("empty_codes") or []:
             errors.append(f"{code} 没有 1m K 线数据")
+    daily: dict[str, list] = {}
+    for code in codes:
+        prior = history.get(code) or []
+        today_bar = _today_daily_bar(intraday.get(code) or [], today_int)
+        daily[code] = prior + ([today_bar] if today_bar else [])
+        if not daily[code]:
+            errors.append(f"{code} 没有 1d K 线数据")
     return daily, intraday
+
+
+def _today_daily_bar(intraday_bars: list[dict], today_int: int) -> dict[str, Any] | None:
+    """当日日线 bar 由 bridge 的当日 1m 现合成：日线历史缓存住不动，只有这根随盘中更新。
+
+    open 取首根开、high/low 取全程极值、close 取末根收、volume/amount 累加。1m 与东财日线量纲
+    同为手/元，接在历史后面画蜡烛不会错位。1m 还没有（开盘前或取空）就返回 None，日线图退回只画历史。
+    """
+    rows = charts.usable_bars(intraday_bars)
+    if not rows:
+        return None
+    return {
+        "date": today_int,
+        "open": float(rows[0]["open"]),
+        "high": max(float(row["high"]) for row in rows),
+        "low": min(float(row["low"]) for row in rows),
+        "close": float(rows[-1]["close"]),
+        "volume": sum(float(row["volume"]) for row in rows),
+        "amount": sum(float(row["amount"]) for row in rows if isinstance(row.get("amount"), (int, float))),
+    }
+
+
+def _daily_cache_path(journal_dir: str | Path, date_iso: str) -> Path:
+    return Path(journal_dir).expanduser().resolve() / "daily_cache" / f"{date_iso}.json"
+
+
+def _load_daily_cache(path: Path) -> dict[str, list[dict[str, Any]]]:
+    """当日日线历史缓存 {code: [截至昨日的 rows]}；不存在或读坏就当空缓存重取，别让半截文件打死取数。"""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_daily_cache(path: Path, cache: dict[str, list[dict[str, Any]]]) -> None:
+    """原子替换落盘：各轮会边跑边读，覆盖写会让下一轮读到半截 JSON。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(cache, handle, ensure_ascii=False)
+        os.replace(temp_name, path)
+    except BaseException:
+        Path(temp_name).unlink(missing_ok=True)
+        raise
 
 
 def _render_pair(
