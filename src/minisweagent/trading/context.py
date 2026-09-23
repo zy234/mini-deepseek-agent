@@ -312,7 +312,9 @@ def _bars(
     """
     today = now.strftime("%Y%m%d")
     today_int = int(today)
-    history = _ensure_daily_history(journal_dir, codes, now, errors, index_codes=index_codes)
+    # 盘中补取给 spacing=1.5：盘前 deadline 到了还缺几只时，盘中第一轮会连打这几只，正撞上
+    # "1.5s 间隔连打第 7 个就断"的节奏，且发生在 09:30 最忙的时刻。要补的票本来就少，多等几秒无所谓。
+    history, _ = _ensure_daily_history(journal_dir, codes, now, errors, index_codes=index_codes, spacing=1.5)
     intraday: dict[str, list] = {}
     for begin in range(0, len(codes), QUOTE_BATCH):
         batch = codes[begin : begin + QUOTE_BATCH]
@@ -341,13 +343,14 @@ def _ensure_daily_history(
     *,
     index_codes: Iterable[str] = (),
     spacing: float = 0.0,
-) -> dict[str, list[dict[str, Any]]]:
-    """把这些代码「截至昨日」的日线历史取齐并持久化到当日缓存，返回 {code: rows}。
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
+    """把这些代码「截至昨日」的日线历史取齐并持久化到当日缓存，返回 (history, failed)。
 
     日线一天只需取一次：命中缓存的直接复用，只对没取过、且当天配额没用完的代码打东财。东财对单 IP
     有突发限流，压低请求数是关键（见记忆 akshare-eastmoney-ip-burst-rate-limit）。取空的代码不写进
     history，但把失败次数记进 failed 并落盘：一只永远取不到的票到 MAX_DAILY_FETCH_ATTEMPTS 次就放弃，
-    不再每轮重试白等还持续送请求。spacing 透传给 akshare_board.daily_history，拉大同一批内两个请求的间隔。
+    不再每轮重试白等还持续送请求。failed 一并返回，让调用方（prefetch）能区分"还有配额待补"和"已放弃"，
+    别对触顶的票空转 sleep。spacing 透传给 akshare_board.daily_history，拉大同一批内两个请求的间隔。
     """
     codes = list(codes)
     today_int = int(now.strftime("%Y%m%d"))
@@ -361,7 +364,7 @@ def _ensure_daily_history(
         code for code in ordered if code not in history and failed.get(code, 0) < MAX_DAILY_FETCH_ATTEMPTS
     ]
     if not missing:
-        return history
+        return history, failed
     try:
         fetched = akshare_board.daily_history(
             missing, start, now.strftime("%Y%m%d"), index_codes=index_codes, spacing=spacing
@@ -369,7 +372,6 @@ def _ensure_daily_history(
     except akshare_board.BoardDataError as exc:
         errors.append(f"日线取数失败（akshare）：{exc}")
         fetched = {}
-    changed = False
     for code in missing:
         # 只把截至昨日的历史写进缓存；当日 bar 由 1m 合成。取到就清掉失败计数，取空就 +1；
         # 首次触顶报一条明确原因（之后这只票不再进 missing，不会重复刷这条）。
@@ -384,10 +386,9 @@ def _ensure_daily_history(
                     f"{code} 日线当天已取 {MAX_DAILY_FETCH_ATTEMPTS} 次仍为空，放弃"
                     "（可能停牌/退市/新股无 90 天历史/代码写错）"
                 )
-        changed = True
-    if changed:
-        _save_daily_cache(cache_path, history, failed)
-    return history
+    # 走到这里 missing 必非空（空的话上面已 return），所以每次都要把失败计数落盘。
+    _save_daily_cache(cache_path, history, failed)
+    return history, failed
 
 
 def prefetch_daily(
@@ -407,26 +408,41 @@ def prefetch_daily(
     日线和板块热度榜是同一类问题：一天只需取一次，盘前落盘、盘中各轮读缓存，不再每轮打东财撞限流。
     东财封控是间歇的（同一节奏时好时坏），所以对还没取到的代码多跑几遍、每遍之间歇一下，靠"多试几次"
     绕过去。盘前有近 10 分钟预算：spacing 让一遍过下来请求密度低一个数量级，还缺的等 pause_seconds 再来。
-    deadline（tz-aware）是硬边界——每遍开始前检查，超了立刻收手，绝不因取数把 run_day 拖过开盘。
+    deadline（tz-aware）是软边界：只在每遍开始前检查，遍内不中断，所以实际收手会超出 deadline 一遍的
+    开销（约 len(codes)×spacing）。触顶放弃的票不再计入待补，全部还缺的票都触顶就立刻收手不再空转 sleep。
     每遍中途的 errors 丢弃（避免刷屏），只把停下来那一遍的真实 errors 带出来：BoardDataError 也可能是
     未安装 akshare/接口改名/pandas 缺失这类确定性故障，不能被"东财限流"一句话盖住误导排查。
     """
     codes = list(codes)
-    missing = codes
+    history: dict[str, list[dict[str, Any]]] = {}
+    failed: dict[str, int] = {}
     last_pass_errors: list[str] = []
     for attempt in range(max_passes):
         if datetime.now(TRADING_TZ) >= deadline:
             break
         last_pass_errors = []
-        history = _ensure_daily_history(journal_dir, codes, now, last_pass_errors, index_codes=index_codes, spacing=spacing)
-        missing = [code for code in codes if not history.get(code)]
-        if not missing:
+        history, failed = _ensure_daily_history(
+            journal_dir, codes, now, last_pass_errors, index_codes=index_codes, spacing=spacing
+        )
+        # 只有"还没取到 且 配额没用完"的票值得再等一遍；触顶的票再 sleep 也不会发请求，纯空转。
+        retryable = [code for code in codes if not history.get(code) and failed.get(code, 0) < MAX_DAILY_FETCH_ATTEMPTS]
+        if not retryable:
             break
         if attempt + 1 < max_passes:
             time.sleep(pause_seconds)
+    missing = [code for code in codes if not history.get(code)]
     if missing:
         errors.extend(last_pass_errors)
-        errors.append(f"盘前日线预取仍缺 {len(missing)} 只（盘中各轮会继续补）：{'、'.join(missing[:10])}")
+        # 分开报：还有配额的盘中确实会继续补；触顶的盘中一次都不会再试，说"继续补"会把排查带偏。
+        pending = [code for code in missing if failed.get(code, 0) < MAX_DAILY_FETCH_ATTEMPTS]
+        abandoned = [code for code in missing if failed.get(code, 0) >= MAX_DAILY_FETCH_ATTEMPTS]
+        if pending:
+            errors.append(f"盘前日线预取仍缺 {len(pending)} 只（盘中各轮会继续补）：{'、'.join(pending[:10])}")
+        if abandoned:
+            errors.append(
+                f"盘前日线预取放弃 {len(abandoned)} 只（当天已取满 {MAX_DAILY_FETCH_ATTEMPTS} 次，盘中不再重试）："
+                f"{'、'.join(abandoned[:10])}"
+            )
     return missing
 
 
