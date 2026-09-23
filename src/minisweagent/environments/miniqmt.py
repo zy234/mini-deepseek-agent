@@ -255,6 +255,11 @@ class MiniQMTClient:
         # 把这根剔出 pivot/base_volume，所以它只进均线：均线含当日价，前高/基准量仍是纯历史，正是要的。
         today, elapsed = _session_progress(quote_at)
         for row in rows:
+            code = row["stock_code"]
+            # tick 的 high/low 可能是 None（_screen_row 用 _finite 过滤）。缺了这根 bar 会被 _trend_metrics
+            # 的字段闸门整根丢掉，均线无声退回"不含当日"——那正是要修的 bug，所以缺就留痕，不静默降级。
+            if row["high"] is None or row["low"] is None:
+                errors.append(f"{code} tick 缺 high/low，当日均线退回纯历史口径")
             today_bar = {
                 "date": today,
                 "open": row["open"],
@@ -263,8 +268,11 @@ class MiniQMTClient:
                 "close": row["last_price"],
                 "volume": row["volume"],
             }
-            bars = (frames.get(row["stock_code"]) or []) + [today_bar]
-            row.update(_trend_metrics(row["last_price"], row["volume"], bars, today, elapsed))
+            # 先剔掉历史里同日期的 bar 再接：缓存过滤用的是墙上时钟，today 来自 tick 的 timetag，两者在
+            # 陈旧 tick（bridge 抖动后回放昨天的 tick）时会不一致，不剔就会有两根当日 bar 一起进均线。
+            # 和 backtest.replay._daily_as_of 同一个写法。
+            history = [bar for bar in frames.get(code) or [] if bar.get("date") != today]
+            row.update(_trend_metrics(row["last_price"], row["volume"], history + [today_bar], today, elapsed))
         return errors
 
     def sector_rank(self, *, family: str = "TGN", limit: int = 15, min_buyable: int = 3) -> dict[str, Any]:

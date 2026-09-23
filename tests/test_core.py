@@ -252,8 +252,10 @@ def test_sector_rank_ranks_by_buyable_strength_and_caches_members(tmp_path, monk
 def test_screen_trend_enrichment_labels_breakout_and_broken(tmp_path, monkeypatch):
     """趋势判定必须由代码给出：涨幅榜第一名可能是过热票，模型不能靠目测决定顺势与否。"""
     client = miniqmt.MiniQMTClient(base_url="http://bridge.local", timeout=5, state_dir=tmp_path)
-    # 盘中 10:00 只走了 30 分钟，日线里的当日 bar 也只有半小时成交量。
-    intraday = "20260908 10:00:00"
+    # 当日必须用真实时钟：日线缓存按"date < 今天"过滤历史，写死一个过去的日期会让那根假当日 bar
+    # 蒙混进历史，测出的均线既不是旧行为也不是新行为。盘中 10:00 只走了 30 分钟。
+    today = datetime.now(miniqmt.TRADING_TZ).strftime("%Y%m%d")
+    intraday = f"{today} 10:00:00"
     ticks = {
         # 放量突破不含当日的前高：突破。
         "600001.SH": {
@@ -276,8 +278,9 @@ def test_screen_trend_enrichment_labels_breakout_and_broken(tmp_path, monkeypatc
             "timetag": intraday,
         },
     }
-    # 前 21 根历史加 1 根当日 bar；当日 bar 的最高价故意高于历史前高，用来验证 pivot 排除了今天。
-    dates = [20260801 + i for i in range(21)] + [20260908]
+    # 前 21 根历史加 1 根当日 bar。当日那根东财也会给，但缓存层只存截至昨日的历史，所以它会被丢掉，
+    # 当日 bar 改由 _enrich_trend 用 tick 合成；tick 的最高价故意高于历史前高，用来验证 pivot 排除了今天。
+    dates = [20260801 + i for i in range(21)] + [int(today)]
     rising = [{"close": 15.0 + i * 0.3, "high": 15.2 + i * 0.3, "low": 14.8 + i * 0.3, "volume": 1000} for i in range(21)]
     rising.append({"close": 21.4, "high": 21.5, "low": 20.9, "volume": 1500})
     falling = [{"close": 20.0 - i * 0.5, "high": 20.2 - i * 0.5, "low": 19.8 - i * 0.5, "volume": 1000} for i in range(21)]
@@ -327,6 +330,10 @@ def test_screen_trend_enrichment_labels_breakout_and_broken(tmp_path, monkeypatc
     # pivot 是不含当日的前高 21.2；用了当日 bar 的 21.5 就等于"突破自己"，条件永远成立也永远没意义。
     assert breakout["pivot"] == 21.2
     assert breakout["high_20d_gap_pct"] > 0
+    # 两套窗口的另一半：当日 bar 要进均线窗口（22 根含今天）但不进前高窗口（21 根纯历史）。缓存只存
+    # 截至昨日，当日 bar 由 tick 合成接回去；漏掉这一步均线会整条向前平移一天，broken 判定跟着钝化。
+    assert (breakout["bars_used"], breakout["prior_bars"]) == (22, 21)
+    assert breakout["ma5"] > 20.5  # 纯历史口径只有 20.40，含当日价才是 20.72
     # 基准量按已交易的 30 分钟折算：1500 / (1000 × 30/240) = 12.0，不折算的话盘中永远算不出放量。
     assert breakout["session_minutes"] == 30
     assert breakout["vol_ratio"] == 12.0
