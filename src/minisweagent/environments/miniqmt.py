@@ -249,12 +249,22 @@ class MiniQMTClient:
                 row["trend_gate"] = "insufficient_data"
             return [f"日线读取失败（akshare），全部行按 insufficient_data 处理：{exc}"]
         errors = [f"{code} 无日线" for code in codes if not frames.get(code)]
-        # 当日 bar 由缓存层过滤掉了（只存截至昨日），frames 是纯历史；今日事实用 tick 的 last/volume。
+        # 缓存只存截至昨日的历史（当日 bar 是盘中实时变动的，不进缓存）。这里把当日 bar 用 row 手头的
+        # tick 字段（_screen_row 已备好 open/high/low/last_price/volume）合成后接回去，喂给 _trend_metrics——
+        # 和 _bars 用 1m 合成当日 bar 是同一句话「缓存历史 + 当日合成」。_trend_metrics 的 prior 按 date != today
+        # 把这根剔出 pivot/base_volume，所以它只进均线：均线含当日价，前高/基准量仍是纯历史，正是要的。
         today, elapsed = _session_progress(quote_at)
         for row in rows:
-            row.update(
-                _trend_metrics(row["last_price"], row["volume"], frames.get(row["stock_code"]) or [], today, elapsed)
-            )
+            today_bar = {
+                "date": today,
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["last_price"],
+                "volume": row["volume"],
+            }
+            bars = (frames.get(row["stock_code"]) or []) + [today_bar]
+            row.update(_trend_metrics(row["last_price"], row["volume"], bars, today, elapsed))
         return errors
 
     def sector_rank(self, *, family: str = "TGN", limit: int = 15, min_buyable: int = 3) -> dict[str, Any]:
