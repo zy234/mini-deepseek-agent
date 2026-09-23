@@ -20,6 +20,9 @@ agents:
     tools: []
     system_template_path: prompts/candidate_scout.system.md
     instance_template_path: prompts/candidate_scout.instance.md
+    model:
+      reasoning_effort: low
+      stream_output: false
   chart_reader:
     description: 看日线图与分钟图，对一组标的直接给出买卖结论
     flow: single_shot
@@ -27,6 +30,9 @@ agents:
     tools: []
     system_template_path: prompts/chart_reader.system.md
     instance_template_path: prompts/chart_reader.instance.md
+    model:
+      reasoning_effort: medium
+      stream_output: false
   execution_manager:
     description: 汇总读图结论、账户与限额并执行交易的唯一角色
     flow: iterative
@@ -38,6 +44,8 @@ agents:
       - account_journal
     system_template_path: prompts/execution_manager.system.md
     instance_template_path: prompts/execution_manager.instance.md
+    model:
+      reasoning_effort: low
 trading:
   premarket_at: '09:20'
   round_interval_minutes: 10

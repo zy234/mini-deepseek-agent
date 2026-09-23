@@ -439,6 +439,9 @@ class TradingPipeline:
         if not profile:
             raise PipelineError(f"配置里没有角色 {role}")
         profile.pop("description", None)
+        # 角色的 model 子块是对全局 model 的覆盖（thinking 强度、是否流式），必须在装进 agent_settings 前摘出来，
+        # 否则会污染 agent 的 config；它是纯 model 参数，不属于 agent 行为配置。
+        model_override = profile.pop("model", None) or {}
         agent_settings = recursive_merge(
             self.settings.get("agent", {}),
             profile,
@@ -453,15 +456,9 @@ class TradingPipeline:
                 "session_label": label,
             },
         )
-        model_settings = dict(self.settings.get("model", {}))
-        # 并行读图时多个流会交错刷屏，所以除了汇总执行都关掉流式输出。
-        model_settings["stream_output"] = bool(model_settings.get("stream_output")) and role == "execution_manager"
-        # thinking 强度按角色实测调档（20260917 真实输入）：完全关思考会把读图的 BUY/SELL 打成 HOLD，
-        # 所以一律保留思考、只降档。chart_reader 判断买卖最敏感，medium 决策不变省约 13% 输出；
-        # candidate_scout 与 execution_manager 对强度不敏感（选池换池、下单只是按限额机械化），low 更省。
-        effort = {"chart_reader": "medium", "candidate_scout": "low", "execution_manager": "low"}.get(role)
-        if effort:
-            model_settings["reasoning_effort"] = effort
+        # 角色级 model 覆盖合并进全局 model：流式开关和 thinking 强度都是纯数据，
+        # 集中放在 deepseek.yaml 的 agents.<role>.model 里，宿主不再按角色名硬编码。
+        model_settings = recursive_merge(self.settings.get("model", {}), model_override)
         environment = get_environment(
             environment_settings
             if environment_settings is not None

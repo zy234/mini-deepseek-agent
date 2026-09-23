@@ -48,6 +48,7 @@ tests/test_core.py                              核心功能测试
 - 图片只以路径存在轨迹里，`_api_messages` 在发请求那一刻才读成 base64。轨迹要能反复读、被观测端加载，塞进几 MB base64 会让它变成不可读的文件。
 - 图上一律不写中文：mac 默认字体没有中文字形，缺字渲染成方块且不会报错。中文说明写在 prompt 里。
 - 交易硬限额只有一份定义（`miniqmt.host_limits`），交易工具照它拦单、prompt 照它注入；两处各读一遍环境变量必然漂移，模型就会按一套限额做计划、撞上另一套被拒。
+- 每个角色的 thinking 强度和是否流式写在 `deepseek.yaml` 的 `agents.<role>.model` 子块（对全局 `model` 的覆盖），宿主装配时 merge 进 model 设置，不在代码里按角色名硬编码。读图 `medium`、选池/下单 `low` 是实测结论：完全关思考会把读图的 BUY/SELL 打成 HOLD，只降档不关；并行读图关流式避免多路交错刷屏，执行阶段保留流式。全局 `model.stream_output` 仍为真，供不经过流水线装配的 `interactive` 角色使用。
 
 ## 回测约定
 
