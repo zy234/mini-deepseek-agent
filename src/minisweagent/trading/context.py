@@ -30,6 +30,9 @@ SECTOR_FAMILIES = ("概念", "行业")
 SECTOR_RANK_LIMIT = 12
 DAILY_LOOKBACK_DAYS = 90
 QUOTE_BATCH = 20
+# 单只票日线当天的取数配额：盘前多跑几遍 + 盘中各轮补取共用这一个上限。永远取不到的票
+# （停牌/退市/新股无 90 天历史/代码写错）到顶就放弃，不再每轮白等一次重试还持续给东财送请求。
+MAX_DAILY_FETCH_ATTEMPTS = 8
 # QMT 的委托状态码。模型必须能区分"已成"和"已报未成"，否则会把在途委托当成没下单又下一遍。
 ORDER_STATUS = {
     48: "未报",
@@ -323,7 +326,7 @@ def _bars(
     daily: dict[str, list] = {}
     for code in codes:
         prior = history.get(code) or []
-        today_bar = _today_daily_bar(intraday.get(code) or [], today_int)
+        today_bar = _today_daily_bar(intraday.get(code) or [], today_int, code, errors)
         daily[code] = prior + ([today_bar] if today_bar else [])
         if not daily[code]:
             errors.append(f"{code} 没有 1d K 线数据")
@@ -337,38 +340,53 @@ def _ensure_daily_history(
     errors: list[str],
     *,
     index_codes: Iterable[str] = (),
+    spacing: float = 0.0,
 ) -> dict[str, list[dict[str, Any]]]:
     """把这些代码「截至昨日」的日线历史取齐并持久化到当日缓存，返回 {code: rows}。
 
-    日线一天只需取一次：命中缓存的直接复用，只对没取过的代码打东财。东财对单 IP 有突发限流，
-    这是把请求数压到最低的关键（见记忆 akshare-eastmoney-ip-burst-rate-limit）。取空的代码
-    不写进缓存，留给调用方（盘前多跑几遍、盘中下一轮）继续补，不把失败固化下来。
+    日线一天只需取一次：命中缓存的直接复用，只对没取过、且当天配额没用完的代码打东财。东财对单 IP
+    有突发限流，压低请求数是关键（见记忆 akshare-eastmoney-ip-burst-rate-limit）。取空的代码不写进
+    history，但把失败次数记进 failed 并落盘：一只永远取不到的票到 MAX_DAILY_FETCH_ATTEMPTS 次就放弃，
+    不再每轮重试白等还持续送请求。spacing 透传给 akshare_board.daily_history，拉大同一批内两个请求的间隔。
     """
     codes = list(codes)
     today_int = int(now.strftime("%Y%m%d"))
     start = (now - timedelta(days=DAILY_LOOKBACK_DAYS)).strftime("%Y%m%d")
     cache_path = _daily_cache_path(journal_dir, now.date().isoformat())
-    history = _load_daily_cache(cache_path)
+    history, failed = _load_daily_cache(cache_path)
     index_set = {str(code) for code in index_codes}
     # 指数排在待取列表最前：批量尾部最容易撞上限流墙，别让大盘图老吃这一记。
     ordered = [code for code in codes if code in index_set] + [code for code in codes if code not in index_set]
-    missing = [code for code in ordered if code not in history]
+    missing = [
+        code for code in ordered if code not in history and failed.get(code, 0) < MAX_DAILY_FETCH_ATTEMPTS
+    ]
     if not missing:
         return history
     try:
-        fetched = akshare_board.daily_history(missing, start, now.strftime("%Y%m%d"), index_codes=index_codes)
+        fetched = akshare_board.daily_history(
+            missing, start, now.strftime("%Y%m%d"), index_codes=index_codes, spacing=spacing
+        )
     except akshare_board.BoardDataError as exc:
         errors.append(f"日线取数失败（akshare）：{exc}")
         fetched = {}
     changed = False
-    for code, rows in fetched.items():
-        # 只把截至昨日的历史写进缓存；当日 bar 由 1m 合成，取空的代码不固化进缓存，留给下一遍继续补。
-        prior = [bar for bar in rows if isinstance(bar.get("date"), int) and bar["date"] < today_int]
+    for code in missing:
+        # 只把截至昨日的历史写进缓存；当日 bar 由 1m 合成。取到就清掉失败计数，取空就 +1；
+        # 首次触顶报一条明确原因（之后这只票不再进 missing，不会重复刷这条）。
+        prior = [bar for bar in fetched.get(code) or [] if isinstance(bar.get("date"), int) and bar["date"] < today_int]
         if prior:
             history[code] = prior
-            changed = True
+            failed.pop(code, None)
+        else:
+            failed[code] = failed.get(code, 0) + 1
+            if failed[code] == MAX_DAILY_FETCH_ATTEMPTS:
+                errors.append(
+                    f"{code} 日线当天已取 {MAX_DAILY_FETCH_ATTEMPTS} 次仍为空，放弃"
+                    "（可能停牌/退市/新股无 90 天历史/代码写错）"
+                )
+        changed = True
     if changed:
-        _save_daily_cache(cache_path, history)
+        _save_daily_cache(cache_path, history, failed)
     return history
 
 
@@ -379,39 +397,64 @@ def prefetch_daily(
     errors: list[str],
     *,
     index_codes: Iterable[str] = (),
-    passes: int = 4,
-    pause_seconds: float = 3.0,
+    deadline: datetime,
+    spacing: float = 2.0,
+    pause_seconds: float = 20.0,
+    max_passes: int = 10,
 ) -> list[str]:
     """盘前把待观测清单的日线历史取齐并持久化，返回最终仍缺的代码。
 
-    日线和板块热度榜是同一类问题：一天只需取一次，盘前请求成功过一次就落盘，盘中各轮直接读缓存，
-    不再每轮打东财撞限流。东财封控是间歇的（同一节奏时好时坏），所以对还没取到的代码多跑几遍、
-    每遍之间歇一下，靠"多试几次"而不是"控速"绕过去。每遍中途失败不进 errors，只在耗尽后把最终
-    还缺的代码报一次；这些留给盘中各轮继续补，不打死盘前。
+    日线和板块热度榜是同一类问题：一天只需取一次，盘前落盘、盘中各轮读缓存，不再每轮打东财撞限流。
+    东财封控是间歇的（同一节奏时好时坏），所以对还没取到的代码多跑几遍、每遍之间歇一下，靠"多试几次"
+    绕过去。盘前有近 10 分钟预算：spacing 让一遍过下来请求密度低一个数量级，还缺的等 pause_seconds 再来。
+    deadline（tz-aware）是硬边界——每遍开始前检查，超了立刻收手，绝不因取数把 run_day 拖过开盘。
+    每遍中途的 errors 丢弃（避免刷屏），只把停下来那一遍的真实 errors 带出来：BoardDataError 也可能是
+    未安装 akshare/接口改名/pandas 缺失这类确定性故障，不能被"东财限流"一句话盖住误导排查。
     """
     codes = list(codes)
     missing = codes
-    for attempt in range(passes):
-        history = _ensure_daily_history(journal_dir, codes, now, [], index_codes=index_codes)
+    last_pass_errors: list[str] = []
+    for attempt in range(max_passes):
+        if datetime.now(TRADING_TZ) >= deadline:
+            break
+        last_pass_errors = []
+        history = _ensure_daily_history(journal_dir, codes, now, last_pass_errors, index_codes=index_codes, spacing=spacing)
         missing = [code for code in codes if not history.get(code)]
         if not missing:
             break
-        if attempt + 1 < passes:
+        if attempt + 1 < max_passes:
             time.sleep(pause_seconds)
     if missing:
-        errors.append(f"盘前日线预取仍缺 {len(missing)} 只（东财限流，盘中各轮会继续补）：{'、'.join(missing[:10])}")
+        errors.extend(last_pass_errors)
+        errors.append(f"盘前日线预取仍缺 {len(missing)} 只（盘中各轮会继续补）：{'、'.join(missing[:10])}")
     return missing
 
 
-def _today_daily_bar(intraday_bars: list[dict], today_int: int) -> dict[str, Any] | None:
+def _today_daily_bar(intraday_bars: list[dict], today_int: int, code: str, errors: list[str]) -> dict[str, Any] | None:
     """当日日线 bar 由 bridge 的当日 1m 现合成：日线历史缓存住不动，只有这根随盘中更新。
 
-    open 取首根开、high/low 取全程极值、close 取末根收、volume/amount 累加。1m 与东财日线量纲
-    同为手/元，接在历史后面画蜡烛不会错位。1m 还没有（开盘前或取空）就返回 None，日线图退回只画历史。
+    open 取首根开、high/low 取全程极值、close 取末根收、volume/amount 累加。1m 与东财日线量纲同为
+    手/元，接在历史后面画蜡烛不会错位。1m 还没有（开盘前或取空）就返回 None，日线图退回只画历史。
+
+    以前当日日线 bar 是东财给的权威数据，现在自己合成就得自己验早段完整性：client.history 每次先 download2，
+    正常首根就是当日首分钟；一旦早段缺失，合成出来就是假开盘价和假影线，而读图 Agent 全靠这根蜡烛判断
+    "高开回落"还是"低开拉升"。缺图比错图好治，所以 bar 照样返回，但必须把不可信这件事让模型知道。
     """
     rows = charts.usable_bars(intraday_bars)
     if not rows:
         return None
+    # 1m 的 date 是 YYYYMMDDHHMMSS 十四位 int；取首根 HHMMSS。>093100 说明早段缺失（9:25 集合竞价那根
+    # 092500 用它的 open 当开盘价是对的，93100 的阈值正好不误伤它）。
+    first_hhmmss = int(rows[0]["date"]) % 1_000_000
+    if first_hhmmss > 93100:
+        errors.append(f"{code} 当日 1m 首根为 {first_hhmmss:06d}，合成的当日日线 bar 开盘价/影线不可信")
+    # amount 任一根缺就整个给 None：按字段补零等于静默少算成交额，破了 charts 的口径（缺 amount 整根/整段丢）。
+    # 日线图不画 amount，给 None 无害。
+    amount = (
+        sum(float(row["amount"]) for row in rows)
+        if all(isinstance(row.get("amount"), (int, float)) for row in rows)
+        else None
+    )
     return {
         "date": today_int,
         "open": float(rows[0]["open"]),
@@ -419,7 +462,7 @@ def _today_daily_bar(intraday_bars: list[dict], today_int: int) -> dict[str, Any
         "low": min(float(row["low"]) for row in rows),
         "close": float(rows[-1]["close"]),
         "volume": sum(float(row["volume"]) for row in rows),
-        "amount": sum(float(row["amount"]) for row in rows if isinstance(row.get("amount"), (int, float))),
+        "amount": amount,
     }
 
 
@@ -427,21 +470,31 @@ def _daily_cache_path(journal_dir: str | Path, date_iso: str) -> Path:
     return Path(journal_dir).expanduser().resolve() / "daily_cache" / f"{date_iso}.json"
 
 
-def _load_daily_cache(path: Path) -> dict[str, list[dict[str, Any]]]:
-    """当日日线历史缓存 {code: [截至昨日的 rows]}；不存在或读坏就当空缓存重取，别让半截文件打死取数。"""
+def _load_daily_cache(path: Path) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
+    """当日日线缓存 {"history": {code: rows}, "failed": {code: 次数}}；读不到或形状不对就当空缓存重取。
+
+    形状必须严格校验：json.loads("[]") 会成功返回 list，随后 history.get(code) 直接 AttributeError 打死
+    整轮取数。缓存是当天的临时文件，格式变了就当空的重取，不写任何读旧格式的兼容代码。
+    """
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return {}, {}
+    if not isinstance(raw, dict):
+        return {}, {}
+    history, failed = raw.get("history"), raw.get("failed")
+    if not isinstance(history, dict) or not isinstance(failed, dict):
+        return {}, {}
+    return history, failed
 
 
-def _save_daily_cache(path: Path, cache: dict[str, list[dict[str, Any]]]) -> None:
+def _save_daily_cache(path: Path, history: dict[str, list[dict[str, Any]]], failed: dict[str, int]) -> None:
     """原子替换落盘：各轮会边跑边读，覆盖写会让下一轮读到半截 JSON。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(cache, handle, ensure_ascii=False)
+            json.dump({"history": history, "failed": failed}, handle, ensure_ascii=False)
         os.replace(temp_name, path)
     except BaseException:
         Path(temp_name).unlink(missing_ok=True)

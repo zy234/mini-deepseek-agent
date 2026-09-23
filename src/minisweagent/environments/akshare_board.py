@@ -226,7 +226,7 @@ def _daily_rows(frame: Any) -> list[dict[str, Any]]:
 
 
 def daily_history(
-    codes: list[str], start_time: str, end_time: str, *, index_codes: Iterable[str] = ()
+    codes: list[str], start_time: str, end_time: str, *, index_codes: Iterable[str] = (), spacing: float = 0.0
 ) -> dict[str, list[dict[str, Any]]]:
     """日线历史走 akshare（东财），返回 {code: [rows]}，行形状与 client.history 的 bars 完全对齐。
 
@@ -234,11 +234,14 @@ def daily_history(
     如 000001.SH 上证指数）走 index_zh_a_hist，个股走 stock_zh_a_hist；两个接口的日期与量价列同名。
     个股不复权：趋势判定和图都用原始价，复权后昨收对不上实时 tick。start_time/end_time 是 YYYYMMDD。
     取不到的 code 给空列表，让调用方按缺图/insufficient_data 留痕，不静默糊过去。
+    spacing>0 时在两个 code 的请求之间歇一下，把整批的请求密度压下来（盘前预热用它绕东财间歇限流）。
     """
     ak = _load_ak()
     index_set = {str(code) for code in index_codes}
     out: dict[str, list[dict[str, Any]]] = {}
-    for code in codes:
+    for position, code in enumerate(codes):
+        if position and spacing:
+            time.sleep(spacing)
         symbol = code[:6]  # 东财只认 6 位纯代码，去掉 .SH/.SZ 后缀
         kwargs: dict[str, Any] = {"symbol": symbol, "period": "daily", "start_date": start_time, "end_date": end_time}
         if code in index_set:

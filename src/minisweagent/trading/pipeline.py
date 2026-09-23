@@ -22,7 +22,7 @@ import secrets
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from datetime import time as clock_time
 from pathlib import Path
 from typing import Any
@@ -130,20 +130,29 @@ class TradingPipeline:
             "data_errors": pack["errors"],
         }
         self._write_watchlist(watchlist)
-        # 日线和板块热度榜同属"一天只取一次"的东财数据：热度榜产出清单已落盘，紧接着把清单里
-        # 这些票的日线历史也预热进缓存（多试几遍绕过东财间歇限流）。盘中各轮直接读缓存，不再每轮
-        # 打东财——这是 2026-09-23 盘中日线整批缺失的根治。持仓票不在清单里，留给盘中按需补取。
+        # 日线和板块热度榜同属"一天只取一次"的东财数据：热度榜产出清单已落盘，紧接着把这些票的日线
+        # 历史也预热进缓存（多试几遍绕过东财间歇限流）。盘中各轮直接读缓存，不再每轮打东财——这是
+        # 2026-09-23 盘中日线整批缺失的根治。持仓票是唯一必须看日线图定止盈止损的那批，而 09:30 第一轮
+        # 正是请求最集中的时刻，绝不能留给盘中去打东财，所以一并预热。
         watch_codes = [pick["stock_code"] for sector in watchlist["sectors"] for pick in sector["picks"]]
+        holding_codes = [position["stock_code"] for position in pack["account"]["positions"]]
+        # 去重保序：两个板块可能选中同一只票，持仓票也可能同时在候选里。
+        prefetch_codes = list(dict.fromkeys(watch_codes + holding_codes + self.config.index_codes))
+        # 盘前有近 10 分钟预算，但 run_day 允许开盘后补跑盘前（那时开盘前 2 分钟这个点已过），
+        # 所以给一个 now+90s 的最低预算兜底，否则补跑时一遍都不跑。
+        open_at = datetime.combine(started.date(), SESSIONS[0][0], tzinfo=TRADING_TZ)
+        deadline = max(open_at - timedelta(minutes=2), started + timedelta(seconds=90))
         daily_errors: list[str] = []
         missing_daily = context.prefetch_daily(
             self.journal_dir,
-            watch_codes + self.config.index_codes,
+            prefetch_codes,
             started,
             daily_errors,
             index_codes=self.config.index_codes,
+            deadline=deadline,
         )
         self.echo(
-            f"盘前日线预热：{len(watch_codes) + len(self.config.index_codes) - len(missing_daily)} 只已缓存"
+            f"盘前日线预热：{len(prefetch_codes) - len(missing_daily)} 只已缓存"
             + (f"，{len(missing_daily)} 只仍缺待盘中补" if missing_daily else "，全部就绪")
         )
         append_account_cycle(
@@ -160,7 +169,8 @@ class TradingPipeline:
                 "follow_up": "开盘后每轮渲染日线与分钟图交给读图 Agent。",
                 "orders": [],
                 "pitfalls": [],
-                "tool_errors": pack["errors"],
+                # 盘前日线预取的失败一并留痕：否则进程重启后查不到今天盘前缺了哪几只。
+                "tool_errors": pack["errors"] + daily_errors,
             },
         )
         self.echo(f"待观测清单已落盘：{self._watchlist_path(watchlist['trade_date'])}")

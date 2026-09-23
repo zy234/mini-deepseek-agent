@@ -903,7 +903,7 @@ def _fake_board_rank(family, *, limit=12, min_buyable=3, max_buy_notional, scan_
     return {"family": family, "sectors": sectors[:limit]}
 
 
-def _fake_daily_history(codes, start_time, end_time, *, index_codes=()):
+def _fake_daily_history(codes, start_time, end_time, *, index_codes=(), spacing=0.0):
     return {code: _daily_bars() for code in codes}
 
 
@@ -1082,7 +1082,14 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
     monkeypatch.setattr(local_env, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(pipeline, "get_model", lambda config: ScriptedModel(**config))
     monkeypatch.setattr(akshare_board, "board_rank", _fake_board_rank)
-    monkeypatch.setattr(akshare_board, "daily_history", _fake_daily_history)
+    # 日线一天只取一次是这次改动的全部价值：数一下 daily_history 被真的打了几次东财。
+    daily_calls = {"n": 0}
+
+    def _counting_daily(*args, **kwargs):
+        daily_calls["n"] += 1
+        return _fake_daily_history(*args, **kwargs)
+
+    monkeypatch.setattr(akshare_board, "daily_history", _counting_daily)
     monkeypatch.chdir(tmp_path)
 
     sessions_dir = tmp_path / ".sessions"
@@ -1146,6 +1153,11 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
 
     FakeMiniQMT.orders_items = []
     FakeMiniQMT.trades_queried = 0
+
+    # 连跑第二轮盘中：日线已被盘前预热全天缓存，这一轮读缓存不许再打东财。整天 daily_history
+    # 只在盘前预热时调了一次——谁把 missing 判定写坏成每轮重取，这条断言当场红。
+    day.run_round()
+    assert daily_calls["n"] == 1
 
     # 轮次槽位对齐时钟，非连续竞价时段不跑；收盘后启动必须直接退出，不能空转到第二天。
     tz = pipeline.TRADING_TZ
