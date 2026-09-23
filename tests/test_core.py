@@ -249,9 +249,9 @@ def test_sector_rank_ranks_by_buyable_strength_and_caches_members(tmp_path, monk
     assert sum(1 for path in calls if path.startswith("/api/v1/market/sectors/")) == 1
 
 
-def test_screen_trend_enrichment_labels_breakout_and_broken(monkeypatch):
+def test_screen_trend_enrichment_labels_breakout_and_broken(tmp_path, monkeypatch):
     """趋势判定必须由代码给出：涨幅榜第一名可能是过热票，模型不能靠目测决定顺势与否。"""
-    client = miniqmt.MiniQMTClient(base_url="http://bridge.local", timeout=5)
+    client = miniqmt.MiniQMTClient(base_url="http://bridge.local", timeout=5, state_dir=tmp_path)
     # 盘中 10:00 只走了 30 分钟，日线里的当日 bar 也只有半小时成交量。
     intraday = "20260908 10:00:00"
     ticks = {
@@ -288,8 +288,13 @@ def test_screen_trend_enrichment_labels_breakout_and_broken(monkeypatch):
             return {"ok": True, "status": "success", "operation": "t", "data": {"ticks": ticks}, "error": None}
         raise AssertionError(f"未预期的请求 {path}")
 
-    def fake_daily(codes, start_time, end_time, *, index_codes=()):
-        # 日线现在走 akshare（东财），不再打 bridge：把构造的 rising/falling 直接按 code 返回。
+    # 日线走 akshare（东财）经 akshare_board 的当日缓存：faking 最底层的 _fetch_daily，让真实的缓存/配额
+    # 逻辑照跑，才验得到"_enrich_trend 和 _bars 共享同一份缓存"。fetch_calls 数真正打东财的次数。
+    fetch_calls = {"n": 0}
+
+    def fake_fetch(codes, start_time, end_time, *, index_set=frozenset(), spacing=0.0):
+        fetch_calls["n"] += 1
+
         def rows(bars):
             return [
                 {
@@ -307,9 +312,12 @@ def test_screen_trend_enrichment_labels_breakout_and_broken(monkeypatch):
         return {"600001.SH": rows(rising), "600002.SH": rows(falling)}
 
     monkeypatch.setattr(client, "_request", fake_request)
-    monkeypatch.setattr(akshare_board, "daily_history", fake_daily)
+    monkeypatch.setattr(akshare_board, "_fetch_daily", fake_fetch)
     result = client.screen(stock_codes=list(ticks), sort_by="amount_desc", limit=2, enrich_trend=True)
     assert result["ok"] is True
+    # 同一天同一批票再筛一次：日线缓存命中，不许再打东财。缓存下沉到 daily_history 的全部价值就在这。
+    assert client.screen(stock_codes=list(ticks), sort_by="amount_desc", limit=2, enrich_trend=True)["ok"] is True
+    assert fetch_calls["n"] == 1
     rows = {row["stock_code"]: row for row in result["data"]["rows"]}
     assert {code: row["trend_gate"] for code, row in rows.items()} == {
         "600001.SH": "breakout",
@@ -903,7 +911,8 @@ def _fake_board_rank(family, *, limit=12, min_buyable=3, max_buy_notional, scan_
     return {"family": family, "sectors": sectors[:limit]}
 
 
-def _fake_daily_history(codes, start_time, end_time, *, index_codes=(), spacing=0.0):
+def _fake_fetch_daily(codes, start_time, end_time, *, index_set=frozenset(), spacing=0.0):
+    # 最底层的东财取数：faking 这一层，让 akshare_board.daily_history 的真实缓存/配额逻辑照跑。
     return {code: _daily_bars() for code in codes}
 
 
@@ -1082,14 +1091,15 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
     monkeypatch.setattr(local_env, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(pipeline, "get_model", lambda config: ScriptedModel(**config))
     monkeypatch.setattr(akshare_board, "board_rank", _fake_board_rank)
-    # 日线一天只取一次是这次改动的全部价值：数一下 daily_history 被真的打了几次东财。
-    daily_calls = {"n": 0}
+    # 日线缓存下沉到 akshare_board：数最底层 _fetch_daily 真正打东财的次数。盘前预热填一次，
+    # 盘中两轮全命中缓存（含 _bars 与 _enrich_trend 共享），全天只该打这一次。
+    fetch_calls = {"n": 0}
 
-    def _counting_daily(*args, **kwargs):
-        daily_calls["n"] += 1
-        return _fake_daily_history(*args, **kwargs)
+    def _counting_fetch(*args, **kwargs):
+        fetch_calls["n"] += 1
+        return _fake_fetch_daily(*args, **kwargs)
 
-    monkeypatch.setattr(akshare_board, "daily_history", _counting_daily)
+    monkeypatch.setattr(akshare_board, "_fetch_daily", _counting_fetch)
     monkeypatch.chdir(tmp_path)
 
     sessions_dir = tmp_path / ".sessions"
@@ -1154,10 +1164,10 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
     FakeMiniQMT.orders_items = []
     FakeMiniQMT.trades_queried = 0
 
-    # 连跑第二轮盘中：日线已被盘前预热全天缓存，这一轮读缓存不许再打东财。整天 daily_history
-    # 只在盘前预热时调了一次——谁把 missing 判定写坏成每轮重取，这条断言当场红。
+    # 连跑第二轮盘中：日线已被盘前预热全天缓存，这一轮读缓存不许再打东财。整天 _fetch_daily
+    # 只在盘前预热时打了一次——谁把 missing 判定写坏成每轮重取，这条断言当场红。
     day.run_round()
-    assert daily_calls["n"] == 1
+    assert fetch_calls["n"] == 1
 
     # 轮次槽位对齐时钟，非连续竞价时段不跑；收盘后启动必须直接退出，不能空转到第二天。
     tz = pipeline.TRADING_TZ
@@ -1199,7 +1209,7 @@ def test_backtest_replays_history_simulates_pnl_and_scores_verdicts(tmp_path, mo
     monkeypatch.setattr(pipeline, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(local_env, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(pipeline, "get_model", lambda config: ScriptedModel(**config))
-    monkeypatch.setattr(akshare_board, "daily_history", _fake_daily_history)
+    monkeypatch.setattr(akshare_board, "_fetch_daily", _fake_fetch_daily)
     monkeypatch.chdir(tmp_path)
 
     journal_dir = tmp_path / "state"

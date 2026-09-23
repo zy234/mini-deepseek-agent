@@ -41,7 +41,6 @@ SCREEN_SORTS = {
 # 趋势字段必须读日线，一次 history 最多 20 只，所以带 enrich_trend 的筛选强制收窄到 20 只。
 TREND_ENRICH_LIMIT = HISTORY_CODE_LIMIT
 TREND_MIN_BARS = 21
-TREND_LOOKBACK_DAYS = 60
 # A 股一个交易日 240 分钟。日线里的当日 bar 是盘中实时更新的，10:00 只有 30 分钟成交量，
 # 直接和全天基准量比会让 vol_ratio 系统性偏低八倍，盘中永远扫不出放量突破。
 TRADING_MINUTES_PER_DAY = 240
@@ -233,22 +232,24 @@ class MiniQMTClient:
     def _enrich_trend(self, rows: list[dict[str, Any]], quote_at: str) -> list[str]:
         """给榜单行补日线趋势字段，把是否顺势从模型的目测变成代码判定。
 
-        日线走 akshare（东财）：大 QMT 撤极简接口后，bridge 的日线只剩当日 1 根，算不出均线和前高。
-        akshare_board 反向依赖本模块常量，模块顶层互相 import 会成环，所以在这里延迟导入。
+        日线走 akshare（东财），且经 akshare_board 的当日缓存：大 QMT 撤极简接口后 bridge 的日线只剩
+        当日 1 根，算不出均线和前高；而缓存下沉在 akshare_board，这条路径和 _bars 共享同一份，同一只票
+        同一天最多打一次东财（+重试），不再每轮对所有票直连东财撞限流。akshare_board 反向依赖本模块常量，
+        模块顶层互相 import 会成环，所以在这里延迟导入。
         """
         from minisweagent.environments import akshare_board
 
-        end = datetime.now(TRADING_TZ)
-        start = end - timedelta(days=TREND_LOOKBACK_DAYS)
+        now = datetime.now(TRADING_TZ)
         codes = [row["stock_code"] for row in rows]
         try:
-            frames = akshare_board.daily_history(codes, start.strftime("%Y%m%d"), end.strftime("%Y%m%d"))
+            # spacing=1.5：首次填缓存（盘前几十只候选）时按节奏取，别连打；命中缓存的轮次不真的取，spacing 不生效。
+            frames = akshare_board.daily_history(codes, now, cache_dir=self.state_dir, spacing=1.5)
         except akshare_board.BoardDataError as exc:
             for row in rows:
                 row["trend_gate"] = "insufficient_data"
             return [f"日线读取失败（akshare），全部行按 insufficient_data 处理：{exc}"]
         errors = [f"{code} 无日线" for code in codes if not frames.get(code)]
-        # 当日 bar 会混进历史里：pivot 必须是不含今天的前高，否则永远等于今天自己的最高价。
+        # 当日 bar 由缓存层过滤掉了（只存截至昨日），frames 是纯历史；今日事实用 tick 的 last/volume。
         today, elapsed = _session_progress(quote_at)
         for row in rows:
             row.update(
