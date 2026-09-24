@@ -1,8 +1,11 @@
-"""回测编排：重放一个交易日的全部槽位，问模型拿结论，模拟成交，落报告。
+"""回测编排：day-1 挑一个板块按槽位筛选建仓，之后每天只跑持仓逻辑找安全卖点，跨日结转。
 
-装配、校验、JSON 重试、并行读图全部复用 TradingPipeline 的现成代码——那是打过仗的，
-重抄一份必然漂移。标的来自该日已落盘的待观测清单或 --codes 指定；模型请求是真的
-DeepSeek 调用，数据和交易是纯本地的，环境锁死 observe，不存在任何真实下单路径。
+装配、校验、JSON 重试、并行读图全部复用 TradingPipeline 的现成代码——那是打过仗的，重抄一份
+必然漂移。回测回答的是实盘那条链真实的盈亏：day-1 一个板块每 25 分钟（省 token，实盘是 10 分钟）
+读图给 BUY/SELL、纸面账户按额度/T+1/费率成交建仓；day-2 起不再筛选新票，只把持仓喂回 chart_reader
+的 holding 组，每 25 分钟看有没有安全卖出，卖出即兑现。持仓、现金跨日结转，T+1 由 roll_to_next_day
+解锁。执行环节是 PaperAccount 的固定规则（不额外跑 execution_manager，省 token）。模型请求是真的
+DeepSeek 调用，数据和交易纯本地，环境锁死 observe，没有任何真实下单路径。
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ from __future__ import annotations
 import json
 import secrets
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,13 +23,16 @@ from minisweagent.backtest.simulate import COMMISSION_MIN, COMMISSION_RATE, STAM
 from minisweagent.environments.miniqmt import TRADING_TZ, host_limits
 from minisweagent.trading.pipeline import PipelineError, TradingPipeline
 
+# 回测默认槽位间隔：实盘 10 分钟，回测拉到 25 分钟省 token（逻辑不变，只是少跑几个槽位）。
+BACKTEST_INTERVAL_MINUTES = 25
+
 
 class BacktestError(RuntimeError):
     """回测跑不起来：标的来源、日期或数据不成立。"""
 
 
 class BacktestRunner:
-    """一天的回测：每个槽位一次重放 + 读图 + 模拟成交，收盘估值出报告。"""
+    """多日回测：day-1 一个板块建仓，之后每日只管持仓找卖点，跨日结转，末日估值出报告。"""
 
     def __init__(
         self,
@@ -40,83 +46,66 @@ class BacktestRunner:
         at: str | None = None,
         extra_slots: list[str] | None = None,
         initial_cash: float = 100_000.0,
-        forward_days: int = 5,
+        through: date | None = None,
+        interval: int = BACKTEST_INTERVAL_MINUTES,
+        sector: str | None = None,
     ):
         self.pipeline = TradingPipeline(settings, sessions_dir=sessions_dir, journal_dir=journal_dir, echo=echo)
         self.sessions_dir = sessions_dir
         self.journal_dir = journal_dir
         self.echo = echo
-        self.trade_date = trade_date
+        self.trade_date = trade_date  # day-1：唯一筛选建仓的一天
+        self.through = through or trade_date  # 最后一个持仓管理日；缺省只跑 day-1
+        if self.through < trade_date:
+            raise BacktestError("--through 不能早于回测起始日")
+        self.interval = interval
+        self.sector = sector
         self.codes = codes
         self.at = self._parse_at(at)
+        if self.at and self.through != trade_date:
+            raise BacktestError("--at 只跑单日单槽位，不能与多日 --through 同时用")
         if at and extra_slots:
             raise BacktestError("--at 只跑单个槽位，与额外槽位不能同时指定")
-        # 固定间隔对齐出来的网格覆盖不了的时刻（比如尾盘 14:40）从这里补，逐个校验时段。
         self.extra_slots = sorted({self._parse_at(moment) for moment in extra_slots or []} - {None})
         self.initial_cash = initial_cash
-        self.forward_days = forward_days
         self.account = PaperAccount(initial_cash, host_limits())
+        self._current_date = trade_date  # 逐日循环里指向"正在跑的那天"，_run_slot/_trace 都读它
+        self._last_closes: dict[str, float] = {}  # 末个交易日的收盘价，给期末估值
 
     def run(self) -> dict[str, Any]:
-        """跑完一天并落报告。单个槽位失败不打死整天，失败跟着数据进报告。"""
+        """逐个交易日跑：day-1 建仓、之后管持仓，跨日结转，末日估值落报告。"""
         limits = host_limits()
         config = self.pipeline.config
-        universe = self._universe()
-        codes = list(
-            dict.fromkeys(pick["stock_code"] for sector in universe for pick in sector.get("picks") or [])
-        )
-        if not codes:
-            raise BacktestError("回测标的是空的")
+        day1_universe = self._day1_universe()
+        days_out: list[dict] = []
         errors: list[str] = []
-        daily, intraday = replay.fetch_bars(
-            self.pipeline._data_client(),
-            codes + config.index_codes,
-            self.trade_date,
-            errors,
-            index_codes=config.index_codes,
-            journal_dir=self.journal_dir,
-        )
-        index_minutes = intraday.get(config.index_codes[0]) or []
-        if not index_minutes:
-            raise BacktestDataError(f"指数 {config.index_codes[0]} 没有当日分钟线，无法定位槽位")
-        slots = [self.at] if self.at else replay.slot_times(index_minutes, self.trade_date, config.round_interval_minutes)
-        if self.extra_slots:
-            slots = sorted(set(slots) | set(self.extra_slots))
-        if not slots:
-            raise BacktestDataError("没有可跑的槽位：分钟线覆盖不到连续竞价时段")
-        self.echo(
-            f"回测 {self.trade_date.isoformat()}：{len(slots)} 个槽位、{len(codes)} 只标的，"
-            f"标的来自{self.universe_source}，初始资金 {self.initial_cash:.2f}"
-        )
-        slots_out = [self._run_slot(hhmm, daily, intraday, universe, limits) for hhmm in slots]
-        records = [record for slot in slots_out for record in slot.pop("records")]
-        # T+1 前向评估：day-1 买入当天卖不掉，用 trade_date 之后的日线看能不能兑现收益。一次性拉
-        # 全部结论标的的前向日线，逐条结论按各自决策价算收益，再进 action_stats 聚合。
-        verdict_codes = list(dict.fromkeys(record["stock_code"] for record in records))
-        forward = replay.forward_daily(
-            verdict_codes, self.trade_date, self.forward_days, journal_dir=self.journal_dir
-        )
-        for record in records:
-            if record.get("price"):
-                record.update(evaluate.forward_view_daily(forward.get(record["stock_code"]) or [], record["price"]) or {})
-        closes = {
-            code: close for code, bars in intraday.items() if bars and (close := _day_close(bars)) is not None
-        }
+        day = self.trade_date
+        while day <= self.through:
+            screen = not days_out  # 第一个真正跑起来的交易日才筛选建仓
+            result = self._run_day(day, screen, day1_universe, limits, config, errors)
+            if result is not None:
+                days_out.append(result)
+                self.account.roll_to_next_day()  # 收盘结转：隔夜持仓 T+1 解锁、当日额度清零
+            day += timedelta(days=1)
+        if not days_out:
+            raise BacktestDataError("范围内没有可回测的交易日（分钟线都取不到）")
+        trades = [order for day_out in days_out for order in day_out["orders"]]
+        final = self.account.mark_to_market(self._last_closes)
         report = {
             "trade_date": self.trade_date.isoformat(),
+            "through": self.through.isoformat(),
+            "trading_days": [day_out["date"] for day_out in days_out],
             "universe_source": self.universe_source,
-            "interval_minutes": config.round_interval_minutes,
+            "interval_minutes": self.interval,
             "initial_cash": self.initial_cash,
-            "forward_days": self.forward_days,
             "fees": {
                 "commission_rate": COMMISSION_RATE,
                 "commission_min": COMMISSION_MIN,
                 "stamp_tax_sell": STAMP_TAX_SELL,
             },
-            "slots": slots_out,
-            "verdicts": records,
-            "stats": evaluate.action_stats(records),
-            "final": self.account.mark_to_market(closes),
+            "days": days_out,
+            "trades": trades,
+            "final": final,
             "errors": errors,
         }
         path = self._write_report(report)
@@ -124,6 +113,40 @@ class BacktestRunner:
         evaluate.print_summary(report, self.echo)
         self.echo(f"报告已落盘：{path}")
         return report
+
+    def _run_day(
+        self, day: date, screen: bool, day1_universe: list[dict], limits: dict, config: Any, errors: list[str]
+    ) -> dict[str, Any] | None:
+        """跑一个交易日的全部槽位。非交易日（分钟线取不到）返回 None，由上层跳过。"""
+        self._current_date = day
+        universe = day1_universe if screen else []  # day-2 起不筛新票，只有持仓组
+        codes = list(dict.fromkeys(pick["stock_code"] for sector in universe for pick in sector.get("picks") or []))
+        codes += [code for code in self.account.positions if code not in codes]
+        if not codes:
+            return None  # 没建成仓、也没有候选：这天没什么可跑
+        daily, intraday = replay.fetch_bars(
+            None, codes + config.index_codes, day, errors, index_codes=config.index_codes, journal_dir=self.journal_dir
+        )
+        index_minutes = intraday.get(config.index_codes[0]) or []
+        if not index_minutes:
+            return None  # 非交易日/停市：没有指数分钟线定位不了槽位
+        if self.at and screen:
+            slots = [self.at]
+        else:
+            slots = replay.slot_times(index_minutes, day, self.interval)
+        if screen and self.extra_slots:
+            slots = sorted(set(slots) | set(self.extra_slots))
+        if not slots:
+            return None
+        self.echo(
+            f"{day.isoformat()}（{'建仓' if screen else '持仓'}）：{len(slots)} 个槽位、{len(codes)} 只标的"
+        )
+        slots_out = [self._run_slot(hhmm, daily, intraday, universe, limits) for hhmm in slots]
+        orders = [{**order, "date": day.isoformat()} for slot in slots_out for order in slot["orders"]]
+        self._last_closes = {
+            code: close for code, bars in intraday.items() if bars and (close := _day_close(bars)) is not None
+        }
+        return {"date": day.isoformat(), "screen": screen, "slots": slots_out, "orders": orders}
 
     # ---------- 单个槽位 ----------
 
@@ -135,20 +158,21 @@ class BacktestRunner:
         view = replay.slot_view(
             daily,
             intraday,
-            trade_date=self.trade_date,
+            trade_date=self._current_date,
             hhmm=hhmm,
             stock_codes=list(
-                dict.fromkeys(pick["stock_code"] for sector in universe for pick in sector.get("picks") or [])
+                dict.fromkeys(
+                    [pick["stock_code"] for sector in universe for pick in sector.get("picks") or []]
+                    + list(self.account.positions)
+                )
             ),
             index_codes=config.index_codes,
             max_buy_notional=limits["max_buy_notional"],
         )
         errors = list(view["errors"])
         groups = self._groups(universe, view, errors)
-        orders: list[dict] = []
-        records: list[dict] = []
         if not groups:
-            return {"slot": hhmm, "orders": orders, "records": records, "errors": errors + ["本槽位没有任何可读标的"]}
+            return {"slot": hhmm, "orders": [], "errors": errors + ["本槽位没有任何可读标的"]}
         trace, session_id = self._trace(hhmm)
         chart_dir = trace.parent / "charts" / hhmm
         for group in groups:
@@ -168,7 +192,7 @@ class BacktestRunner:
                 index_charts.append(index["chart"])
         pack = {
             "as_of": view["as_of"],
-            "trade_date": self.trade_date.isoformat(),
+            "trade_date": self._current_date.isoformat(),
             "indexes": view["indexes"],
             "groups": groups,
             "limits": limits,
@@ -183,19 +207,18 @@ class BacktestRunner:
         verdicts = [verdict for reading in readings for verdict in reading.get("verdicts") or []]
         prices = {code: entry["row"]["last_price"] for code, entry in view["stocks"].items()}
         orders, skipped = self.account.apply(hhmm, verdicts, prices)
-        records = [self._record(hhmm, verdict, view) for verdict in verdicts]
         self.echo(
-            f"{hhmm} 槽位：{len(groups)} 组、{len(verdicts)} 条结论、成交 {len(orders)} 笔"
+            f"  {hhmm}：{len(groups)} 组、{len(verdicts)} 条结论、成交 {len(orders)} 笔"
             + (f"、跳过 {len(skipped)} 笔" if skipped else "")
         )
         return {
             "slot": hhmm,
             "as_of": view["as_of"],
             "readings": [{"group": reading["group"], "index_view": reading.get("index_view", "")} for reading in readings],
+            "verdicts": [self._record(hhmm, verdict, view) for verdict in verdicts],
             "orders": orders,
             "skipped": skipped,
             "cash": round(self.account.cash, 2),
-            "records": records,
             "errors": errors,
         }
 
@@ -254,8 +277,11 @@ class BacktestRunner:
 
     # ---------- 装配 ----------
 
-    def _universe(self) -> list[dict]:
-        """回测标的：--codes 显式指定，或该日已落盘的待观测清单。"""
+    def _day1_universe(self) -> list[dict]:
+        """day-1 建仓标的：只锁一个板块（--codes 手动指定，或清单里 --sector 指定/第一个）。
+
+        回测有意只做一个板块——多板块全跑每槽好几次带图请求，太烧 token。
+        """
         if self.codes:
             self.universe_source = "--codes"
             return [{"sector": "手动指定", "reason": "命令行指定标的", "picks": [{"stock_code": code} for code in self.codes]}]
@@ -268,8 +294,14 @@ class BacktestRunner:
         sectors = [sector for sector in watchlist.get("sectors") or [] if sector.get("picks")]
         if not sectors:
             raise BacktestError("清单里没有任何标的")
-        self.universe_source = "待观测清单"
-        return sectors
+        if self.sector:
+            sectors = [sector for sector in sectors if sector["sector"] == self.sector]
+            if not sectors:
+                raise BacktestError(f"清单里没有板块 {self.sector}")
+        chosen = sectors[0]  # 只取一个板块；没指定 --sector 就用清单里的第一个
+        self.universe_source = f"待观测清单·{chosen['sector']}"
+        self.echo(f"day-1 建仓板块：{chosen['sector']}（{[p['stock_code'] for p in chosen['picks']]}）")
+        return [chosen]
 
     def _parse_at(self, at: str | None) -> str | None:
         if at is None:
@@ -286,11 +318,11 @@ class BacktestRunner:
     def _trace(self, hhmm: str) -> tuple[Path, str]:
         """轨迹与实盘同一目录结构，观测端直接能看；kind 标 backtest 便于区分。"""
         started = datetime.now(TRADING_TZ)
-        session_id = f"{started:%Y%m%d-%H%M%S}-{secrets.token_hex(3)}-backtest-{self.trade_date:%Y%m%d}-{hhmm}"
+        session_id = f"{started:%Y%m%d-%H%M%S}-{secrets.token_hex(3)}-backtest-{self._current_date:%Y%m%d}-{hhmm}"
         return self.sessions_dir / started.strftime("%Y%m%d") / f"{session_id}.json", session_id
 
     def _write_report(self, report: dict) -> Path:
-        path = self.journal_dir / "backtest" / f"{self.trade_date:%Y%m%d}-{datetime.now(TRADING_TZ):%H%M%S}.json"
+        path = self.journal_dir / "backtest" / f"{self.trade_date:%Y%m%d}-{self.through:%Y%m%d}-{datetime.now(TRADING_TZ):%H%M%S}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_name(f".{path.name}.tmp")
         temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")

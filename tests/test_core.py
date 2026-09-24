@@ -883,10 +883,11 @@ def _daily_bars():
     return bars
 
 
-def _minute_bars():
+def _minute_bars(day="20260910"):
+    """某交易日的当日分钟线（回测多日用，按 day 生成 14 位时间戳）。收盘价缓涨，便于验证买卖兑现。"""
     return [
         {
-            "date": int(f"20260910{9 + (index + 30) // 60:02d}{(index + 30) % 60:02d}00"),
+            "date": int(f"{day}{9 + (index + 30) // 60:02d}{(index + 30) % 60:02d}00"),
             "open": 15.4,
             "high": 15.65,
             "low": 15.35,
@@ -990,6 +991,8 @@ class ScriptedModel:
         listed = re.search(r"标的 ([^。]+)。", messages[1]["content"])
         unique = list(dict.fromkeys((listed.group(1) if listed else "").split("、")))
         ScriptedModel.seen["reader"] = ScriptedModel.seen.get("reader", 0) + 1
+        # 持仓组给 SELL（回测多日里 day-2 起靠这个兑现卖出），候选组 6000 开头给 BUY、其余 HOLD。
+        holding = "（holding）" in messages[1]["content"]
         return _answer(
             json.dumps(
                 {
@@ -997,7 +1000,7 @@ class ScriptedModel:
                     "verdicts": [
                         {
                             "stock_code": code,
-                            "action": "BUY" if code.startswith("6000") else "HOLD",
+                            "action": "SELL" if holding else ("BUY" if code.startswith("6000") else "HOLD"),
                             "confidence": 0.7,
                             "price_hint": 15.8,
                             "reason": "日线突破，分钟站上均价",
@@ -1204,11 +1207,11 @@ class _FrozenClock:
         return self.moment
 
 
-def test_backtest_replays_history_simulates_pnl_and_scores_verdicts(tmp_path, monkeypatch):
-    """回测一个槽位：历史行情按时刻截断渲染、结论走真实校验、纸面成交与收益算得出来。
+def test_backtest_buys_day1_then_sells_on_a_later_day_under_t1(tmp_path, monkeypatch):
+    """多日回测闭环：day-1 挑一个板块按槽位建仓，day-2 只跑持仓、给安全卖出兑现，收益算得出来。
 
-    模型请求用 ScriptedModel，行情用 FakeMiniQMT 的历史 bar；但 prompt 是真实渲染、
-    校验是真实校验、成交规则是真实的纸面账户——这条测试验的是回测自己的口径。
+    模型请求用 ScriptedModel（候选组 BUY、持仓组 SELL），行情用构造的历史 bar；但 prompt 是真实
+    渲染、校验是真实校验、成交与 T+1/跨日结转是真实的纸面账户——验的是回测这条多日链的口径。
     """
     ScriptedModel.seen.clear()
     ScriptedModel.images.clear()
@@ -1226,8 +1229,12 @@ def test_backtest_replays_history_simulates_pnl_and_scores_verdicts(tmp_path, mo
     monkeypatch.setattr(local_env, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(pipeline, "get_model", lambda config: ScriptedModel(**config))
     monkeypatch.setattr(akshare_board, "_fetch_daily", _fake_fetch_daily)
-    # 回测分钟线走 akshare 新浪历史分钟（bridge 不留历史 1m）；端到端用构造分钟替掉，不打网络。
-    monkeypatch.setattr(akshare_board, "minute_history", lambda codes, trade_date: {code: _minute_bars() for code in codes})
+    # 回测分钟线走 akshare 新浪历史分钟（bridge 不留历史 1m）；端到端用构造分钟替掉，按天生成不打网络。
+    monkeypatch.setattr(
+        akshare_board,
+        "minute_history",
+        lambda codes, trade_date: {code: _minute_bars(trade_date.strftime("%Y%m%d")) for code in codes},
+    )
     monkeypatch.chdir(tmp_path)
 
     journal_dir = tmp_path / "state"
@@ -1240,15 +1247,7 @@ def test_backtest_replays_history_simulates_pnl_and_scores_verdicts(tmp_path, mo
                     {
                         "sector": "TGN热门一",
                         "reason": "主线板块",
-                        "picks": [
-                            {
-                                "stock_code": "600001.SH",
-                                "reason": "突破前高",
-                                "risk": "破位",
-                                "trend_gate": "breakout",
-                                "premarket_price": 15.2,
-                            }
-                        ],
+                        "picks": [{"stock_code": "600001.SH", "reason": "突破前高", "risk": "破位", "trend_gate": "breakout", "premarket_price": 15.2}],
                     }
                 ],
             },
@@ -1263,38 +1262,25 @@ def test_backtest_replays_history_simulates_pnl_and_scores_verdicts(tmp_path, mo
         journal_dir=journal_dir,
         echo=lambda text: None,
         trade_date=date(2026, 9, 10),
-        at="10:00",
+        through=date(2026, 9, 11),
     )
     report = backtest.run()
 
-    # 读图真的发生了：一次带图请求，图按 10:00 截断的历史分钟线渲染。
-    assert ScriptedModel.seen["reader"] == 1
-    assert ScriptedModel.images[0]
-    # 成交价就是模型在图上看到的 10:00 那根 bar 的收盘价；数量按额度与一手取整。
-    order = report["slots"][0]["orders"][0]
-    assert order["action"] == "BUY" and order["stock_code"] == "600001.SH"
-    assert order["price"] == pytest.approx(15.55)
-    assert order["volume"] == 1200
-    # 初始资金 → 最终资金：收盘价估值，佣金按最低 5 元收。
-    assert report["final"]["cash"] == 81335.0
-    assert report["final"]["total"] == 100079.0
-    assert report["final"]["return_pct"] == 0.079
-    # 结论质量走 T+1 之后的日线：09-10 买在 15.55，day+1(09-11) 才能卖，看之后 3 根前向日线。
-    assert report["forward_days"] == 5
-    verdict = report["verdicts"][0]
-    assert verdict["fwd_days"] == 3
-    assert (verdict["t1_open_pct"], verdict["t1_close_pct"]) == (0.96, 1.99)
-    assert (verdict["mfe_pct"], verdict["mae_pct"], verdict["fwd_close_pct"]) == (4.82, -0.96, 2.25)
-    assert report["stats"]["BUY"] == {
-        "count": 1,
-        "mean_t1_close_pct": 1.99,
-        "median_t1_close_pct": 1.99,
-        "hit_rate": 1.0,
-        "mean_t1_open_pct": 0.96,
-        "mean_mfe_pct": 4.82,
-        "mean_mae_pct": -0.96,
-        "mean_fwd_close_pct": 2.25,
-    }
+    # 两个交易日各跑读图：day-1 候选组建仓，day-2 持仓组卖出。
+    assert report["trading_days"] == ["2026-09-10", "2026-09-11"]
+    assert ScriptedModel.seen["reader"] == 2
+    buys = [order for order in report["trades"] if order["action"] == "BUY"]
+    sells = [order for order in report["trades"] if order["action"] == "SELL"]
+    # day-1 建仓：成交价是 09:55 槽位那根分钟 bar 的收盘价，数量按额度与一手取整。
+    assert len(buys) == 1 and buys[0]["date"] == "2026-09-10" and buys[0]["stock_code"] == "600001.SH"
+    assert buys[0]["price"] == pytest.approx(15.525) and buys[0]["volume"] == 1200
+    # day-2 才能卖（T+1 由 roll_to_next_day 解锁）：持仓组给 SELL，全额清仓。
+    assert len(sells) == 1 and sells[0]["date"] == "2026-09-11" and sells[0]["volume"] == 1200
+    # 期末空仓：现金 = 卖出回款，收益率含双边佣金 + 卖出印花税，微亏。
+    assert report["final"]["market_value"] == 0.0
+    assert report["final"]["cash"] == pytest.approx(99971.37)
+    assert report["final"]["return_pct"] == pytest.approx(-0.029)
+    assert list((journal_dir / "backtest").glob("20260910-20260911-*.json"))
     assert list((journal_dir / "backtest").glob("20260910-*.json"))
 
 

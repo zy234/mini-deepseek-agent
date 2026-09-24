@@ -231,7 +231,9 @@ def main(
     backtest_at: str | None = typer.Option(None, "--at", help="只回测该时刻的槽位，HH:MM；缺省跑全天全部槽位。"),
     extra_slots: str | None = typer.Option(None, "--extra-slots", help="在固定间隔的槽位之外追加的时刻，逗号分隔的 HH:MM，如 14:40。"),
     initial_cash: float = typer.Option(100_000.0, "--initial-cash", min=1000.0, help="回测初始资金。"),
-    forward_days: int = typer.Option(5, "--forward-days", min=1, help="T+1 前向评估窗口：day-1 买入后看之后几个交易日的日线兑现收益。"),
+    backtest_through: str | None = typer.Option(None, "--through", help="回测结束日（YYYY-MM-DD）：day-1 建仓，之后每天只跑持仓找卖点，直到这天。缺省只跑 day-1。"),
+    backtest_interval: int = typer.Option(25, "--interval", min=1, help="回测槽位间隔分钟（实盘 10 分钟，回测默认 25 省 token）。"),
+    backtest_sector: str | None = typer.Option(None, "--sector", help="day-1 只做清单里的这个板块；缺省取清单第一个。与 --codes 二选一。"),
 ) -> Any:
     """Run one agent interactively, or drive the three-stage trading pipeline."""
     _load_dotenv()
@@ -253,6 +255,12 @@ def main(
             trade_date = date.fromisoformat(backtest)
         except ValueError as exc:
             raise typer.BadParameter("--backtest 需要 YYYY-MM-DD 日期") from exc
+        through = None
+        if backtest_through:
+            try:
+                through = date.fromisoformat(backtest_through)
+            except ValueError as exc:
+                raise typer.BadParameter("--through 需要 YYYY-MM-DD 日期") from exc
         codes = [code.strip() for code in (backtest_codes or "").split(",") if code.strip()] or None
         moments = [moment.strip() for moment in (extra_slots or "").split(",") if moment.strip()] or None
         try:
@@ -266,7 +274,9 @@ def main(
                 at=backtest_at,
                 extra_slots=moments,
                 initial_cash=initial_cash,
-                forward_days=forward_days,
+                through=through,
+                interval=backtest_interval,
+                sector=backtest_sector,
             ).run()
         except (BacktestError, BacktestDataError) as error:
             # 业务失败（标的来源不成立、数据缺口）是一句话说清的事，不需要 traceback。

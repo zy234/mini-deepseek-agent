@@ -70,6 +70,16 @@ class PaperAccount:
             "profit_rate": round((price / position["avg_cost"] - 1) * 100, 2) if position["avg_cost"] else 0.0,
         }
 
+    def roll_to_next_day(self) -> None:
+        """跨到下一交易日：昨日买入的量今天起可卖（T+1 解锁），当日买入额度清零。
+
+        回测多日连跑时，每天开盘前调一次——bought_today 归零让隔夜持仓变成 can_use，
+        daily_buy_notional 归零重置当日买入上限。持仓、现金、均价都结转不动。
+        """
+        for position in self.positions.values():
+            position["bought_today"] = 0
+        self.daily_buy_notional = 0.0
+
     def mark_to_market(self, closes: dict[str, float]) -> dict[str, Any]:
         """收盘价估值，给出最终资金与收益率。停牌缺价的持仓用最近成交价兜底并留痕。"""
         positions = []
