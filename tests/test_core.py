@@ -855,7 +855,11 @@ def _row(code):
 
 
 def _daily_bars():
-    """40 根递增日线，最后一根是当日 bar。图要真的画出来，所以字段必须齐。"""
+    """40 根递增日线（截至 trade_date 前）+ 3 根 trade_date 之后的前向 bar。
+
+    前 40 根 8 月的历史给图和均线用；后 3 根 09-11/12/13 只在 T+1 前向评估里出现——图和趋势
+    取数的 now 是 09-10，daily_history 的 prior 过滤（date < 20260910）天然把它们挡在历史之外。
+    """
     bars = []
     for index in range(40):
         close = 12.0 + index * 0.1
@@ -870,6 +874,12 @@ def _daily_bars():
                 "amount": (9000.0 + index * 30) * close * 100,
             }
         )
+    # trade_date(09-10)之后的前向日线：day+1 起才是 T+1 下能兑现的窗口。
+    bars += [
+        {"date": 20260911, "open": 15.70, "high": 16.00, "low": 15.60, "close": 15.86, "volume": 9500.0, "amount": 1.5e8},
+        {"date": 20260912, "open": 15.86, "high": 16.20, "low": 15.50, "close": 16.10, "volume": 9800.0, "amount": 1.6e8},
+        {"date": 20260913, "open": 16.10, "high": 16.30, "low": 15.40, "close": 15.90, "volume": 9700.0, "amount": 1.6e8},
+    ]
     return bars
 
 
@@ -1267,16 +1277,21 @@ def test_backtest_replays_history_simulates_pnl_and_scores_verdicts(tmp_path, mo
     assert report["final"]["cash"] == 81335.0
     assert report["final"]["total"] == 100079.0
     assert report["final"]["return_pct"] == 0.079
-    # 结论质量：前向收益和 MFE/MAE 来自模型没看到的未来 bar。
+    # 结论质量走 T+1 之后的日线：09-10 买在 15.55，day+1(09-11) 才能卖，看之后 3 根前向日线。
+    assert report["forward_days"] == 5
     verdict = report["verdicts"][0]
-    assert (verdict["fwd_pct"], verdict["mfe_pct"], verdict["mae_pct"]) == (0.45, 0.64, -1.29)
+    assert verdict["fwd_days"] == 3
+    assert (verdict["t1_open_pct"], verdict["t1_close_pct"]) == (0.96, 1.99)
+    assert (verdict["mfe_pct"], verdict["mae_pct"], verdict["fwd_close_pct"]) == (4.82, -0.96, 2.25)
     assert report["stats"]["BUY"] == {
         "count": 1,
-        "mean_fwd_pct": 0.45,
-        "median_fwd_pct": 0.45,
+        "mean_t1_close_pct": 1.99,
+        "median_t1_close_pct": 1.99,
         "hit_rate": 1.0,
-        "mean_mfe_pct": 0.64,
-        "mean_mae_pct": -1.29,
+        "mean_t1_open_pct": 0.96,
+        "mean_mfe_pct": 4.82,
+        "mean_mae_pct": -0.96,
+        "mean_fwd_close_pct": 2.25,
     }
     assert list((journal_dir / "backtest").glob("20260910-*.json"))
 

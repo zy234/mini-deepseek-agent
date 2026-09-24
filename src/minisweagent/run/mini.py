@@ -231,6 +231,7 @@ def main(
     backtest_at: str | None = typer.Option(None, "--at", help="只回测该时刻的槽位，HH:MM；缺省跑全天全部槽位。"),
     extra_slots: str | None = typer.Option(None, "--extra-slots", help="在固定间隔的槽位之外追加的时刻，逗号分隔的 HH:MM，如 14:40。"),
     initial_cash: float = typer.Option(100_000.0, "--initial-cash", min=1000.0, help="回测初始资金。"),
+    forward_days: int = typer.Option(5, "--forward-days", min=1, help="T+1 前向评估窗口：day-1 买入后看之后几个交易日的日线兑现收益。"),
 ) -> Any:
     """Run one agent interactively, or drive the three-stage trading pipeline."""
     _load_dotenv()
@@ -265,6 +266,7 @@ def main(
                 at=backtest_at,
                 extra_slots=moments,
                 initial_cash=initial_cash,
+                forward_days=forward_days,
             ).run()
         except (BacktestError, BacktestDataError) as error:
             # 业务失败（标的来源不成立、数据缺口）是一句话说清的事，不需要 traceback。

@@ -8,9 +8,10 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
+from minisweagent.environments import akshare_board
 from minisweagent.environments.miniqmt import (
     TRADING_TZ,
     MiniQMTClient,
@@ -47,6 +48,29 @@ def fetch_bars(
     """
     clock = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 0, tzinfo=TRADING_TZ)
     return _bars(client, codes, clock, errors, index_codes=index_codes, journal_dir=journal_dir)
+
+
+def forward_daily(
+    codes: Iterable[str], trade_date: date, days: int, *, journal_dir: str, index_codes: Iterable[str] = ()
+) -> dict[str, list[dict]]:
+    """T+1 前向评估用的日线：trade_date 之后、按日期升序的日线 bar，每只截前 days 根。
+
+    复用 akshare_board.daily_history 那条带缓存+配额的取数路径，把 now 设在 trade_date 往后
+    days*2+10 个自然日——daily_history 的窗口是「now 前 90 天到 now 前一日」，这样正好把
+    trade_date 之后到 day+days 的交易日全覆盖进来（*2+10 给周末假期留余量），再按 date > trade_date
+    过滤、取前 days 根。缓存文件按这个未来 now 的日期存，和图用的当日缓存是两份，互不覆盖。
+    """
+    now = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 0, tzinfo=TRADING_TZ) + timedelta(
+        days=days * 2 + 10
+    )
+    history = akshare_board.daily_history(
+        list(codes), now, cache_dir=journal_dir, index_codes=index_codes, spacing=1.0
+    )
+    day_int = int(trade_date.strftime("%Y%m%d"))
+    return {
+        code: [bar for bar in bars if isinstance(bar.get("date"), int) and bar["date"] > day_int][:days]
+        for code, bars in history.items()
+    }
 
 
 def slot_times(index_minutes: list[dict], trade_date: date, interval_minutes: int) -> list[str]:

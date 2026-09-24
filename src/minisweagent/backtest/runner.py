@@ -40,6 +40,7 @@ class BacktestRunner:
         at: str | None = None,
         extra_slots: list[str] | None = None,
         initial_cash: float = 100_000.0,
+        forward_days: int = 5,
     ):
         self.pipeline = TradingPipeline(settings, sessions_dir=sessions_dir, journal_dir=journal_dir, echo=echo)
         self.sessions_dir = sessions_dir
@@ -53,6 +54,7 @@ class BacktestRunner:
         # 固定间隔对齐出来的网格覆盖不了的时刻（比如尾盘 14:40）从这里补，逐个校验时段。
         self.extra_slots = sorted({self._parse_at(moment) for moment in extra_slots or []} - {None})
         self.initial_cash = initial_cash
+        self.forward_days = forward_days
         self.account = PaperAccount(initial_cash, host_limits())
 
     def run(self) -> dict[str, Any]:
@@ -88,6 +90,15 @@ class BacktestRunner:
         )
         slots_out = [self._run_slot(hhmm, daily, intraday, universe, limits) for hhmm in slots]
         records = [record for slot in slots_out for record in slot.pop("records")]
+        # T+1 前向评估：day-1 买入当天卖不掉，用 trade_date 之后的日线看能不能兑现收益。一次性拉
+        # 全部结论标的的前向日线，逐条结论按各自决策价算收益，再进 action_stats 聚合。
+        verdict_codes = list(dict.fromkeys(record["stock_code"] for record in records))
+        forward = replay.forward_daily(
+            verdict_codes, self.trade_date, self.forward_days, journal_dir=self.journal_dir
+        )
+        for record in records:
+            if record.get("price"):
+                record.update(evaluate.forward_view_daily(forward.get(record["stock_code"]) or [], record["price"]) or {})
         closes = {
             code: close for code, bars in intraday.items() if bars and (close := _day_close(bars)) is not None
         }
@@ -96,6 +107,7 @@ class BacktestRunner:
             "universe_source": self.universe_source,
             "interval_minutes": config.round_interval_minutes,
             "initial_cash": self.initial_cash,
+            "forward_days": self.forward_days,
             "fees": {
                 "commission_rate": COMMISSION_RATE,
                 "commission_min": COMMISSION_MIN,
@@ -171,7 +183,7 @@ class BacktestRunner:
         verdicts = [verdict for reading in readings for verdict in reading.get("verdicts") or []]
         prices = {code: entry["row"]["last_price"] for code, entry in view["stocks"].items()}
         orders, skipped = self.account.apply(hhmm, verdicts, prices)
-        records = [self._record(hhmm, verdict, view, intraday) for verdict in verdicts]
+        records = [self._record(hhmm, verdict, view) for verdict in verdicts]
         self.echo(
             f"{hhmm} 槽位：{len(groups)} 组、{len(verdicts)} 条结论、成交 {len(orders)} 笔"
             + (f"、跳过 {len(skipped)} 笔" if skipped else "")
@@ -226,12 +238,12 @@ class BacktestRunner:
                 errors.append("持仓标的本槽位都没有行情")
         return groups
 
-    def _record(self, hhmm: str, verdict: dict, view: dict, intraday: dict[str, list]) -> dict:
-        """一条结论加上它事后的走势验证：前向收益来自模型没看到的未来 bar。"""
+    def _record(self, hhmm: str, verdict: dict, view: dict) -> dict:
+        """一条结论的基础记录；前向收益在 run() 里拉完前向日线后统一补上（T+1 之后才有兑现窗口）。"""
         code = verdict["stock_code"]
         entry = view["stocks"].get(code)
         price = entry["row"]["last_price"] if entry else None
-        record = {
+        return {
             "slot": hhmm,
             "stock_code": code,
             "action": verdict.get("action"),
@@ -239,9 +251,6 @@ class BacktestRunner:
             "price": price,
             "reason": str(verdict.get("reason") or "")[:500],
         }
-        if price:
-            record.update(evaluate.forward_view(intraday.get(code) or [], view["cutoff"], price) or {})
-        return record
 
     # ---------- 装配 ----------
 
