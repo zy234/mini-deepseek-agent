@@ -317,6 +317,9 @@ def _fetch_daily(
             if code in index_set:
                 # 000001.SH → sh000001、399006.SZ → sz399006
                 frame = _retry(ak.stock_zh_index_daily, symbol=f"{code[-2:].lower()}{code[:6]}")
+                # 新浪指数 volume 的单位是股，bridge 的 1m（拿来合成当日 bar）是手，差 100 倍。不换算，
+                # 日线量能柱上 30 根历史和当日那根就差两个数量级，当日量永远看着是零，读图会读成"大盘量塌了"。
+                frame["volume"] = frame["volume"] / LOT_SIZE
             else:
                 frame = _retry(
                     ak.stock_zh_a_hist,
