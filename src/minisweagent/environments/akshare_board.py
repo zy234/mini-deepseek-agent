@@ -336,6 +336,53 @@ def _fetch_daily(
     return out
 
 
+# 新浪分钟成交量是「股」，东财日线成交量是「手」（100 股），vol_ratio 拿分钟合成的当日量比历史日线量，
+# 两边单位必须一致，所以分钟量除以 100 折成手。成交额两边都是元，不动。
+_SINA_MINUTE_VOLUME_PER_LOT = 100
+
+
+def _minute_rows(frame: Any, day_int: int) -> list[dict[str, Any]]:
+    """新浪分钟表 → bridge 1m bar 形状，只留 trade_date 当天：{date:int14, open, high, low, close, volume(手), amount}。"""
+    rows: list[dict[str, Any]] = []
+    for _, row in frame.iterrows():
+        compact = str(row.get("day")).replace("-", "").replace(":", "").replace(" ", "")
+        if len(compact) != 14 or not compact.isdigit() or int(compact[:8]) != day_int:
+            continue
+        volume = _num(row.get("volume"))
+        rows.append(
+            {
+                "date": int(compact),
+                "open": _num(row.get("open")),
+                "high": _num(row.get("high")),
+                "low": _num(row.get("low")),
+                "close": _num(row.get("close")),
+                "volume": volume / _SINA_MINUTE_VOLUME_PER_LOT if volume is not None else None,
+                "amount": _num(row.get("amount")),
+            }
+        )
+    return rows
+
+
+def minute_history(codes: Iterable[str], trade_date: Any) -> dict[str, list[dict]]:
+    """某历史交易日的当日 1m 分钟线，形状对齐 bridge：只给回测用。
+
+    bridge 只留当日 1m、历史日期取不到，所以回测的分钟线从新浪 stock_zh_a_minute 回补——它个股和
+    指数同一个接口都认（symbol 走 sh/sz+6 位），返回最近约 8 个交易日的 1m，够回测最近的日子。
+    单只票拿不到（超出新浪窗口/停牌）给空列表，由调用方按缺图留痕。
+    """
+    ak = _load_ak()
+    day_int = int(trade_date.strftime("%Y%m%d"))
+    out: dict[str, list[dict]] = {}
+    for code in codes:
+        try:
+            frame = _retry(ak.stock_zh_a_minute, symbol=f"{code[-2:].lower()}{code[:6]}", period="1", adjust="")
+        except BoardDataError:
+            out[code] = []
+            continue
+        out[code] = _minute_rows(frame, day_int)
+    return out
+
+
 def _daily_cache_path(cache_dir: str | Path, date_iso: str) -> Path:
     return Path(cache_dir).expanduser().resolve() / "daily_cache" / f"{date_iso}.json"
 

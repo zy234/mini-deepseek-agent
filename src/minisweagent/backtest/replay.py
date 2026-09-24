@@ -20,7 +20,7 @@ from minisweagent.environments.miniqmt import (
     _trend_metrics,
 )
 from minisweagent.trading import charts
-from minisweagent.trading.context import _bars, _render_pair
+from minisweagent.trading.context import _render_pair
 
 # 连续竞价时段（一天内分钟数）：9:30-11:30、13:00-15:00，与流水线 SESSIONS 同一口径。
 SESSION_MINUTES = ((570, 690), (780, 900))
@@ -39,15 +39,27 @@ def fetch_bars(
     index_codes: Iterable[str] = (),
     journal_dir: str,
 ) -> tuple[dict[str, list], dict[str, list]]:
-    """拉全部日线（90 天窗口）和当日分钟线。槽位截断在内存里做，不重复请求。
+    """拉全部日线（截至前一日）和当日分钟线。槽位截断在内存里做，不重复请求。
 
-    走 context._bars 而不是另写一份取数：日线走 akshare、分钟走 bridge、空数据报错，这些
-    行为回测和实盘必须一致，抄第二份必然漂移。传"当日 15:00"当 now，窗口正好落在回测日。
-    日线历史按 journal_dir 下的当日缓存复用：同一回测日重跑不必再打东财。当日 bar 由分钟线
-    合成后接在历史末尾，各槽位再自行截断重构，与实盘同一口径。index_codes 里的代码按指数取日线。
+    日线走 akshare_board.daily_history，和实盘同源、同一份 (date,code) 缓存。分钟线本该和实盘一样
+    走 bridge，但 bridge 只留当日 1m、历史日期一律取不到（bigqmt 撤极简接口后靠实时订阅回补），所以
+    回测的分钟线只能从新浪历史分钟回补（akshare_board.minute_history，覆盖最近约 8 个交易日）。这是
+    回测与实盘唯一必须分叉的一处——不是想另写口径，是历史分钟没有别的来源。client 参数保留以兼容
+    调用签名，取数已不经过它。当日日 bar 各槽位用截断分钟线自行重构（_daily_as_of），与实盘同口径。
     """
     clock = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 0, tzinfo=TRADING_TZ)
-    return _bars(client, codes, clock, errors, index_codes=index_codes, journal_dir=journal_dir)
+    try:
+        history = akshare_board.daily_history(
+            codes, clock, cache_dir=journal_dir, index_codes=index_codes, spacing=1.0
+        )
+    except akshare_board.BoardDataError as exc:
+        errors.append(f"日线取数失败（akshare）：{exc}")
+        history = {}
+    intraday = akshare_board.minute_history(codes, trade_date)
+    for code in codes:
+        if not intraday.get(code):
+            errors.append(f"{code} 没有历史分钟线（akshare 新浪仅覆盖最近约 8 个交易日）")
+    return {code: history.get(code, []) for code in codes}, intraday
 
 
 def forward_daily(

@@ -1226,6 +1226,8 @@ def test_backtest_replays_history_simulates_pnl_and_scores_verdicts(tmp_path, mo
     monkeypatch.setattr(local_env, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(pipeline, "get_model", lambda config: ScriptedModel(**config))
     monkeypatch.setattr(akshare_board, "_fetch_daily", _fake_fetch_daily)
+    # 回测分钟线走 akshare 新浪历史分钟（bridge 不留历史 1m）；端到端用构造分钟替掉，不打网络。
+    monkeypatch.setattr(akshare_board, "minute_history", lambda codes, trade_date: {code: _minute_bars() for code in codes})
     monkeypatch.chdir(tmp_path)
 
     journal_dir = tmp_path / "state"
