@@ -213,22 +213,34 @@ def _num(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+# 东财日线列名 → bars 行字段。新浪 stock_zh_index_daily 本来就是这套英文名，所以只在东财侧改名，
+# 让 _daily_rows 只有一套列名要认——两套列名映射写进同一个循环，下次加通道就是第三个分支。
+_EM_DAILY_RENAME = {
+    "日期": "date", "开盘": "open", "最高": "high", "最低": "low",
+    "收盘": "close", "成交量": "volume", "成交额": "amount",
+}
+
+
 def _daily_rows(frame: Any) -> list[dict[str, Any]]:
-    """东财日线表映射成 client.history 的 bars 行形状：{date:int, open, high, low, close, volume, amount}。"""
+    """日线表映射成 client.history 的 bars 行形状；列名已在取数处统一成英文。
+
+    新浪指数表没有成交额这一列，row.get 给 None → amount 为 None。charts.BAR_FIELDS 不含 amount，
+    usable_bars 不会因此丢行，日线图也不画成交额，所以缺就缺，绝不补零。
+    """
     rows: list[dict[str, Any]] = []
     for _, row in frame.iterrows():
-        date = _date_int(row.get("日期"))
+        date = _date_int(row.get("date"))
         if date is None:
             continue
         rows.append(
             {
                 "date": date,
-                "open": _num(row.get("开盘")),
-                "high": _num(row.get("最高")),
-                "low": _num(row.get("最低")),
-                "close": _num(row.get("收盘")),
-                "volume": _num(row.get("成交量")),
-                "amount": _num(row.get("成交额")),
+                "open": _num(row.get("open")),
+                "high": _num(row.get("high")),
+                "low": _num(row.get("low")),
+                "close": _num(row.get("close")),
+                "volume": _num(row.get("volume")),
+                "amount": _num(row.get("amount")),
             }
         )
     return rows
@@ -245,7 +257,7 @@ def daily_history(
     缓存只存「截至昨日」的行（当日 bar 是盘中实时变动的，`_bars` 自己用 1m 合成、`_enrich_trend` 用
     tick 当今日事实），所以当天不变、可反复读。取空的代码累加失败次数、到顶放弃，都记进缓存。
     start/end 由 now 内部按 90 天算；需要更短窗口的调用方自己切片（趋势字段只用尾部 20 根，无需切）。
-    index_codes 里的代码走 index_zh_a_hist，其余走 stock_zh_a_hist；spacing 拉大同批内两个请求的间隔。
+    index_codes 里的代码走新浪 stock_zh_index_daily，其余走东财 stock_zh_a_hist；spacing 拉大同批内两个请求的间隔。
     未安装 akshare 这类确定性故障会抛 BoardDataError（不计入配额），由调用方决定怎么留痕。
     """
     codes = list(codes)
@@ -253,9 +265,7 @@ def daily_history(
     cache_path = _daily_cache_path(cache_dir, now.date().isoformat())
     history, failed = _load_daily_cache(cache_path)
     index_set = {str(code) for code in index_codes}
-    # 指数排在待取列表最前：批量尾部最容易撞上限流墙，别让大盘图老吃这一记。
-    ordered = [code for code in codes if code in index_set] + [code for code in codes if code not in index_set]
-    missing = [code for code in ordered if code not in history and failed.get(code, 0) < MAX_DAILY_FETCH_ATTEMPTS]
+    missing = [code for code in codes if code not in history and failed.get(code, 0) < MAX_DAILY_FETCH_ATTEMPTS]
     if missing:
         start = (now - timedelta(days=DAILY_LOOKBACK_DAYS)).strftime("%Y%m%d")
         fetched = _fetch_daily(missing, start, now.strftime("%Y%m%d"), index_set=index_set, spacing=spacing)
@@ -288,29 +298,38 @@ def daily_cache_missing(codes: Iterable[str], now: datetime, *, cache_dir: str |
 def _fetch_daily(
     codes: list[str], start_time: str, end_time: str, *, index_set: set[str], spacing: float = 0.0
 ) -> dict[str, list[dict[str, Any]]]:
-    """逐个 code 打东财取日线原始行，返回 {code: rows}（未按当日过滤）。取不到的 code 给空列表。
+    """逐个 code 取日线原始行，返回 {code: rows}（未按当日过滤）。取不到的 code 给空列表。
 
-    个股不复权：趋势判定和图都用原始价，复权后昨收对不上实时 tick。spacing>0 时两个请求之间歇一下，
-    把整批的请求密度压下来。这是唯一真正打东财的地方，缓存与配额都在 daily_history 里管。
+    指数走新浪 stock_zh_index_daily，个股走东财 stock_zh_a_hist。东财的 index_zh_a_hist 对
+    000001.SH/399006.SZ 是稳定挂的（每次远端直接掐连接、重试无效），一天 8 次配额全废、大盘图
+    永远缺日线那半张；新浪一把到昨日，还不占东财那个会突发限流的 IP 配额。
+    个股不复权：趋势判定和图都用原始价，复权后昨收对不上实时 tick。spacing>0 时两个请求之间歇一下。
+    新浪不认 start/end，返回 1990 年至今全历史（上证 8700+ 行），所以窗口截断放在出口统一做——
+    对东财是 no-op，比给指数单开一条过滤路径少一个特例，也免得把全历史灌进当日缓存。
     """
     ak = _load_ak()
+    start_int, end_int = int(start_time), int(end_time)
     out: dict[str, list[dict[str, Any]]] = {}
     for position, code in enumerate(codes):
         if position and spacing:
             time.sleep(spacing)
-        symbol = code[:6]  # 东财只认 6 位纯代码，去掉 .SH/.SZ 后缀
-        kwargs: dict[str, Any] = {"symbol": symbol, "period": "daily", "start_date": start_time, "end_date": end_time}
-        if code in index_set:
-            fetch = ak.index_zh_a_hist
-        else:
-            fetch = ak.stock_zh_a_hist
-            kwargs["adjust"] = ""
         try:
-            frame = _retry(fetch, **kwargs)
+            if code in index_set:
+                # 000001.SH → sh000001、399006.SZ → sz399006
+                frame = _retry(ak.stock_zh_index_daily, symbol=f"{code[-2:].lower()}{code[:6]}")
+            else:
+                frame = _retry(
+                    ak.stock_zh_a_hist,
+                    symbol=code[:6],  # 东财只认 6 位纯代码
+                    period="daily",
+                    start_date=start_time,
+                    end_date=end_time,
+                    adjust="",
+                ).rename(columns=_EM_DAILY_RENAME)
         except BoardDataError:
             out[code] = []
             continue
-        out[code] = _daily_rows(frame)
+        out[code] = [row for row in _daily_rows(frame) if start_int <= row["date"] <= end_int]
     return out
 
 
