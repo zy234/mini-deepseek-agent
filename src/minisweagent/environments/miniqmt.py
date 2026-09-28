@@ -9,6 +9,7 @@ import math
 import os
 import re
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -144,6 +145,7 @@ class MiniQMTClient:
         sort_by: str = "change_pct_desc",
         limit: int = 20,
         enrich_trend: bool = False,
+        enrich_liquidity: bool = False,
     ) -> dict[str, Any]:
         """按板块或指定代码批量取实时行情，只回排序后的紧凑行，避免整版 tick 淹没上下文。"""
         if sort_by not in SCREEN_SORTS:
@@ -193,6 +195,9 @@ class MiniQMTClient:
         rows.sort(key=SCREEN_SORTS[sort_by][0], reverse=SCREEN_SORTS[sort_by][1])
         selected = rows[:limit]
         trend_errors: list[str] = []
+        liquidity_errors: list[str] = []
+        if enrich_liquidity and selected:
+            liquidity_errors = self._enrich_liquidity(selected, quote_at)
         if enrich_trend and selected:
             trend_errors = self._enrich_trend(selected, quote_at)
         data = {
@@ -227,28 +232,76 @@ class MiniQMTClient:
             )
             if trend_errors:
                 data["trend_errors"] = trend_errors
+        if liquidity_errors:
+            data["liquidity_errors"] = liquidity_errors
+        if enrich_liquidity:
+            data["liquidity_fields"] = (
+                "volume_shares、float_shares、total_shares、turnover_pct、liquidity_at"
+            )
         return _success(operation="market_screen", data=data)
+
+    def _enrich_liquidity(self, rows: list[dict[str, Any]], quote_at: str) -> list[str]:
+        """补流通股本并计算换手率；不调用返回不稳定的区间换手率接口。
+
+        Big QMT tick 的 ``pvolume`` 是股数，``volume`` 是手数；合约详情的
+        ``FloatVolume``/``FloatVolumn`` 是流通股本。两者都有时直接计算：
+        pvolume / float_shares * 100。详情接口是单代码的，最多并发补当前榜单的
+        50 只，避免盘前逐只串行放大延迟。
+        """
+        errors: list[str] = []
+        codes = [str(row.get("stock_code")) for row in rows]
+
+        def fetch(code: str) -> tuple[str, dict[str, Any]]:
+            return code, self._request("GET", "/api/v1/market/instrument/detail", query={"stock_code": code})
+
+        details: dict[str, dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(codes)))) as pool:
+            futures = {pool.submit(fetch, code): code for code in codes}
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    _, result = future.result()
+                except Exception as exc:
+                    errors.append(f"{code} 合约详情失败：{type(exc).__name__}: {exc}")
+                    continue
+                if result.get("ok"):
+                    details[code] = result
+                else:
+                    errors.append(f"{code} 合约详情失败：{result.get('error', {}).get('detail', 'unknown error')}")
+
+        for row in rows:
+            code = row["stock_code"]
+            detail = (details.get(code) or {}).get("data", {}).get("detail", {})
+            float_shares = _first_number(detail, ("FloatVolume", "FloatVolumn", "float_volume", "float_volumn"))
+            total_shares = _first_number(detail, ("TotalVolume", "TotalVolumn", "total_volume", "total_volumn"))
+            volume_shares = _first_number(row, ("pvolume",))
+            if volume_shares is None:
+                volume_lots = _finite(row.get("volume"))
+                volume_shares = volume_lots * LOT_SIZE if volume_lots is not None else None
+            row["volume_shares"] = round(volume_shares, 2) if volume_shares is not None else None
+            row["float_shares"] = round(float_shares, 2) if float_shares is not None else None
+            row["total_shares"] = round(total_shares, 2) if total_shares is not None else None
+            row["turnover_pct"] = (
+                round(volume_shares / float_shares * 100, 4)
+                if volume_shares is not None and float_shares and float_shares > 0
+                else None
+            )
+            row["liquidity_at"] = quote_at or None
+            if row["turnover_pct"] is None:
+                errors.append(f"{code} 缺流通股本或成交量，turnover_pct=null")
+        return errors
 
     def _enrich_trend(self, rows: list[dict[str, Any]], quote_at: str) -> list[str]:
         """给榜单行补日线趋势字段，把是否顺势从模型的目测变成代码判定。
 
-        日线走 akshare（东财），且经 akshare_board 的当日缓存：大 QMT 撤极简接口后 bridge 的日线只剩
-        当日 1 根，算不出均线和前高；而缓存下沉在 akshare_board，这条路径和 _bars 共享同一份，同一只票
-        同一天最多打一次东财（+重试），不再每轮对所有票直连东财撞限流。akshare_board 反向依赖本模块常量，
-        模块顶层互相 import 会成环，所以在这里延迟导入。
+        昨日历史走大 QMT 缓存，当日 bar 由当前 tick 合成。
         """
-        from minisweagent.environments import akshare_board
+        from minisweagent.environments import daily_history
 
         now = datetime.now(TRADING_TZ)
         codes = [row["stock_code"] for row in rows]
-        try:
-            # spacing=1.5：首次填缓存（盘前几十只候选）时按节奏取，别连打；命中缓存的轮次不真的取，spacing 不生效。
-            frames = akshare_board.daily_history(codes, now, cache_dir=self.state_dir, spacing=1.5)
-        except akshare_board.BoardDataError as exc:
-            for row in rows:
-                row["trend_gate"] = "insufficient_data"
-            return [f"日线读取失败（akshare），全部行按 insufficient_data 处理：{exc}"]
-        errors = [f"{code} 无日线" for code in codes if not frames.get(code)]
+        errors: list[str] = []
+        frames = daily_history.fetch(self, codes, now, errors, cache_dir=self.state_dir)
         # 缓存只存截至昨日的历史（当日 bar 是盘中实时变动的，不进缓存）。这里把当日 bar 用 row 手头的
         # tick 字段（_screen_row 已备好 open/high/low/last_price/volume）合成后接回去，喂给 _trend_metrics——
         # 和 _bars 用 1m 合成当日 bar 是同一句话「缓存历史 + 当日合成」。_trend_metrics 的 prior 按 date != today
@@ -988,6 +1041,8 @@ def _screen_row(code: str, tick: dict[str, Any], max_buy_notional: float) -> dic
         "close_position": _close_position(last, high, low),
         "volume": _finite(tick.get("volume")) or 0.0,
         "amount": _finite(tick.get("amount")) or 0.0,
+        # pvolume 是成交股数；若终端不返回则由 volume（手）在补充阶段换算。
+        "pvolume": _finite(tick.get("pvolume")),
         # 一手成本和可买标记直接给结论：模型不用自己乘 100，也不用猜宿主限额。
         "lot_cost": lot_cost,
         "buyable": lot_cost <= max_buy_notional and not code.startswith(BUY_BLOCKED_PREFIXES),

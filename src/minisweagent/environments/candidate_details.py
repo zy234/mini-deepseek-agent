@@ -14,6 +14,9 @@ BRIEF_FIELDS = (
     "trend_gate",
     "vol_ratio",
     "high_20d_gap_pct",
+    "turnover_pct",
+    "float_shares",
+    "volume_shares",
 )
 
 
@@ -97,7 +100,11 @@ class CandidateDetails:
             if not codes:
                 raise ValueError("无可用成分股代码")
             response = self.client.screen(
-                stock_codes=codes, sort_by="close_position_desc", limit=self.rows_per_sector, enrich_trend=True,
+                stock_codes=codes,
+                sort_by="close_position_desc",
+                limit=self.rows_per_sector,
+                enrich_trend=True,
+                enrich_liquidity=True,
             )
             if not response["ok"]:
                 raise ValueError((response.get("error") or {}).get("detail", "个股查询失败"))
