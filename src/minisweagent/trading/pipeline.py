@@ -104,8 +104,8 @@ class TradingPipeline:
         payload = self._ask_json(
             agent,
             task=(
-                f"交易日 {pack['trade_date']} 盘前 {pack['as_of']} 选池：从注入的热门板块里选出"
-                f"{self.config.sector_count} 个板块，每个板块 {self.config.picks_per_sector} 只票。"
+                f"交易日 {pack['trade_date']} 选池（取数开始于 {pack['as_of']}）：从注入 rows 的热门板块里最多选出"
+                f"{self.config.sector_count} 个板块，每个板块最多 {self.config.picks_per_sector} 只票，可以少选，不必选满。"
             ),
             validate=lambda data: _validate_watchlist(data, pool, self.config),
             template_vars={
@@ -596,7 +596,6 @@ def _validate_verdicts(data: Any, codes: list[str]) -> dict[str, Any]:
     if missing:
         raise ValueError(f"这些标的没有结论：{'、'.join(missing)}")
     return {**data, "verdicts": [seen[code] for code in codes]}
-
 
 
 
