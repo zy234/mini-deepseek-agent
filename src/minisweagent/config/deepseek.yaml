@@ -16,7 +16,7 @@ agents:
   candidate_scout:
     description: 盘前先读板块摘要，再按需查询个股结构并提交待观测清单
     flow: iterative
-    step_limit: 14
+    step_limit: 30
     wall_time_limit_seconds: 480
     json_output: true
     tools:

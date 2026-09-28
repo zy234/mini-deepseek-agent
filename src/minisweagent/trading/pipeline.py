@@ -42,6 +42,8 @@ from minisweagent.utils.serialize import recursive_merge
 logger = logging.getLogger("minisweagent.trading")
 
 ACTIONS = ("BUY", "SELL", "HOLD")
+BUY_MODES = ("OPEN", "T_ADD", "T_BUYBACK")
+SELL_MODES = ("NONE", "T_REDUCE", "RISK_EXIT")
 # 连续竞价时段。收盘前最后一轮跑完就结束当天，尾盘集中竞价不参与。
 SESSIONS = ((clock_time(9, 30), clock_time(11, 30)), (clock_time(13, 0), clock_time(15, 0)))
 # 盘前清单缺失时的补跑上限：09:20 首跑一次，之后每个槽位各补一次，共 10 次约覆盖 100 分钟，
@@ -580,7 +582,7 @@ def _validate_watchlist(data: Any, pool: dict[str, dict[str, Any]], config: Trad
 
 
 def _validate_verdicts(data: Any, codes: list[str]) -> dict[str, Any]:
-    """校验读图结论：每只票恰好一条结论，动作只能是三种，代码不能超出本组。"""
+    """校验读图结论，并把做 T 意图归一化给执行 Agent。"""
     if not isinstance(data, dict):
         raise ValueError("输出必须是 JSON 对象")
     verdicts = data.get("verdicts")
@@ -595,6 +597,38 @@ def _validate_verdicts(data: Any, codes: list[str]) -> dict[str, Any]:
             raise ValueError(f"{code} 不在本组标的里，本组只有 {'、'.join(codes)}")
         if verdict.get("action") not in ACTIONS:
             raise ValueError(f"{code} 的 action 必须是 {'、'.join(ACTIONS)}")
+        action = verdict["action"]
+        buy_mode = verdict.get("buy_mode")
+        sell_mode = verdict.get("sell_mode")
+        if buy_mode is None:
+            buy_mode = "OPEN"
+        if sell_mode is None:
+            sell_mode = "RISK_EXIT" if action == "SELL" else "NONE"
+        sell_volume_pct = verdict.get("sell_volume_pct")
+        if sell_volume_pct is None:
+            sell_volume_pct = 0.5 if sell_mode == "T_REDUCE" else 1.0
+        if not isinstance(sell_volume_pct, (int, float)) or not 0 < float(sell_volume_pct) <= 1:
+            raise ValueError(f"{code} 的 sell_volume_pct 必须在 0 和 1 之间")
+        if buy_mode not in BUY_MODES:
+            raise ValueError(f"{code} 的 buy_mode 必须是 {'、'.join(BUY_MODES)}")
+        if sell_mode not in SELL_MODES:
+            raise ValueError(f"{code} 的 sell_mode 必须是 {'、'.join(SELL_MODES)}")
+        if action != "BUY" and buy_mode != "OPEN":
+            raise ValueError(f"{code} 只有 BUY 才能使用 buy_mode={buy_mode}")
+        if action != "SELL" and sell_mode != "NONE":
+            raise ValueError(f"{code} 只有 SELL 才能使用 sell_mode={sell_mode}")
+        if action == "SELL" and sell_mode == "NONE":
+            raise ValueError(f"{code} 的 SELL 必须说明 sell_mode")
+        if sell_mode == "T_REDUCE" and float(sell_volume_pct) > 0.5:
+            raise ValueError(f"{code} 的 T_REDUCE 最多只能卖出可卖仓的 50%")
+        if action != "SELL" and sell_volume_pct != 1.0:
+            raise ValueError(f"{code} 只有 SELL 才能设置 sell_volume_pct")
+        verdict = {
+            **verdict,
+            "buy_mode": buy_mode,
+            "sell_mode": sell_mode,
+            "sell_volume_pct": float(sell_volume_pct),
+        }
         if code in seen:
             raise ValueError(f"{code} 给了两条结论")
         seen[code] = verdict
@@ -602,5 +636,3 @@ def _validate_verdicts(data: Any, codes: list[str]) -> dict[str, Any]:
     if missing:
         raise ValueError(f"这些标的没有结论：{'、'.join(missing)}")
     return {**data, "verdicts": [seen[code] for code in codes]}
-
-

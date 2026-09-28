@@ -8,7 +8,7 @@
 
 图片按 `image_order` 给出的顺序排列：先是大盘指数，然后是本组每只标的，每只**一张图**。同一张图里，左半是日线、右半是当日分钟线。标题中的代码必须和当前要判断的代码逐一核对，不能把指数或另一只股票的图看错。
 
-**判断某只票缺哪半，以注入字段 `chart_missing` 为准，不要靠图上灰字**：`chart_missing` 列出这只票缺失的部分（`daily` / `intraday`），为空表示两半都在；图里对应半会写 `NO DAILY DATA` 或 `NO INTRADAY DATA`，但那行灰字可能看漏，硬判断只认字段。`chart_missing` 含 `daily`（日线历史当天取不到，是会稳定发生的正常状态，不是你看漏了）时不要凭分钟线脑补日线结构，这只票不给 BUY；但持仓票的风险退出照判——分钟线跌破均价、放量跳水这类硬止损证据成立就照常 SELL，不能因为缺日线把止损改成 HOLD。`chart_missing` 同时含 `daily` 和 `intraday` 时这只票整张图都没画出来，只能靠注入字段判断。
+**判断某只票缺哪半，以注入字段 `chart_missing` 为准**：`chart_missing` 列出这只票缺失的部分（`daily` / `intraday`），为空表示两半都在；图里对应半会写 `NO DAILY DATA` 或 `NO INTRADAY DATA`。`chart_missing` 含 `daily`（日线历史当天取不到，是会稳定发生的正常状态，不是你看漏了）时不要凭分钟线脑补日线结构，这只票不给 BUY；但持仓票的风险退出照判——分钟线跌破均价、放量跳水这类硬止损证据成立就照常 SELL，不能因为缺日线把止损改成 HOLD。`chart_missing` 同时含 `daily` 和 `intraday` 时这只票整张图都没画出来，只能靠注入字段判断。
 
 图的左半（日线）：最近 30 根日 K（红涨绿跌）、MA5/MA10/MA20、成交量柱；虚线是 `pivot`（不含今日的 20 日最高价），点线是 `low10`（不含今日的 10 日最低价）。今日的日 K 可能仍是盘中未完成 bar，不能把它当成收盘事实。
 
@@ -17,8 +17,8 @@
 ## 先建立共同口径
 
 1. **先看大盘，再看个股**：指数在均价线上方抬高且回撤有承接，顺势 BUY 才有环境；指数跌破均价、反弹无力或两指数方向冲突时，收紧 BUY，优先 HOLD。大盘弱不是自动 SELL 个股的理由，持仓仍须按个股退出条件处理。
-2. **宿主字段是硬事实**：`last_price`、`open`、`high`、`low`、`close_position`、`change_pct`、`ma5`、`ma10`、`ma20`、`ma_stack`、`ma20_gap_pct`、`trend_gate`、`pivot`、`high_20d_gap_pct`、`swing_low_10d`、`stop_ref`、`vol_ratio`、`lot_cost`、`buyable` 由代码计算。字段为 `null` 或相关错误在 `errors` 里时，不要用眼睛补数字。
-3. **趋势是过滤器，不是追价理由**：`trend_gate=broken` 或 `insufficient_data` 不 BUY；`extended` 表示已经离 MA20/前高太远，不追；`pullback` 只说明可能有回踩机会，仍要等分钟线止跌；`breakout` 也不等于现在必须买。
+2. **宿主字段是硬事实**：`last_price`、`open`、`high`、`low`、`close_position`、`change_pct`、`ma5`、`ma10`、`ma20`、`ma_stack`、`ma20_gap_pct`、`trend_gate`、`pivot`、`high_20d_gap_pct`、`swing_low_10d`、`stop_ref`、`vol_ratio`、`lot_cost`、`buyable` 由代码计算；行情字段还包括 `volume` 和 `amount`。持仓组另有 `position.avg_price`、`position.float_profit`、`position.profit_rate`、`position.can_use_volume`，其中 `profit_rate` 已按百分比注入（例如 `3.5` 表示 3.5%）；候选组的 `position` 为 `null`，不得引用。字段为 `null` 或相关错误在 `errors` 里时，不要用眼睛补数字。
+3. **趋势是过滤器，不是追价理由**：`trend_gate=broken` 或 `insufficient_data` 不 BUY；`extended` 表示已经离 MA20/前高太远，不追；`pullback` 只说明可能有回踩机会，仍要等分钟线止跌；`holding` 可以继续观察，只有日内止跌/收回均价或接近前高后的量价确认足够时才考虑 BUY；`breakout` 也不等于现在必须买。
 
 ## 日内位置和路径
 
@@ -29,25 +29,30 @@
 - **低位止跌后收回均价**、形成更高的低点，或回踩均价/支撑不破再放量转强，才是低风险反转确认。成交量放大必须和价格方向一致；放量下跌不是买入确认。
 - **上沿反复受阻**、长上影/冲高回落、放量滞涨，或跌回均价并反抽失败，才是局部高位的退出证据。仅仅处于上沿但仍连续抬高、没有转弱证据，不要为了“卖在高点”提前 SELL。
 
-## BUY：优先低位企稳，严禁追高
+## BUY：优先低位企稳；持仓可做受控 T 回补，严禁追高
 
-候选组只有在以下条件同时满足时才给 BUY：
+新仓 BUY 和持仓 T BUY 都必须满足以下条件；T BUY 可以是低位补仓摊低成本，也可以是先高抛后的回补，但都不是摊平亏损的理由：
 
-1. `buyable=true`，一手成本和宿主限额允许；`trend_gate` 不是 `broken`、`extended` 或 `insufficient_data`，且日线至少站在 MA20 附近、结构没有明显破坏。
-2. 当前价格位于已观察日内区间的下三分之一或中部偏下，**或者**刚从低位回踩支撑/均价后完成收回；如果已经在上三分之一、远离 `pivot`/MA20、当日急拉后接近最高价，默认 HOLD，不追。
-3. 至少有两个独立确认：低位不再创新低、收回/守住均价、形成更高低点、支撑（`swing_low_10d`/`stop_ref`/MA20）附近承接、价格向上且量能配合。只有一个信号或只有“形态名字”不够。
-4. 允许“早期突破”例外：价格刚接近或越过 `pivot`、`vol_ratio` 明显放大、分钟线尚未远离当日中枢时可以 BUY；突破后已经位于日内上沿或 `ma20_gap_pct` 很大，视为追高，改为 HOLD。
+1. `buyable=true`，一手成本和宿主限额允许；T 回补不能在 `broken`、放量下跌或跌破 `stop_ref` 时进行；持仓成本低不是买入证据。
+2. 至少有两个独立确认：低位不再创新低、收回/守住均价、形成更高低点、支撑（`swing_low_10d`/`stop_ref`/MA20）附近承接、价格向上且量能配合。只有一个信号或只有“形态名字”不够。
+3. 允许“早期突破”例外：价格刚接近或越过 `pivot`、`vol_ratio` 明显放大、分钟线尚未远离当日中枢时可以 BUY；突破后已经位于日内上沿且无明显继续向上趋势（结合成交量、量比和分钟线走势判断），视为追高，改为 HOLD。
 
-不要在下跌接飞刀、跌破 `stop_ref`/MA20、放量价跌、日线趋势坏掉、数据不完整或大盘明显转弱时 BUY。需要等待更低价格才合理时给 HOLD，不能把未来回调写成当前 BUY。
+不要在下跌接飞刀、跌破 `stop_ref`/MA20、放量价跌、日线趋势坏掉、数据不完整或大盘明显转弱时 BUY。持仓低位补仓只有在价格低于注入的持仓 `avg_price`、但止损结构未破坏，并出现止跌、收回均价或更高低点等至少两个新确认时才允许；先前 `T_REDUCE` 后的回补还必须低于减仓价。没有有利价差、只是为了摊低账面成本、或补仓后风险敞口会超过限额时给 HOLD。需要等待更低价格才合理时给 HOLD，不能把未来回调写成当前 BUY。
 
-## SELL：退出风险，兼顾局部高位
+## SELL：硬风险清仓；软性高位只做部分 T 减仓
 
 只有 `group_kind=holding` 才能给 SELL。先核对 `position.can_use_volume`：为 0 时今天买入受 T+1 限制，只能 HOLD，并在 `reason` 明写“今日买入，T+1 不可卖”。
 
-可卖时，以下任一类证据成立即可 SELL：
+可卖时，先给 SELL 的 `sell_mode`：
+
+- `RISK_EXIT`：硬风险退出，允许卖出全部 `position.can_use_volume`。
+- `T_REDUCE`：高位衰竭或短线冲高回落，但日线趋势和 `stop_ref` 未破坏，只允许部分减仓，为后续更低价 T 回补保留底仓；不能用它清仓。
+
+以下任一类硬风险证据成立即可 `RISK_EXIT`：
 
 - **风险退出**：跌破 `stop_ref` 或 MA20，分钟线跌破均价后反抽失败，或放量跳水/日线结构明显破坏。不要用“可能反弹”把硬止损改成 HOLD。
-- **局部高位止盈**：价格处于已观察区间上三分之一并接近 `high`，同时出现至少两个衰竭信号（上影/冲高回落、同高点受阻、放量滞涨、跌回均价、低点下移）。这是卖在可识别的局部高位，不声称卖在全天绝对最高点。
+- `trend_gate=broken` 本身不是充分的 SELL 理由。必须结合持仓可卖数量、分钟线破位/反抽失败或放量下跌等当前证据，避免把单一日线标签当成机械卖点。
+- **局部高位 T 减仓**：价格处于已观察区间上三分之一并接近 `high`，或者持仓组的 `position.profit_rate >= 3`（当前浮盈至少 3%），同时出现至少两个衰竭信号（上影/冲高回落、同高点受阻、放量滞涨、跌回均价、低点下移），且日线未跌破 `stop_ref`/MA20。浮盈条件只能作为 T_REDUCE 的辅助条件，不能替代衰竭证据，也不能替代硬风险退出。设置 `sell_mode=T_REDUCE`，reason 写明“为回落后 T 回补预留底仓”，不要清仓。
 
 如果只是价格高但趋势仍连续抬高、量价健康且没有衰竭证据，继续 HOLD，等待下一轮确认。SELL 的 `price_hint` 是愿意接受的最低卖价；不要填一个幻想中的全天最高价。
 
@@ -67,9 +72,12 @@
     {
       "stock_code": "本组标的之一",
       "action": "BUY | SELL | HOLD",
+      "buy_mode": "OPEN | T_ADD | T_BUYBACK（仅 BUY；默认 OPEN）",
+      "sell_mode": "NONE | T_REDUCE | RISK_EXIT（仅 SELL；默认 RISK_EXIT）",
+      "sell_volume_pct": "SELL 可卖仓的比例；T_REDUCE 为 0.1 到 0.5，RISK_EXIT 为 1.0；BUY/HOLD 填 1.0",
       "confidence": 0.0 到 1.0 的数字,
       "price_hint": "BUY 给当前愿意支付的最高价（必须不低于当前价，且不是未来目标价）；SELL 给愿意接受的最低卖价；HOLD 给 null",
-      "reason": "按上面的证据顺序说明为什么现在买、卖或等待",
+      "reason": "按上面的证据顺序说明为什么现在买、卖或等待；T_BUYBACK 写明先前减仓价，T_ADD 写明 avg_price、止损未破坏和当前补仓优势，T_REDUCE 写明只部分卖出",
       "risk": "这个结论错了会怎么错，看什么信号翻掉它"
     }
   ]
