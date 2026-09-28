@@ -1100,7 +1100,8 @@ def _pipeline_settings(tmp_path: Path) -> dict:
     return settings
 
 
-def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
+@pytest.mark.parametrize("missing_family", [None, "概念", "行业", "概念空", "全部"])
+def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch, missing_family):
     """盘前选池 → 并行读图 → 汇总执行的完整一天：图真的渲染，单真的提交，账本真的落盘。"""
     FakeMiniQMT.submissions.clear()
     FakeMiniQMT.orders_items = []
@@ -1110,7 +1111,27 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(local_env, "MiniQMTClient", FakeMiniQMT)
     monkeypatch.setattr(pipeline, "get_model", lambda config: ScriptedModel(**config))
-    monkeypatch.setattr(akshare_board, "board_rank", _fake_board_rank)
+    def mixed_board_rank(family, **kwargs):
+        if missing_family in (family, "全部"):
+            raise akshare_board.BoardDataError("模拟榜单不可用")
+        if missing_family == "概念空" and family == "概念":
+            return {"family": family, "sectors": []}
+        result = _fake_board_rank(family, **kwargs)
+        if missing_family is None:
+            first, second = result["sectors"]
+            # 行业中有更强机会，不能把概念的弱板块排在它前面；同名板块也不能吃掉两个扫描名额。
+            result["sectors"] = (
+                [first, {**second, "sector": "概念弱板块", "buyable_median_change_pct": -1.0}]
+                if family == "概念"
+                else [{**first, "buyable_median_change_pct": 3.5}, second]
+            )
+        # 同一股票同时属于两类板块，保留比较依据，最终输出只允许选一次。
+        for sector in result["sectors"]:
+            if sector["sector"] == "TGN热门二":
+                sector["member_codes"] = ["600001.SH", *sector["member_codes"]]
+        return result
+
+    monkeypatch.setattr(akshare_board, "board_rank", mixed_board_rank)
     # 日线缓存下沉到 akshare_board：数最底层 _fetch_daily 真正打东财的次数。盘前预热填一次，
     # 盘中两轮全命中缓存（含 _bars 与 _enrich_trend 共享），全天只该打这一次。
     fetch_calls = {"n": 0}
@@ -1128,7 +1149,22 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch):
         _pipeline_settings(tmp_path), sessions_dir=sessions_dir, journal_dir=journal_dir, echo=lambda text: None
     )
 
+    if missing_family == "全部":
+        with pytest.raises(context.MarketDataError, match="概念和行业板块热度榜均没有数据"):
+            day.premarket()
+        assert not ScriptedModel.seen and not FakeMiniQMT.submissions
+        return
+
     watchlist = day.premarket()
+    # 检查真实渲染给模型的输入，确保行业明细真正进入 prompt，且总预算仍为两个板块。
+    scout_trace = json.loads(next(sessions_dir.rglob("*-premarket.json")).read_text())
+    scout_input = scout_trace["messages"][1]["content"]
+    candidates = json.loads(scout_input.split("## 热门板块内部个股行情与趋势字段\n", 1)[1].split("\n## 账户", 1)[0])
+    assert [item["sector"] for item in candidates] == ["TGN热门一", "TGN热门二"]
+    expected_families = ["概念", "行业"] if missing_family is None else ["概念" if missing_family == "行业" else "行业"] * 2
+    assert [item["family"] for item in candidates] == expected_families
+    assert all(any(row["stock_code"] == "600001.SH" for row in item["rows"]) for item in candidates)
+    assert bool(watchlist["data_errors"]) == (missing_family is not None)
     # 编出来的代码被打回，重试一次后才落盘；两个板块各一只，且都来自注入的池子。
     assert ScriptedModel.seen["scout"] == 2
     picked = [pick["stock_code"] for sector in watchlist["sectors"] for pick in sector["picks"]]

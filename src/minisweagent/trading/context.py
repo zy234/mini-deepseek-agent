@@ -22,7 +22,7 @@ from minisweagent.environments.account_journal import read_account_journal
 from minisweagent.environments.miniqmt import TRADING_TZ, MiniQMTClient, host_limits
 from minisweagent.trading import charts
 
-# 概念板块定当日主线（短线资金炒概念），行业板块交叉验证背后有没有行业级资金。
+# 概念与行业共同竞争候选名额，不能因类别固定排在后面就失去取个股明细的机会。
 # 数据源：akshare（东财）。大 QMT 撤极简接口后，QMT 已取不到申万/通达信板块数据，见 akshare_board。
 SECTOR_FAMILIES = ("概念", "行业")
 SECTOR_RANK_LIMIT = 12
@@ -79,10 +79,27 @@ def premarket_context(
             errors.append(f"{family} 板块热度榜失败：{exc}")
             continue
         ranks[family] = result["sectors"]
-    if not ranks.get(SECTOR_FAMILIES[0]):
-        raise MarketDataError(f"{SECTOR_FAMILIES[0]} 板块热度榜没有数据，盘前无法选池：{'；'.join(errors)}")
+        if not ranks[family]:
+            errors.append(f"{family} 板块热度榜没有数据")
+    # 总扫描预算不变：两类热度榜合并按可买中位涨幅、上涨比例排序，资金占比用于同分择优。
+    # 不用各榜内的 fund_rank 横比；缺失的资金数据排在已知值之后，不当作零流入。
+    ranked = [{**sector, "family": family} for family, sectors in ranks.items() for sector in sectors]
+    ranked.sort(
+        key=lambda item: (
+            item["buyable_median_change_pct"],
+            item["up_ratio"],
+            item.get("main_net_inflow_pct") if item.get("main_net_inflow_pct") is not None else float("-inf"),
+        ),
+        reverse=True,
+    )
+    if not ranked:
+        raise MarketDataError(f"概念和行业板块热度榜均没有数据，盘前无法选池：{'；'.join(errors)}")
+    # 下游按板块名索引，同名板块只保留排名靠前的一份，避免占两份预算或在校验时互相覆盖。
+    selected: dict[str, dict] = {}
+    for sector in ranked:
+        selected.setdefault(sector["sector"], sector)
     candidates = []
-    for sector in ranks[SECTOR_FAMILIES[0]][:sectors_scanned]:
+    for sector in list(selected.values())[:sectors_scanned]:
         # 成分股由 akshare 给出代码，实时行情与日线趋势字段走 ZMQ：拿代码列表让 client.screen 出确定性结论。
         codes = sector.get("member_codes") or []
         if not codes:
@@ -100,6 +117,7 @@ def premarket_context(
         candidates.append(
             {
                 "sector": sector["sector"],
+                "family": sector["family"],
                 "sector_stats": {
                     key: sector.get(key)
                     for key in (
