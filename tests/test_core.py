@@ -1188,6 +1188,15 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch, 
     assert picked == ["600001.SH", "000004.SZ"]
     assert (journal_dir / "watchlist" / f"{watchlist['trade_date']}.json").is_file()
 
+    # 长账本先筛选再注入，早盘交易不能被后续空转轮次挤掉。
+    journal_path = journal_dir / "journals" / f"{watchlist['trade_date']}.md"
+    history = "<!-- cycle:early-trade -->\n## 09:30 · BUY\n- 操作：BUY 600001.SH 100\n"
+    history += "<!-- trade:early-trade:intent:1 -->\n- 操作：submit\n"
+    history += "<!-- cycle:old-hold -->\n- 操作：无\n- 决策：" + "等待" * 22000 + "\n"
+    history += "<!-- cycle:latest-hold -->\n- 操作：无\n- 后续观察：最新观察\n"
+    with journal_path.open("a", encoding="utf-8") as handle:
+        handle.write(history)
+
     outcome = day.run_round()
 
     # 两个候选板块各一组，加上持仓组，一共三组并行读图。
@@ -1209,6 +1218,12 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch, 
     assert "买入 600001.SH 一手" in journal
     roots = inspect.TraceIndex(sessions_dir).sessions()
     round_root = next(root for root in roots if root["agent_name"] == "execution_manager")
+    execution_trace = json.loads(next(sessions_dir.rglob("*-round.json")).read_text())
+    injected = execution_trace["messages"][1]["content"]
+    assert "cycle:early-trade" in injected and "trade:early-trade:intent:1" in injected
+    assert "cycle:latest-hold" in injected and "最新观察" in injected
+    assert "cycle:old-hold" not in injected
+    assert "cycle:old-hold" in journal_path.read_text(encoding="utf-8")
     assert [child["agent_name"] for child in round_root["children"]] == ["chart_reader"] * 3
     # 观测端区分并行读图组靠的是轨迹里落下的 label，不是去解析任务文本。
     assert [child["label"] for child in round_root["children"]] == ["TGN热门一", "TGN热门二", "当前持仓"]

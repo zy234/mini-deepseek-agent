@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -23,21 +24,56 @@ RECORD_FIELDS = {
 }
 
 
-def read_account_journal(directory: str | Path) -> dict[str, Any]:
+def read_account_journal(directory: str | Path, *, compact: bool = False) -> dict[str, Any]:
     """读取账本快照：今日全部记录，加上前一交易日的收尾记录。"""
     journal_dir = Path(directory).expanduser().resolve() / "journals"
     today = datetime.now(TRADING_TZ).date().isoformat()
     today_path = journal_dir / f"{today}.md"
     previous_paths = sorted(path for path in journal_dir.glob("*.md") if path.name < today_path.name)
     previous_path = previous_paths[-1] if previous_paths else None
+    today_text = today_path.read_text(encoding="utf-8") if today_path.is_file() else ""
     return _success(
         "journal_read",
         {
             "date": today,
-            "today": _read_tail(today_path, MAX_JOURNAL_READ_CHARS),
+            "today": compact_today_journal(today_text) if compact else today_text[-MAX_JOURNAL_READ_CHARS:],
             "previous": _read_tail(previous_path, 12_000) if previous_path else "",
         },
     )
+
+
+def compact_today_journal(journal: str) -> str:
+    """给执行阶段的 prompt 裁剪当日账本。
+
+    最近一轮保留完整记录，之前的轮次只保留确实有委托操作的记录；交易工具审计块
+    本身就是实际操作，也一并保留。原始 Markdown 文件和 ``account_journal read``
+    的返回值不裁剪，便于观测和审计。
+    """
+    if not journal:
+        return ""
+    blocks = re.split(r"(?=<!-- (?:cycle|trade):)", journal)
+    prefix, records = blocks[0], [block for block in blocks[1:] if block.strip()]
+    if not records:
+        return journal
+    latest_cycle = max(
+        (index for index, block in enumerate(records) if block.lstrip().startswith("<!-- cycle:")),
+        default=len(records) - 1,
+    )
+    traded_cycles = set(re.findall(r"^<!-- trade:([^:]+):", journal, flags=re.MULTILINE))
+    kept: list[str] = []
+    for index, block in enumerate(records):
+        cycle = re.match(r"<!-- cycle:(.*?) -->", block)
+        if (index == latest_cycle or _journal_block_has_operation(block)
+                or (cycle and cycle.group(1) in traded_cycles)):
+            kept.append(block)
+    return prefix + "".join(kept)
+
+
+def _journal_block_has_operation(block: str) -> bool:
+    if block.lstrip().startswith("<!-- trade:"):
+        return True
+    match = re.search(r"^- 操作：([^\n]*)", block, flags=re.MULTILINE)
+    return bool(match and match.group(1).strip() not in {"", "无"})
 
 
 def append_account_cycle(

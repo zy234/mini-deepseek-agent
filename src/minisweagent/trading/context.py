@@ -171,7 +171,7 @@ def round_context(
         "groups": groups,
         "account": account,
         "limits": host_limits(),
-        "journal": read_account_journal(journal_dir)["data"],
+        "journal": read_account_journal(journal_dir, compact=True)["data"],
         "errors": errors,
     }
 
