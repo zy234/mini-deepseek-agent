@@ -14,15 +14,20 @@ agents:
     system_template_path: prompts/interactive.system.md
     instance_template_path: prompts/interactive.instance.md
   candidate_scout:
-    description: 盘前从注入的板块热度与个股结构里选出当日待观测清单
-    flow: single_shot
+    description: 盘前先读板块摘要，再按需查询个股结构并提交待观测清单
+    flow: iterative
+    step_limit: 14
+    wall_time_limit_seconds: 480
     json_output: true
-    tools: []
+    tools:
+      - candidate_details
     system_template_path: prompts/candidate_scout.system.md
     instance_template_path: prompts/candidate_scout.instance.md
     model:
       reasoning_effort: low
       stream_output: false
+      observation_template: '{{ output.stdout }}'
+      format_error_template: '{{ error }}。查询只能调用 candidate_details，sectors 与 stock_codes 二选一；查询完成后直接返回最终 JSON 对象。'
   chart_reader:
     description: 看日线图与分钟图，对一组标的直接给出买卖结论
     flow: single_shot
@@ -53,6 +58,8 @@ trading:
   picks_per_sector: 2
   sectors_scanned: 8
   rows_per_sector: 8
+  candidate_query_calls: 12
+  candidate_detail_limit: 20
   index_codes:
     - 000001.SH
     - 399006.SZ

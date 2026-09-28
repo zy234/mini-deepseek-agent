@@ -1,8 +1,7 @@
 """宿主侧数据装配：把行情、账户和账本取好、算好、排好版，直接注入 prompt。
 
-这条流水线里模型不再自己调工具取数。原因很直接：取数是确定性动作，让模型决定取什么、
-取几次，只会引入"忘了取"、"取错时间窗"和"上下文被整版 tick 淹掉"三类故障。宿主取数则
-每一轮的输入都是同一份形状，出错立刻可见。
+选池先注入摘要，由只读工具按需展开本轮明细；盘中阶段仍由宿主一次装配所需数据。
+取数口径、时间戳和失败信息由宿主维护，模型不自行拼接口或推算缺失数据。
 
 所有对外函数返回的 dict 里都有 errors 字段：取数失败必须跟着数据一起进 prompt，
 模型要知道自己是在残缺数据上做判断，而不是以为市场上就没有那些票。
@@ -55,12 +54,9 @@ class MarketDataError(RuntimeError):
 def premarket_context(
     client: MiniQMTClient,
     *,
-    journal_dir: str | Path,
     index_codes: list[str],
-    sectors_scanned: int = 8,
-    rows_per_sector: int = 8,
 ) -> dict[str, Any]:
-    """盘前数据包：板块热度榜、热板块内部个股结构、大盘、账户和账本。
+    """盘前只取榜单、大盘和账户，个股明细留给选池工具按需查询。
 
     通常 9:20 执行，也允许盘中补跑。各数据按各自时间戳解释；趋势字段由 screen 按
     历史日线与 tick 合成当日 bar 计算，不能把整包指标都描述成昨收结构。
@@ -78,10 +74,11 @@ def premarket_context(
         except akshare_board.BoardDataError as exc:
             errors.append(f"{family} 板块热度榜失败：{exc}")
             continue
-        ranks[family] = result["sectors"]
+        ranks[family] = [{**sector, "quote_at": result.get("quote_at")} for sector in result["sectors"]]
+        errors.extend(f"{family} 板块 {name} 成分行情获取失败" for name in result.get("member_fetch_failures") or [])
         if not ranks[family]:
             errors.append(f"{family} 板块热度榜没有数据")
-    # 总扫描预算不变：两类热度榜合并按可买中位涨幅、上涨比例排序，资金占比用于同分择优。
+    # 两类摘要统一排序供模型比较，但不预先截断为要查询明细的板块。
     # 不用各榜内的 fund_rank 横比；缺失的资金数据排在已知值之后，不当作零流入。
     ranked = [{**sector, "family": family} for family, sectors in ranks.items() for sector in sectors]
     ranked.sort(
@@ -98,55 +95,20 @@ def premarket_context(
     selected: dict[str, dict] = {}
     for sector in ranked:
         selected.setdefault(sector["sector"], sector)
-    candidates = []
-    for sector in list(selected.values())[:sectors_scanned]:
-        # 成分股由 akshare 给出代码，实时行情与日线趋势字段走 ZMQ：拿代码列表让 client.screen 出确定性结论。
-        codes = sector.get("member_codes") or []
-        if not codes:
-            errors.append(f"板块 {sector['sector']} 无可用成分股代码")
-            continue
-        screened = client.screen(
-            stock_codes=codes,
-            sort_by="close_position_desc",
-            limit=rows_per_sector,
-            enrich_trend=True,
-        )
-        if not screened["ok"]:
-            errors.append(f"板块 {sector['sector']} 个股筛选失败：{(screened.get('error') or {}).get('detail', '')}")
-            continue
-        candidates.append(
-            {
-                "sector": sector["sector"],
-                "family": sector["family"],
-                "sector_stats": {
-                    key: sector.get(key)
-                    for key in (
-                        "members_quoted",
-                        "up_ratio",
-                        "median_change_pct",
-                        "buyable_count",
-                        "buyable_median_change_pct",
-                        "amount",
-                        "main_net_inflow_yi",
-                        "main_net_inflow_pct",
-                    )
-                },
-                "quote_at": screened["data"]["quote_at"],
-                "rows": screened["data"]["rows"],
-            }
-        )
-    if not candidates:
-        raise MarketDataError(f"热门板块个股筛选全部失败，盘前无法选池：{'；'.join(errors)}")
+    summary_fields = (
+        "sector", "family", "quote_at", "buyable_median_change_pct", "up_ratio",
+        "main_net_inflow_yi", "main_net_inflow_pct", "buyable_count",
+    )
+    summaries = [{key: sector.get(key) for key in summary_fields} for sector in selected.values()]
     account = account_context(client, errors)
     return {
         "as_of": now.isoformat(timespec="seconds"),
         "trade_date": now.date().isoformat(),
         "indexes": index_quotes(client, index_codes, errors),
-        "sector_ranks": ranks,
-        "sector_candidates": candidates,
+        "sector_ranks": summaries,
+        "sector_catalog": selected,
         "account": account,
         "limits": limits,
-        "journal": read_account_journal(journal_dir)["data"],
         "errors": errors,
     }
 

@@ -12,7 +12,7 @@ PROMPT_KINDS = ("system", "instance")
 PROMPT_DIRNAME = "prompts"
 # 交易日流水线的三个阶段角色，以及它们不能被配置改坏的硬形态。
 PIPELINE_ROLES = {
-    "candidate_scout": {"flow": "single_shot", "json_output": True, "tools": ()},
+    "candidate_scout": {"flow": "iterative", "json_output": True, "tools": ("candidate_details",)},
     "chart_reader": {"flow": "single_shot", "json_output": True, "tools": ()},
     "execution_manager": {"flow": "iterative", "json_output": False, "tools": ("miniqmt_trade",)},
 }
@@ -115,6 +115,8 @@ def _validate_pipeline_roles(agents: dict) -> None:
         missing = [tool for tool in demands["tools"] if tool not in (profile.get("tools") or [])]
         if missing:
             raise ValueError(f"agents.{role}.tools 缺少必需工具：{', '.join(missing)}")
+        if role == "candidate_scout" and set(profile.get("tools") or []) != set(demands["tools"]):
+            raise ValueError("agents.candidate_scout.tools 只能包含 candidate_details")
 
 
 def _validate_profile(name: str, profile: dict, agents: dict, base_dir: Path) -> None:

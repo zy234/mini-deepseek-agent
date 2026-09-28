@@ -17,6 +17,7 @@ from minisweagent.environments.account_journal import (
     read_account_journal,
 )
 from minisweagent.environments.bash_policy import analyze_bash_command
+from minisweagent.environments.candidate_details import CandidateDetails
 from minisweagent.environments.editor import execute_editor
 from minisweagent.environments.miniqmt import MiniQMTClient
 from minisweagent.environments.web_fetch import execute_web_fetch
@@ -78,15 +79,29 @@ class LocalEnvironment:
         *,
         config_class: type = LocalEnvironmentConfig,
         approval_callback: Callable[[str, str], bool] | None = None,
+        candidate_details: CandidateDetails | None = None,
         **kwargs,
     ):
         """This class executes bash commands directly on the local machine."""
         self.config = config_class(**kwargs)
         self.approval_callback = approval_callback or _prompt_for_approval
         self._miniqmt: MiniQMTClient | None = None
+        # 本轮查询状态只活在内存里，不放配置，也不序列化整个成分股目录与缓存。
+        self.candidate_details = candidate_details
 
     def execute(self, action: dict, cwd: str = "", *, timeout: float | None = None) -> dict[str, Any]:
         """Execute a command in the local environment and return the result as a dict."""
+        if self.candidate_details is not None and action.get("tool") != "candidate_details":
+            return _json_tool_output("candidate_details", {
+                "ok": False, "error": {"code": "tool_not_allowed", "detail": "选池环境只允许 candidate_details 只读查询"},
+            })
+        if action.get("tool") == "candidate_details":
+            result = (
+                self.candidate_details.execute({key: value for key, value in action.items() if key not in {"tool", "tool_call_id"}})
+                if self.candidate_details is not None else
+                {"ok": False, "error": {"code": "not_bound", "detail": "candidate_details 只能由选池流水线绑定本轮数据后使用"}}
+            )
+            return _json_tool_output("candidate_details", result)
         if action.get("tool") == "str_replace_editor":
             return self._execute_editor(action, cwd)
         if action.get("tool") == "web_search":

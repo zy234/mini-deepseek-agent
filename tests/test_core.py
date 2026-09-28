@@ -935,7 +935,7 @@ def _fake_fetch_daily(codes, start_time, end_time, *, index_set=frozenset(), spa
 
 
 class ScriptedModel:
-    """按 system prompt 分辨角色的假模型。第一次选池故意编一个池子外的代码，验证宿主会打回。"""
+    """按 system prompt 分辨角色的假模型。选池先查简表、故意提前提交，再展开详情完成。"""
 
     seen: dict[str, int] = {}
     images: list[list[str]] = []
@@ -954,17 +954,28 @@ class ScriptedModel:
         if "汇总执行" in system:
             return self._executor()
         if "盘前选池" in system:
-            return self._scout(kwargs)
+            return self._scout(messages, kwargs)
         return self._reader(messages, kwargs)
 
-    def _scout(self, kwargs):
+    def _scout(self, messages, kwargs):
         assert kwargs.get("json_output") is True, "选池角色必须走 JSON 输出"
+        assert kwargs.get("tools") == ["candidate_details"]
         count = ScriptedModel.seen["scout"] = ScriptedModel.seen.get("scout", 0) + 1
         if count == 1:
-            # 凭记忆编的代码：宿主必须打回，不能让它进待观测清单。
-            picks = [{"stock_code": "600519.SH", "reason": "记错了", "risk": "无"}]
-        else:
-            picks = [{"stock_code": "600001.SH", "reason": "站上前高", "risk": "破 14.3 走"}]
+            assert "member_codes" not in messages[1]["content"]
+            assert "ma20" not in messages[1]["content"] and "600001.SH" not in messages[1]["content"]
+            return _actions([{"tool": "candidate_details", "tool_call_id": "sectors",
+                              "sectors": ["TGN热门一", "TGN热门二"]}])
+        if count in (3, 5):
+            if count == 3:
+                assert "已展开详情" in messages[-1]["content"]
+            return _actions([{"tool": "candidate_details", "tool_call_id": f"stocks-{count}",
+                              "stock_codes": ["600001.SH", "000004.SZ"]}])
+        if count == 4:
+            return _actions([{"tool": "candidate_details", "tool_call_id": "sectors-again",
+                              "sectors": ["TGN热门一", "TGN热门二"]}])
+        # 第二次请求故意直接提交简表中的股票，宿主必须要求展开完整详情后重试。
+        picks = [{"stock_code": "600001.SH", "reason": "站上前高", "risk": "破 14.3 走"}]
         return _answer(
             json.dumps(
                 {
@@ -1156,17 +1167,23 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch, 
         return
 
     watchlist = day.premarket()
-    # 检查真实渲染给模型的输入，确保行业明细真正进入 prompt，且总预算仍为两个板块。
+    # 首轮只有摘要，个股简表和完整详情分两步进入工具观测，重复查询不再注入相同数据。
     scout_trace = json.loads(next(sessions_dir.rglob("*-premarket.json")).read_text())
     scout_input = scout_trace["messages"][1]["content"]
-    candidates = json.loads(scout_input.split("## 热门板块内部个股行情与趋势字段\n", 1)[1].split("\n## 账户", 1)[0])
+    assert all(key not in scout_input for key in ("member_codes", "top_buyable", "ma20", "前一交易日账本"))
+    observations = [json.loads(message["content"]) for message in scout_trace["messages"] if message["role"] == "tool"]
+    candidates = observations[0]["data"]["sectors"]
     assert [item["sector"] for item in candidates] == ["TGN热门一", "TGN热门二"]
     expected_families = ["概念", "行业"] if missing_family is None else ["概念" if missing_family == "行业" else "行业"] * 2
     assert [item["family"] for item in candidates] == expected_families
     assert all(any(row["stock_code"] == "600001.SH" for row in item["rows"]) for item in candidates)
+    assert all("ma20" not in row for item in candidates for row in item["rows"])
+    assert all("ma20" in row for row in observations[1]["data"]["stocks"])
+    assert observations[2]["data"]["sectors"] == []
+    assert observations[3]["data"]["stocks"] == []
+    assert observations[3]["data"]["already_returned"] == ["600001.SH", "000004.SZ"]
     assert bool(watchlist["data_errors"]) == (missing_family is not None)
-    # 编出来的代码被打回，重试一次后才落盘；两个板块各一只，且都来自注入的池子。
-    assert ScriptedModel.seen["scout"] == 2
+    assert ScriptedModel.seen["scout"] == 6
     picked = [pick["stock_code"] for sector in watchlist["sectors"] for pick in sector["picks"]]
     assert picked == ["600001.SH", "000004.SZ"]
     assert (journal_dir / "watchlist" / f"{watchlist['trade_date']}.json").is_file()
@@ -1241,6 +1258,96 @@ class _FrozenClock:
 
     def now(self, _tz=None) -> datetime:
         return self.moment
+
+
+def test_candidate_details_tool_loop_is_bounded_and_read_only(tmp_path, monkeypatch):
+    """真实选池装配与 DeepSeek 适配器跑工具循环，HTTP client mock；越界、预算、失败全部可见。"""
+    monkeypatch.setenv("DS_KEY", "test")
+    FakeMiniQMT.submissions.clear()
+    FakeMiniQMT.orders_items = []
+    monkeypatch.setattr(pipeline, "MiniQMTClient", FakeMiniQMT)
+    monkeypatch.setattr(akshare_board, "_fetch_daily", _fake_fetch_daily)
+    screen_calls = []
+    original_screen = FakeMiniQMT.screen
+
+    def screen(self, **kwargs):
+        screen_calls.append(kwargs["stock_codes"])
+        if "000004.SZ" in kwargs["stock_codes"]:
+            raise TimeoutError("模拟板块行情超时")
+        result = original_screen(self, **kwargs)
+        result["data"]["trend_errors"] = ["600003.SH 日线不完整"]
+        result["data"]["rows"][-1]["trend_gate"] = "insufficient_data"
+        return result
+
+    monkeypatch.setattr(FakeMiniQMT, "screen", screen)
+
+    def ranks(family, **kwargs):
+        result = _fake_board_rank(family, **kwargs)
+        result["sectors"].append({**result["sectors"][0], "sector": "备用板块", "buyable_median_change_pct": -2})
+        return result
+
+    monkeypatch.setattr(akshare_board, "board_rank", ranks)
+    actions = [
+        ("candidate_details", {"sectors": ["TGN热门一"], "stock_codes": ["600001.SH"]}),
+        ("bash", {"command": "echo forbidden"}),
+        ("candidate_details", {"stock_codes": ["600519.SH"]}),
+        ("candidate_details", {"sectors": ["TGN热门一"]}),
+        ("candidate_details", {"sectors": ["TGN热门二"]}),
+        ("candidate_details", {"sectors": ["备用板块"]}),
+        ("candidate_details", {"stock_codes": ["600001.SH", "600002.SH"]}),
+        ("candidate_details", {"stock_codes": ["600003.SH"]}),
+        ("candidate_details", {"sectors": ["TGN热门一", "TGN热门二"]}),
+        ("candidate_details", {"stock_codes": ["600001.SH"]}),
+        ("candidate_details", {"stock_codes": ["600002.SH"]}),
+    ]
+    requests = []
+    output = {"market_view": "仅从有效详情选择", "sectors": [{"sector": "TGN热门一", "reason": "相对强势",
+              "picks": [{"stock_code": "600001.SH", "reason": "已核验", "risk": "破位退出"}]}]}
+
+    def create(**request):
+        assert [tool["function"]["name"] for tool in request["tools"]] == ["candidate_details"]
+        assert request["response_format"] == {"type": "json_object"}
+        if not requests:
+            assert not screen_calls, "首轮只取摘要，不能提前查所有板块个股"
+        index = len(requests)
+        requests.append(request)
+        if index < len(actions):
+            name, args = actions[index]
+            delta = SimpleNamespace(content=None, reasoning_content="先查询", tool_calls=[
+                _FakeToolDelta(call_id=f"query-{index}", name=name, arguments=json.dumps(args, ensure_ascii=False)),
+            ])
+            return [_FakeChunk(delta=delta, finish_reason="tool_calls")]
+        return [_FakeChunk(delta=SimpleNamespace(content=json.dumps(output, ensure_ascii=False),
+                                                reasoning_content=None, tool_calls=[]), finish_reason="stop")]
+
+    def model_factory(settings):
+        model = DeepSeekModel(**settings)
+        model.client.chat.completions.create = create
+        return model
+
+    monkeypatch.setattr(pipeline, "get_model", model_factory)
+    settings = _pipeline_settings(tmp_path)
+    settings["trading"].update(candidate_query_calls=8, candidate_detail_limit=2)
+    sessions = tmp_path / "sessions"
+    day = pipeline.TradingPipeline(settings, sessions_dir=sessions, journal_dir=tmp_path / "state", echo=lambda _: None)
+    watchlist = day.premarket()
+    assert len(screen_calls) == 2, "失败与重复查询不能重新取数，超限板块不能发请求"
+    assert not FakeMiniQMT.submissions
+    assert watchlist["sectors"][0]["picks"][0]["stock_code"] == "600001.SH"
+    assert any("日线不完整" in error for error in watchlist["data_errors"])
+    assert any("行情超时" in error for error in watchlist["data_errors"])
+    trace = json.loads(next(sessions.rglob("*-premarket.json")).read_text())
+    observations = [json.loads(message["content"]) for message in trace["messages"] if message["role"] == "tool"]
+    assert observations[0]["error"]["code"] == "out_of_scope"
+    assert observations[2]["data"]["sectors"][0]["rows"] == []
+    assert "行情超时" in observations[2]["data"]["sectors"][0]["errors"][0]
+    for index in (3, 5, 8):
+        assert observations[index]["error"]["code"] == "query_limit"
+    assert observations[6]["data"]["sectors"] == []
+    assert observations[7]["data"]["stocks"] == []
+    assert "member_codes" not in json.dumps(trace, ensure_ascii=False), "宿主完整目录不能随环境配置写入轨迹"
+    assert any("只能提供" in message.get("content", "") for message in trace["messages"])
+    assert any("不允许使用工具" in message.get("content", "") for message in trace["messages"])
 
 
 def test_backtest_buys_day1_then_sells_on_a_later_day_under_t1(tmp_path, monkeypatch):
@@ -1342,9 +1449,15 @@ def test_pipeline_role_configuration_is_guarded(tmp_path):
     with pytest.raises(ValueError, match="candidate_scout"):
         config.validate_agents(missing_role, base_dir)
 
-    # 读图和选池角色不许有工具：它们的输入全部由宿主注入。
+    # 读图仍无工具，选池只允许本轮只读明细查询，不能扩大成交易或命令执行环境。
     assert settings["agents"]["chart_reader"]["tools"] == []
-    assert settings["agents"]["candidate_scout"]["tools"] == []
+    assert settings["agents"]["candidate_scout"]["tools"] == ["candidate_details"]
+    assert settings["agents"]["candidate_scout"]["flow"] == "iterative"
+    for tools in ([], ["candidate_details", "bash"], ["candidate_details", "miniqmt_trade"]):
+        bad_tools = json.loads(json.dumps(raw))
+        bad_tools["agents"]["candidate_scout"]["tools"] = tools
+        with pytest.raises(ValueError, match="candidate_details"):
+            config.validate_agents(bad_tools, base_dir)
 
 
 def _spawn_sleeper(self, log_path: Path, kind: str, mode: str) -> None:

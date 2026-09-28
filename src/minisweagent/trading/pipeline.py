@@ -2,7 +2,7 @@
 
 阶段之间只由宿主传递结构化数据，没有任何 Agent 能调度另一个 Agent：
 
-- 阶段一（默认 09:20）：宿主取板块热度榜和热门板块内部的个股结构，`candidate_scout` 选出
+- 阶段一（默认 09:20）：宿主取板块摘要，`candidate_scout` 按需查个股详情后选出
   若干板块各若干只票，落盘成当日待观测清单。
 - 阶段二（开盘后每 interval 分钟）：宿主为每只待观测股和大盘渲染日线图与当日分钟图，按板块
   分组并行交给 `chart_reader`，每组一次带图请求，直接给出买卖结论。
@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 from minisweagent.agents import get_agent
 from minisweagent.environments import get_environment
 from minisweagent.environments.account_journal import append_account_cycle, append_cycle_fallback
+from minisweagent.environments.candidate_details import CandidateDetails
 from minisweagent.environments.local import LocalEnvironmentConfig
 from minisweagent.environments.miniqmt import TRADING_TZ, MiniQMTClient
 from minisweagent.models import get_model
@@ -61,6 +62,8 @@ class TradingConfig(BaseModel):
     picks_per_sector: int = Field(default=2, ge=1, le=5)
     sectors_scanned: int = Field(default=8, ge=1, le=20)
     rows_per_sector: int = Field(default=8, ge=1, le=20)
+    candidate_query_calls: int = Field(default=12, ge=2, le=30)
+    candidate_detail_limit: int = Field(default=20, ge=1, le=100)
     index_codes: list[str] = Field(default_factory=lambda: ["000001.SH", "399006.SZ"])
     daily_chart_days: int = Field(default=30, ge=10, le=120)
     max_parallel_groups: int = Field(default=6, ge=1, le=12)
@@ -86,28 +89,31 @@ class TradingPipeline:
     def premarket(self) -> dict[str, Any]:
         """取盘前数据、选出待观测清单并落盘。清单是当天阶段二的唯一输入。"""
         started = datetime.now(TRADING_TZ)
+        client = self._data_client()
         pack = context.premarket_context(
-            self._data_client(),
-            journal_dir=self.journal_dir,
+            client,
             index_codes=self.config.index_codes,
-            sectors_scanned=self.config.sectors_scanned,
-            rows_per_sector=self.config.rows_per_sector,
         )
         self.echo(
-            f"盘前数据就绪：{len(pack['sector_candidates'])} 个热门板块，"
-            f"{sum(len(item['rows']) for item in pack['sector_candidates'])} 只候选行情"
+            f"盘前摘要就绪：{len(pack['sector_ranks'])} 个板块，个股明细由模型按需查询"
             + (f"；取数警告 {len(pack['errors'])} 条" if pack["errors"] else "")
         )
         trace, session_id = self._trace(started, "premarket")
-        agent = self._build_agent("candidate_scout", trace=trace, session_id=session_id, cycle_kind="premarket")
-        pool = _candidate_pool(pack)
+        details = CandidateDetails(
+            client, pack["sector_catalog"], pack["errors"], max_sectors=self.config.sectors_scanned,
+            rows_per_sector=self.config.rows_per_sector, max_calls=self.config.candidate_query_calls,
+            max_stocks=self.config.candidate_detail_limit,
+        )
+        agent = self._build_agent(
+            "candidate_scout", trace=trace, session_id=session_id, cycle_kind="premarket", candidate_details=details,
+        )
         payload = self._ask_json(
             agent,
             task=(
-                f"交易日 {pack['trade_date']} 选池（取数开始于 {pack['as_of']}）：从注入 rows 的热门板块里最多选出"
+                f"交易日 {pack['trade_date']} 选池（取数开始于 {pack['as_of']}）：先比较榜单摘要，再用 candidate_details 查询，最多选出"
                 f"{self.config.sector_count} 个板块，每个板块最多 {self.config.picks_per_sector} 只票，可以少选，不必选满。"
             ),
-            validate=lambda data: _validate_watchlist(data, pool, self.config),
+            validate=lambda data: _validate_watchlist(data, details.pool, self.config),
             template_vars={
                 "as_of": pack["as_of"],
                 "trade_date": pack["trade_date"],
@@ -115,10 +121,16 @@ class TradingPipeline:
                 "picks_per_sector": self.config.picks_per_sector,
                 "indexes": context.block(pack["indexes"]),
                 "sector_ranks": context.block(pack["sector_ranks"]),
-                "sector_candidates": context.block(pack["sector_candidates"]),
-                "account": context.block(pack["account"]),
+                "account": context.block({key: pack["account"][key] for key in ("snapshot_at", "asset", "positions")}),
                 "limits": context.block(pack["limits"]),
-                "journal_previous": pack["journal"]["previous"],
+                "query_limits": context.block({
+                    "max_calls": self.config.candidate_query_calls,
+                    "max_sectors": self.config.sectors_scanned,
+                    "rows_per_sector": self.config.rows_per_sector,
+                    "max_detail_stocks": self.config.candidate_detail_limit,
+                    "sectors_per_call": 4,
+                    "stocks_per_call": 10,
+                }),
                 "data_errors": context.block(pack["errors"]),
             },
         )
@@ -434,6 +446,7 @@ class TradingPipeline:
         parent: str = "",
         label: str = "",
         environment_settings: dict[str, Any] | None = None,
+        candidate_details: CandidateDetails | None = None,
     ) -> Any:
         profile = dict((self.settings.get("agents") or {}).get(role) or {})
         if not profile:
@@ -459,12 +472,13 @@ class TradingPipeline:
         # 角色级 model 覆盖合并进全局 model：流式开关和 thinking 强度都是纯数据，
         # 集中放在 deepseek.yaml 的 agents.<role>.model 里，宿主不再按角色名硬编码。
         model_settings = recursive_merge(self.settings.get("model", {}), model_override)
-        environment = get_environment(
+        environment_config = (
             environment_settings
             if environment_settings is not None
-            # 取数和读图角色不需要任何工具，环境固定 observe，连误触交易的可能都不留。
+            # 选池只读查询、读图无工具，环境固定 observe。
             else recursive_merge(self.settings.get("environment", {}), {"miniqmt_mode": "observe"})
         )
+        environment = get_environment({**environment_config, "candidate_details": candidate_details})
         return get_agent(get_model(model_settings), environment, agent_settings)
 
     def _ask_json(
@@ -521,14 +535,6 @@ class TradingPipeline:
         return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _candidate_pool(pack: dict[str, Any]) -> dict[str, dict[str, Any]]:
-    """板块 → 该板块可选代码集合。模型只能从这里挑，编不出池子外的代码。"""
-    return {
-        item["sector"]: {row["stock_code"]: row for row in item["rows"]}
-        for item in pack["sector_candidates"]
-    }
-
-
 def _validate_watchlist(data: Any, pool: dict[str, dict[str, Any]], config: TradingConfig) -> dict[str, Any]:
     """校验盘前清单：板块必须来自注入的热度榜，个股必须来自该板块注入的行情行且可买。"""
     if not isinstance(data, dict):
@@ -554,7 +560,7 @@ def _validate_watchlist(data: Any, pool: dict[str, dict[str, Any]], config: Trad
             code = pick.get("stock_code")
             row = pool[name].get(code)
             if row is None:
-                raise ValueError(f"{code} 不在板块 {name} 注入的行情里，不许凭记忆填代码")
+                raise ValueError(f"{code} 不在板块 {name} 已展开详情的股票中，请先用 candidate_details 查询该板块及股票完整详情")
             if not row.get("buyable"):
                 raise ValueError(f"{code} 宿主标记为不可买（{row.get('unbuyable', '')}），不能选它")
             if code in seen:
@@ -596,6 +602,5 @@ def _validate_verdicts(data: Any, codes: list[str]) -> dict[str, Any]:
     if missing:
         raise ValueError(f"这些标的没有结论：{'、'.join(missing)}")
     return {**data, "verdicts": [seen[code] for code in codes]}
-
 
 

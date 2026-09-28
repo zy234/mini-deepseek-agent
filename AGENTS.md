@@ -3,8 +3,8 @@
 本仓库有意实现一个小型 Agent 框架，主体是一条按交易日运行的三阶段视觉交易流水线：
 
 - 模型：通过 DeepSeek 兼容 OpenAI 的 Chat Completions API 调用 `deepseek-flash`（平台只认这个名字，`deepseek-v4.1-flash` 这类写法直接 400）。它支持图片输入，K 线图就是靠这个通道给模型看的。
-- 流水线：阶段一盘前选池（09:20），阶段二盘中每 10 分钟按板块分组并行读图，阶段三汇总执行。行情、账户、账本全部由宿主取好注入 prompt，模型不再自己调工具取数。
-- 工具：宿主只给执行阶段留 `miniqmt_trade`、`miniqmt_account` 和 `account_journal`；通用 `interactive` 角色另有 `bash`、`str_replace_editor`、`web_search`、`web_fetch`。
+- 流水线：阶段一盘前选池（09:20），阶段二盘中每 10 分钟按板块分组并行读图，阶段三汇总执行。选池先注入板块与账户摘要，再用只读工具按需查询个股；盘中行情、账户、账本仍由宿主取好注入 prompt。
+- 工具：选池只开放 `candidate_details`，执行阶段使用 `miniqmt_trade`、`miniqmt_account` 和 `account_journal`；通用 `interactive` 角色另有 `bash`、`str_replace_editor`、`web_search`、`web_fetch`。
 - 环境：只执行本地子进程和工作区内的文件编辑，加上宿主绑定的 MiniQMT Bridge。
 - CLI：一个 `mini` 入口和一个 YAML 配置文件；`mini-inspect` 提供轨迹观测与角色配置。
 
@@ -21,6 +21,7 @@ src/minisweagent/environments/local.py          本地命令执行和工具分�
 src/minisweagent/environments/editor.py         工作区内文本编辑和原子写入
 src/minisweagent/environments/miniqmt.py        MiniQMT Bridge 客户端、交易安全规则和硬限额
 src/minisweagent/environments/account_journal.py 每日追加式交易账本
+src/minisweagent/environments/candidate_details.py 本轮选池只读查询、缓存与预算
 src/minisweagent/trading/pipeline.py            三阶段编排、校验与交易日循环
 src/minisweagent/trading/context.py             宿主侧取数、账户/账本装配和注入排版
 src/minisweagent/trading/charts.py              日线与分钟线渲染成 PNG
@@ -40,11 +41,11 @@ tests/test_core.py                              核心功能测试
 
 ## 流水线约定
 
-- 三个阶段角色的名字写死在宿主调度里：`candidate_scout`（single_shot + json_output）、`chart_reader`（single_shot + json_output）、`execution_manager`（iterative + `miniqmt_trade`）。这三条硬形态由 `config/PIPELINE_ROLES` 在写盘前校验，改坏了不会报错只会安静跑偏。
+- 三个阶段角色的名字写死在宿主调度里：`candidate_scout`（iterative + json_output + 仅 `candidate_details`）、`chart_reader`（single_shot + json_output）、`execution_manager`（iterative + `miniqmt_trade`）。这三条硬形态由 `config/PIPELINE_ROLES` 在写盘前校验，改坏了不会报错只会安静跑偏。
 - 阶段之间只由宿主传递结构化数据，没有任何 Agent 能调度另一个 Agent。阶段二各组之间没有共享状态，所以直接用线程并行；一组失败不打死整轮，但失败必须跟着数据进阶段三的输入。
 - 并行读图组的板块名通过 `session_label` 落进子轨迹的 `info.session`，观测端靠这个字段区分组；观测端不许去解析任务文本猜名字，那是把显示绑死在 prompt 措辞上。
 - 模型给出的股票代码必须落在宿主注入的池子里，`_validate_watchlist` 和 `_validate_verdicts` 会逐条核对。校验不过就把原因回传给模型重来（默认 2 次），凭记忆编出来的代码会让账户买到完全无关的票。
-- 盘前概念与行业共同选池：两类热度榜合并后按可买票中位涨幅、上涨比例、主力净流入占比依次降序取个股明细，`sectors_scanned` 是两类合计上限。同名板块只取排名靠前的一份；不同板块保留成分重叠供模型比较，最终清单由宿主禁止重复代码。单类榜单失败或为空时记录缺口，另一类仍可继续，两类均不可用才失败。
+- 盘前概念与行业共同选池：首轮只注入两类板块摘要、指数、账户摘要和限额，不注入全体成分代码、个股明细或昨日逐轮账本。`candidate_details` 先按板块返回简表，再按代码展开完整详情；最终入选必须来自已查询板块且已展开详情的股票。`sectors_scanned` 是模型本轮可查询的不同板块总上限，不是宿主预先截取榜单的数量；`candidate_query_calls` 和 `candidate_detail_limit` 限制工具总调用数及完整详情股票数。调用与失败都占预算，同轮重复查询只提示已返回，不刷新、不重复注入；重票复用首次快照与时间戳。运行时绑定的选池环境只允许这个只读工具，不开放命令、交易或账本写入。单类榜单失败可继续另一类，缺口必须留痕；两类均不可用则失败。
 - 取数失败进 `errors` 并注入 prompt，让模型知道自己在残缺数据上判断；账户快照取不到则整轮失败——没有可用资金和可卖数量，任何交易判断都是猜的。
 - 图片只以路径存在轨迹里，`_api_messages` 在发请求那一刻才读成 base64。轨迹要能反复读、被观测端加载，塞进几 MB base64 会让它变成不可读的文件。
 - 图上一律不写中文：mac 默认字体没有中文字形，缺字渲染成方块且不会报错。中文说明写在 prompt 里。

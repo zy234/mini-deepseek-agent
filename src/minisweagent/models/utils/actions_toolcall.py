@@ -6,6 +6,7 @@ from typing import Any
 
 from jinja2 import StrictUndefined, Template
 
+from minisweagent.environments.candidate_details import validate_candidate_query
 from minisweagent.exceptions import FormatError
 
 BASH_TOOL = {
@@ -181,6 +182,22 @@ ACCOUNT_JOURNAL_TOOL = {
         },
     },
 }
+CANDIDATE_DETAILS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "candidate_details",
+        "description": "本轮选池只读查询。sectors 返回板块内个股简表；stock_codes 展开已查询简表中的股票完整详情。两参数只能选一个。重复查询复用本轮快照，只返回 already_returned 提示，不重复塞入数据。最终入选股票必须先展开详情。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sectors": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 4},
+                "stock_codes": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 10},
+            },
+            "additionalProperties": False,
+        },
+    },
+}
+
 TOOL_DEFINITIONS = [
     BASH_TOOL,
     EDITOR_TOOL,
@@ -189,6 +206,7 @@ TOOL_DEFINITIONS = [
     MINIQMT_ACCOUNT_TOOL,
     MINIQMT_TRADE_TOOL,
     ACCOUNT_JOURNAL_TOOL,
+    CANDIDATE_DETAILS_TOOL,
 ]
 TOOL_DEFINITIONS_BY_NAME = {tool["function"]["name"]: tool for tool in TOOL_DEFINITIONS}
 DEFAULT_TOOL_NAMES = ["bash", "str_replace_editor", "web_search", "web_fetch"]
@@ -356,6 +374,7 @@ TOOL_SPECS: dict[str, dict[str, Any]] = {
     "miniqmt_account": {"keys": {"view"}, "validate": _validate_miniqmt_account_args},
     "miniqmt_trade": {"keys": {"operation", "inputs"}, "validate": _validate_miniqmt_trade_args},
     "account_journal": {"keys": {"operation", "record"}, "validate": _validate_account_journal_args},
+    "candidate_details": {"keys": {"sectors", "stock_codes"}, "validate": validate_candidate_query},
 }
 if set(TOOL_SPECS) != set(TOOL_DEFINITIONS_BY_NAME):
     # 模型看到的工具和宿主能解析的工具必须完全一致，缺一边都是启动即错的配置故障。

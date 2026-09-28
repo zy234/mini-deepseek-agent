@@ -13,7 +13,7 @@ python3 -m pip install -e .
 
 | 阶段 | 时刻 | 角色 | 输入 | 输出 |
 | --- | --- | --- | --- | --- |
-| 一 · 盘前选池 | 09:20 | `candidate_scout` | 板块热度榜、热门板块内部个股结构、大盘、账户、昨日账本 | 5 个板块各 2 只票的待观测清单 |
+| 一 · 盘前选池 | 09:20 | `candidate_scout` | 概念/行业摘要、大盘、账户摘要；工具按需细查 | 最多 5 个板块、各最多 2 只票的待观测清单 |
 | 二 · 盘中读图 | 09:30–15:00 每 10 分钟 | `chart_reader` × 组数（并行） | 每只票的 30 日日线图和当日分钟图、大盘两张图、实时行情与趋势字段 | 每只票一条 BUY/SELL/HOLD 结论 |
 | 三 · 汇总执行 | 每轮读图之后 | `execution_manager` | 本轮全部结论、账户快照、当日委托成交、交易账本、硬限额 | 实际提交的委托 + 账本记录 |
 
@@ -51,7 +51,8 @@ mini --config path/to/agent.yaml --output trajectory.json --step-limit 20 --time
 内置角色：
 
 - `interactive`：通用交互角色，有 `bash`、`str_replace_editor`、`web_search`、`web_fetch`。
-- `candidate_scout` / `chart_reader`：无工具、只输出 JSON，输入全部由宿主注入，只能由流水线驱动。
+- `candidate_scout`：通过 `candidate_details` 查询板块简表、展开个股详情，再输出 JSON；只读查询限定在本轮榜单，最终股票必须已查详情。
+- `chart_reader`：无工具、只输出 JSON，输入全部由宿主注入。两者均由流水线驱动。
 - `execution_manager`：有 `miniqmt_trade`、`miniqmt_account`、`account_journal`，是唯一能动账户的角色。
 
 ## 观测与调参
@@ -102,7 +103,7 @@ python3 -m playwright install chromium
 ```text
 mini --trading-day
  └── TradingPipeline（宿主编排，唯一的调度者）
-     ├── 阶段一 candidate_scout      ← context.premarket_context（板块榜 / 个股结构 / 账户 / 账本）
+     ├── 阶段一 candidate_scout      ← context.premarket_context（板块与账户摘要）+ candidate_details 按需细查
      ├── 阶段二 chart_reader × N     ← context.round_context + charts.render_*（并行，每组一次带图请求）
      └── 阶段三 execution_manager    ← 全部结论 + 账户 + 账本 + 限额，工具：miniqmt_trade / miniqmt_account / account_journal
 ```

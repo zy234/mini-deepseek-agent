@@ -4,15 +4,11 @@
 
 {{ indexes }}
 
-## 板块热度榜
+## 板块热度摘要（概念与行业）
 
 {{ sector_ranks }}
 
-## 热门板块内部个股行情与趋势字段
-
-{{ sector_candidates }}
-
-## 账户
+## 账户摘要
 
 {{ account }}
 
@@ -20,12 +16,12 @@
 
 {{ limits }}
 
-## 前一交易日账本
+## 本轮查询上限
 
-{{ journal_previous }}
+{{ query_limits }}
 
 ## 本次取数的失败与缺口
 
 {{ data_errors }}
 
-按系统提示的标准最多选出 {{ sector_count }} 个板块、每个板块最多 {{ picks_per_sector }} 只票。这是数量上限，可以少选，不要为了填满名额放宽标准。只输出 JSON 对象。
+先通过 candidate_details 查询看好的板块简表，再展开拟入选股票的完整详情。最多选出 {{ sector_count }} 个板块、每个板块最多 {{ picks_per_sector }} 只票，可以少选，不要为了填满名额放宽标准。查询完成后最终只输出 JSON 对象。
