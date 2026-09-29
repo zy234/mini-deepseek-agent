@@ -24,4 +24,4 @@
 
 {{ data_errors }}
 
-先通过 candidate_details 查询看好的板块简表，再展开拟入选股票的完整详情。最多选出 {{ sector_count }} 个板块、每个板块最多 {{ picks_per_sector }} 只票，可以少选，不要为了填满名额放宽标准。查询完成后最终只输出 JSON 对象。
+先通过 candidate_details 查询看好的板块简表，再展开拟入选股票的完整详情；准备因同方向而放弃的板块时，至少展开一只形态不同的可买替代票后再决定。最多选出 {{ sector_count }} 个板块、每个板块最多 {{ picks_per_sector }} 只票，可以少选，不要为了填满名额放宽标准。查询完成后最终只输出 JSON 对象。

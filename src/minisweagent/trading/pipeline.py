@@ -158,11 +158,11 @@ class TradingPipeline:
         deadline = max(open_at - timedelta(minutes=2), started + timedelta(seconds=90))
         daily_errors: list[str] = []
         missing_daily = context.prefetch_daily(
+            client,
             self.journal_dir,
             prefetch_codes,
             started,
             daily_errors,
-            index_codes=self.config.index_codes,
             deadline=deadline,
         )
         self.echo(

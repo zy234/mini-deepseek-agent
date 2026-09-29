@@ -37,9 +37,11 @@ from minisweagent.environments.miniqmt import (
 
 logger = logging.getLogger(__name__)
 
-# 东财每天随机断连（实测行业榜首拉 RemoteDisconnected、重试即过），所有取数都要带重试。
+# 东财每天随机断连（实测行业榜首拉 RemoteDisconnected、重试即过）。单次请求先重试 3 次，
+# 板块仍失败时由 board_rank 在全局 5 分钟窗口内继续重试，避免一次板块失败拖完全部时间。
 RETRY_ATTEMPTS = 3
-RETRY_SLEEP_SECONDS = 1.5
+RETRY_SLEEP_SECONDS = 4.0
+MEMBER_RETRY_WINDOW_SECONDS = 300.0
 # 板块全表几百个，逐个拉成分太慢；只对按资金净流入排在前面的这些板块拉成分算可买热度。
 DEFAULT_SCAN_BOARDS = 15
 # 日线历史统一取 90 天：MA20 从图上第一根就有值，趋势字段也只用尾部 20 根，多给无害。
@@ -69,9 +71,23 @@ def _retry(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
             return fn(*args, **kwargs)
         except Exception as exc:  # akshare 抛的是 requests/解析异常，统一按可重试处理
             last = exc
+            # 每次失败立即追加，之后重试成功或进程退出也不会丢失现场；只记录公开行情参数。
+            now = datetime.now(TRADING_TZ)
+            record = {
+                "at": now.isoformat(timespec="seconds"), "function": getattr(fn, "__name__", type(fn).__name__),
+                "symbol": kwargs.get("symbol"), "attempt": attempt + 1, "max_attempts": RETRY_ATTEMPTS,
+                "error_type": type(exc).__name__, "error": str(exc),
+            }
+            try:
+                path = Path(".sessions/diagnostics") / f"akshare-retries-{now.date().isoformat()}.jsonl"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except OSError as log_error:
+                logger.warning("行情重试诊断落盘失败：%s；原始异常：%s", log_error, record)
             if attempt + 1 < RETRY_ATTEMPTS:
                 time.sleep(RETRY_SLEEP_SECONDS)
-    raise BoardDataError(f"akshare {getattr(fn, '__name__', fn)} 失败：{last}") from last
+    raise BoardDataError(f"akshare {getattr(fn, '__name__', fn)} 失败：{type(last).__name__}: {last}") from last
 
 
 def _to_qmt_code(raw: Any) -> str | None:
@@ -151,6 +167,7 @@ def board_rank(
     min_buyable: int = 3,
     max_buy_notional: float,
     scan_boards: int = DEFAULT_SCAN_BOARDS,
+    retry_until: float | None = None,
 ) -> dict[str, Any]:
     """板块热度榜：东财板块行情 + 主力资金流，取资金最热的若干板块下钻算「可买中位涨幅」。
 
@@ -168,18 +185,30 @@ def board_rank(
     boards.sort(key=lambda name: flow.get(name, {}).get("fund_rank", 10**9))
     ranked: list[dict[str, Any]] = []
     failed: list[str] = []
-    for name in boards[:scan_boards]:
-        try:
-            codes, quotes = _cons_ticks(family, name)
-        except BoardDataError:
-            failed.append(name)
-            continue
-        summary = _sector_summary(name, codes, quotes, max_buy_notional)
-        if not summary or summary["members_quoted"] < SECTOR_RANK_MIN_MEMBERS or summary["buyable_count"] < min_buyable:
-            continue
-        summary.update(flow.get(name, {"main_net_inflow_yi": None, "main_net_inflow_pct": None, "fund_rank": None}))
-        summary["member_codes"] = [code for code in codes if STOCK_CODE_PATTERN.match(code)]
-        ranked.append(summary)
+    # 失败板块继续保留简短名称供兼容；原始异常另存，便于事后区分超时、断连、限流和解析错误。
+    failed_details: dict[str, str] = {}
+    pending = list(boards[:scan_boards])
+    retry_until = retry_until if retry_until is not None else time.monotonic() + MEMBER_RETRY_WINDOW_SECONDS
+    while pending:
+        next_pending: list[str] = []
+        for name in pending:
+            try:
+                codes, quotes = _cons_ticks(family, name)
+            except BoardDataError as exc:
+                failed_details[name] = f"{name}: {exc}"
+                next_pending.append(name)
+                continue
+            summary = _sector_summary(name, codes, quotes, max_buy_notional)
+            if not summary or summary["members_quoted"] < SECTOR_RANK_MIN_MEMBERS or summary["buyable_count"] < min_buyable:
+                continue
+            summary.update(flow.get(name, {"main_net_inflow_yi": None, "main_net_inflow_pct": None, "fund_rank": None}))
+            summary["member_codes"] = [code for code in codes if STOCK_CODE_PATTERN.match(code)]
+            ranked.append(summary)
+        if not next_pending or time.monotonic() >= retry_until:
+            failed = next_pending
+            break
+        pending = next_pending
+        time.sleep(RETRY_SLEEP_SECONDS)
     ranked.sort(key=lambda item: item["buyable_median_change_pct"], reverse=True)
     return {
         "family": family,
@@ -194,6 +223,7 @@ def board_rank(
         },
         "sort_by": "buyable_median_change_pct",
         "member_fetch_failures": failed[:10],
+        "member_fetch_errors": [failed_details[name] for name in failed[:10]],
         "sectors": ranked[:limit],
     }
 

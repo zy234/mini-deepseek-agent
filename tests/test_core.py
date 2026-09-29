@@ -756,7 +756,10 @@ class FakeMiniQMT:
             }
         )
 
-    def screen(self, *, sector_name="", stock_codes=None, sort_by="change_pct_desc", limit=20, enrich_trend=False):
+    def screen(
+        self, *, sector_name="", stock_codes=None, sort_by="change_pct_desc", limit=20,
+        enrich_trend=False, enrich_liquidity=False,
+    ):
         codes = self.pool.get(sector_name, []) if sector_name else list(stock_codes or [])
         return _ok(
             {
@@ -907,7 +910,7 @@ _FAKE_POOL = {
 }
 
 
-def _fake_board_rank(family, *, limit=12, min_buyable=3, max_buy_notional, scan_boards=15):
+def _fake_board_rank(family, *, limit=12, min_buyable=3, max_buy_notional, scan_boards=15, retry_until=None):
     sectors = [
         {
             "sector": name,
@@ -1251,10 +1254,9 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch, 
     FakeMiniQMT.orders_items = []
     FakeMiniQMT.trades_queried = 0
 
-    # 连跑第二轮盘中：日线已被盘前预热全天缓存，这一轮读缓存不许再打东财。整天 _fetch_daily
-    # 只在盘前预热时打了一次——谁把 missing 判定写坏成每轮重取，这条断言当场红。
+    # 连跑第二轮盘中：QMT 日线已在盘前缓存，这一轮不应回退到东财。
     day.run_round()
-    assert fetch_calls["n"] == 1
+    assert fetch_calls["n"] == 0
 
     # 轮次槽位对齐时钟，非连续竞价时段不跑；收盘后启动必须直接退出，不能空转到第二天。
     tz = pipeline.TRADING_TZ

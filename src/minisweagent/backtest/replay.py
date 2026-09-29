@@ -11,7 +11,7 @@ from collections.abc import Iterable
 from datetime import date, datetime
 from typing import Any
 
-from minisweagent.environments import akshare_board
+from minisweagent.environments import akshare_board, daily_history
 from minisweagent.environments.miniqmt import (
     TRADING_TZ,
     MiniQMTClient,
@@ -48,13 +48,7 @@ def fetch_bars(
     调用签名，取数已不经过它。当日日 bar 各槽位用截断分钟线自行重构（_daily_as_of），与实盘同口径。
     """
     clock = datetime(trade_date.year, trade_date.month, trade_date.day, 15, 0, tzinfo=TRADING_TZ)
-    try:
-        history = akshare_board.daily_history(
-            codes, clock, cache_dir=journal_dir, index_codes=index_codes, spacing=1.0
-        )
-    except akshare_board.BoardDataError as exc:
-        errors.append(f"日线取数失败（akshare）：{exc}")
-        history = {}
+    history = daily_history.fetch(client, codes, clock, errors, cache_dir=journal_dir)
     intraday = akshare_board.minute_history(codes, trade_date)
     for code in codes:
         if not intraday.get(code):

@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from minisweagent.environments import akshare_board
+from minisweagent.environments import akshare_board, daily_history
 from minisweagent.environments.account_journal import read_account_journal
 from minisweagent.environments.miniqmt import TRADING_TZ, MiniQMTClient, host_limits
 from minisweagent.trading import charts
@@ -64,18 +64,29 @@ def premarket_context(
     now = datetime.now(TRADING_TZ)
     errors: list[str] = []
     limits = host_limits()
+    retry_until = time.monotonic() + akshare_board.MEMBER_RETRY_WINDOW_SECONDS
     # 板块热度榜与成分股走 akshare（东财）；成分股的实时行情/趋势仍走 ZMQ（client.screen）。
     ranks: dict[str, list[dict]] = {}
     for family in SECTOR_FAMILIES:
         try:
             result = akshare_board.board_rank(
-                family, limit=SECTOR_RANK_LIMIT, min_buyable=3, max_buy_notional=limits["max_buy_notional"]
+                family, limit=SECTOR_RANK_LIMIT, min_buyable=3, max_buy_notional=limits["max_buy_notional"],
+                retry_until=retry_until,
             )
         except akshare_board.BoardDataError as exc:
             errors.append(f"{family} 板块热度榜失败：{exc}")
             continue
         ranks[family] = [{**sector, "quote_at": result.get("quote_at")} for sector in result["sectors"]]
-        errors.extend(f"{family} 板块 {name} 成分行情获取失败" for name in result.get("member_fetch_failures") or [])
+        errors.extend(
+            f"{family} 板块 {detail}"
+            for detail in result.get("member_fetch_errors") or []
+        )
+        # 兼容旧版板块结果：没有详细异常时仍留下板块名称缺口。
+        errors.extend(
+            f"{family} 板块 {name} 成分行情获取失败"
+            for name in result.get("member_fetch_failures") or []
+            if not any(str(detail).startswith(f"{name}:") for detail in result.get("member_fetch_errors") or [])
+        )
         if not ranks[family]:
             errors.append(f"{family} 板块热度榜没有数据")
     # 两类摘要统一排序供模型比较，但不预先截断为要查询明细的板块。
@@ -289,11 +300,7 @@ def _bars(
     # 盘中补取给 spacing=1.5：盘前 deadline 到了还缺几只时，盘中第一轮会连打这几只，正撞上
     # "1.5s 间隔连打第 7 个就断"的节奏，且发生在 09:30 最忙的时刻。要补的票本来就少，多等几秒无所谓。
     # 未装 akshare 这类确定性故障会抛 BoardDataError，这里留痕后当空历史，让当日 bar 独撑或按缺图报出。
-    try:
-        history = akshare_board.daily_history(codes, now, cache_dir=journal_dir, index_codes=index_codes, spacing=1.5)
-    except akshare_board.BoardDataError as exc:
-        errors.append(f"日线取数失败（akshare）：{exc}")
-        history = {}
+    history = daily_history.fetch(client, codes, now, errors, cache_dir=journal_dir)
     intraday: dict[str, list] = {}
     for begin in range(0, len(codes), QUOTE_BATCH):
         batch = codes[begin : begin + QUOTE_BATCH]
@@ -315,51 +322,12 @@ def _bars(
 
 
 def prefetch_daily(
-    journal_dir: str | Path,
-    codes: Iterable[str],
-    now: datetime,
-    errors: list[str],
-    *,
-    index_codes: Iterable[str] = (),
-    deadline: datetime,
-    spacing: float = 2.0,
-    pause_seconds: float = 20.0,
-    max_passes: int = 10,
+    client: MiniQMTClient, journal_dir: str | Path, codes: Iterable[str], now: datetime, errors: list[str], *, deadline: datetime
 ) -> list[str]:
-    """盘前把待观测清单的日线历史预热进缓存（akshare_board 的 (date, code) 缓存），返回最终仍缺的代码。
-
-    缓存与配额都在 akshare_board.daily_history 里，这里只做盘前的"多试几遍"编排：东财封控是间歇的
-    （同一节奏时好时坏），对还没取到的代码隔一会儿再来一遍，靠"多试几次"绕过去。盘前有近 10 分钟预算，
-    spacing 让每遍请求密度低一个数量级。deadline（tz-aware）是软边界：只在每遍开始前检查、遍内不中断，
-    实际收手会超出 deadline 约一遍的开销。retryable（还没取到且配额未满）全清空就立刻收手，别对已触顶
-    放弃的票空转 sleep。留痕分两类：还有配额的说"盘中会继续补"，触顶的说"当天已放弃"——后者盘中一次
-    都不会再试，说"继续补"会把排查带偏。
-    """
-    codes = list(codes)
-    for attempt in range(max_passes):
-        if datetime.now(TRADING_TZ) >= deadline:
-            break
-        # 每遍中途的 errors 丢弃（避免刷屏），最后一遍统一按缓存状态留痕。BoardDataError 是未装 akshare
-        # 这类确定性故障，抛出来就报一次并收手：重试不会让它恢复，只会白等到 deadline。
-        try:
-            akshare_board.daily_history(codes, now, cache_dir=journal_dir, index_codes=index_codes, spacing=spacing)
-        except akshare_board.BoardDataError as exc:
-            errors.append(f"盘前日线预取失败（akshare），全部留给盘中补：{exc}")
-            break
-        retryable, _ = akshare_board.daily_cache_missing(codes, now, cache_dir=journal_dir)
-        if not retryable:
-            break
-        if attempt + 1 < max_passes:
-            time.sleep(pause_seconds)
-    retryable, abandoned = akshare_board.daily_cache_missing(codes, now, cache_dir=journal_dir)
-    if retryable:
-        errors.append(f"盘前日线预取仍缺 {len(retryable)} 只（盘中各轮会继续补）：{'、'.join(retryable[:10])}")
-    if abandoned:
-        errors.append(
-            f"盘前日线预取放弃 {len(abandoned)} 只（当天已取满 {akshare_board.MAX_DAILY_FETCH_ATTEMPTS} 次，"
-            f"盘中不再重试）：{'、'.join(abandoned[:10])}"
-        )
-    return retryable + abandoned
+    """盘前批量下载 QMT 日线，超时或缺失的代码留痕。"""
+    codes = list(dict.fromkeys(codes))
+    history = daily_history.fetch(client, codes, now, errors, cache_dir=journal_dir, deadline=deadline)
+    return [code for code in codes if not history.get(code)]
 
 
 def _today_daily_bar(intraday_bars: list[dict], today_int: int, code: str, errors: list[str]) -> dict[str, Any] | None:

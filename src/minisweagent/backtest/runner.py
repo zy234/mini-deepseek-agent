@@ -125,7 +125,7 @@ class BacktestRunner:
         if not codes:
             return None  # 没建成仓、也没有候选：这天没什么可跑
         daily, intraday = replay.fetch_bars(
-            None, codes + config.index_codes, day, errors, index_codes=config.index_codes, journal_dir=self.journal_dir
+            self.pipeline._data_client(), codes + config.index_codes, day, errors, index_codes=config.index_codes, journal_dir=self.journal_dir
         )
         index_minutes = intraday.get(config.index_codes[0]) or []
         if not index_minutes:
