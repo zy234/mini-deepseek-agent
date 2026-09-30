@@ -113,7 +113,7 @@ class TradingPipeline:
             agent,
             task=(
                 f"交易日 {pack['trade_date']} 选池（取数开始于 {pack['as_of']}）：先比较榜单摘要，再用 candidate_details 查询，最多选出"
-                f"{self.config.sector_count} 个板块，每个板块最多 {self.config.picks_per_sector} 只票，可以少选，不必选满。"
+                f"{self.config.sector_count} 个板块，每个板块最多 {self.config.picks_per_sector} 只可买代表票；这是宽松待观测清单，强势同方向也可同时保留，趋势和买点留给后续读图。"
             ),
             validate=lambda data: _validate_watchlist(data, details.pool, self.config),
             template_vars={
