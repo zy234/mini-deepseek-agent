@@ -86,8 +86,9 @@ class TradingConfig(BaseModel):
     round_interval_max: int = Field(default=30, ge=1, le=120)
     # 轮次之间多久拉一次最新价比对护栏。tick 走 ZMQ 很便宜，但没必要秒级轮询。
     monitor_poll_seconds: int = Field(default=60, ge=10, le=600)
-    # 同一组两次监控触发之间的冷却，也用于固定轮次刚布防后压制立即重触发。
-    monitor_cooldown_minutes: int = Field(default=8, ge=1, le=60)
+    # 同组触发节流：一组每 monitor_cooldown_minutes 内最多触发一次（固定轮次布防也占这个窗口），
+    # 否则一只在边界附近抖动的票会把整组每个轮询周期都拉去读图下单。
+    monitor_cooldown_minutes: int = Field(default=10, ge=1, le=60)
     sector_count: int = Field(default=5, ge=1, le=10)
     picks_per_sector: int = Field(default=2, ge=1, le=5)
     sectors_scanned: int = Field(default=8, ge=1, le=20)

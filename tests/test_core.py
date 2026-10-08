@@ -1105,7 +1105,7 @@ def _pipeline_settings(tmp_path: Path) -> dict:
         "round_interval_min": 25,
         "round_interval_max": 30,
         "monitor_poll_seconds": 60,
-        "monitor_cooldown_minutes": 8,
+        "monitor_cooldown_minutes": 10,
         "sector_count": 2,
         "picks_per_sector": 1,
         "sectors_scanned": 2,

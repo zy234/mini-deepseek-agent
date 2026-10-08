@@ -436,11 +436,11 @@ def _daily_atr_pct(daily_bars: list[dict]) -> float | None:
 
 
 def _monitor_reference(stock: dict[str, Any], daily_bars: list[dict]) -> dict[str, Any] | None:
-    """盘中监控价带的宿主推荐：给读图 Agent 一个"只有异动才越界"的默认带，它可据此收窄或放宽。
+    """盘中监控价带的参考事实：只给读图 Agent"这只票现在在哪、近期一天通常波动多少"，不给推荐价。
 
-    带宽取"日线典型振幅"与"今日已走振幅"的较大者，并设 1.5% 下限防低波动票被噪声反复触发；
-    推荐上/下沿同时不低于/不高于今日已出现的高低点——价格还没突破今日区间就不该算异动。
-    没有可用现价就返回 None：无价可比，这只票本轮不给监控参考。
+    刻意不算推荐上下沿：一旦塞个现成数值，模型几乎必然照抄，监控价带就退化成宿主的机械带，而不是
+    模型按自己的结论决定"什么价位值得我重新看一眼"。`recent_vol_pct` 只是提醒它别把带设得比日常
+    波动还窄而频繁假唤醒。没有可用现价就返回 None：无价可比，这只票本轮不给参考。
     """
     last = stock.get("last_price")
     if not isinstance(last, (int, float)) or isinstance(last, bool) or last <= 0:
@@ -451,15 +451,12 @@ def _monitor_reference(stock: dict[str, Any], daily_bars: list[dict]) -> dict[st
     today_range_pct = (
         round((today_high - today_low) / last * 100, 2) if today_high and today_low and today_high >= today_low else None
     )
-    band_pct = max(value for value in (atr_pct, today_range_pct, 1.5) if value is not None)
-    span = last * band_pct / 100
     return {
         "last_price": last,
         "today_high": today_high,
         "today_low": today_low,
-        "recent_vol_pct": round(band_pct, 2),
-        "recommended_low": round(min(today_low if today_low else last, last - span), 2),
-        "recommended_high": round(max(today_high if today_high else last, last + span), 2),
+        # 近期一天通常振幅：优先日线 ATR%，无历史时退回今日已走振幅。纯参考，不是让模型照搬的带宽。
+        "recent_vol_pct": atr_pct if atr_pct is not None else today_range_pct,
     }
 
 
