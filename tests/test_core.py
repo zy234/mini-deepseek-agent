@@ -1017,6 +1017,8 @@ class ScriptedModel:
                             "action": "SELL" if holding else ("BUY" if code.startswith("6000") else "HOLD"),
                             "confidence": 0.7,
                             "price_hint": 15.8,
+                            "trigger_low": 15.0,
+                            "trigger_high": 16.0,
                             "reason": "日线突破，分钟站上均价",
                             "risk": "破均价走",
                         }
@@ -1099,8 +1101,11 @@ def _pipeline_settings(tmp_path: Path) -> dict:
     """
     settings = mini.get_config_from_spec(mini.DEFAULT_CONFIG_FILE)
     settings["trading"] = {
-        "premarket_at": "09:20",
-        "round_interval_minutes": 10,
+        "premarket_at": "10:00",
+        "round_interval_min": 25,
+        "round_interval_max": 30,
+        "monitor_poll_seconds": 60,
+        "monitor_cooldown_minutes": 8,
         "sector_count": 2,
         "picks_per_sector": 1,
         "sectors_scanned": 2,
@@ -1258,11 +1263,22 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch, 
     day.run_round()
     assert fetch_calls["n"] == 0
 
-    # 轮次槽位对齐时钟，非连续竞价时段不跑；收盘后启动必须直接退出，不能空转到第二天。
+    # 盘中监控：读图产出的 trigger 价带布防后，现价越界即对该组补跑一次 scoped 读图+执行。
     tz = pipeline.TRADING_TZ
-    assert day._round_slot(datetime(2026, 9, 10, 9, 35, tzinfo=tz)) == "0930"
-    assert day._round_slot(datetime(2026, 9, 10, 11, 41, tzinfo=tz)) is None
-    assert day._round_slot(datetime(2026, 9, 10, 14, 7, tzinfo=tz)) == "1400"
+    guards = day._arm_guards(outcome["readings"], datetime(2026, 9, 10, 10, 0, tzinfo=tz))
+    assert guards and all(group.bands for group in guards.values())  # 每组都从结论里取到了价带
+    # FakeMiniQMT.quotes 固定返回 3900，远在 [15, 16] 之上：过了冷却期的组必然越上沿触发。
+    fired = day._scan_breaches(guards, datetime(2026, 9, 10, 10, 20, tzinfo=tz))
+    assert fired and fired[0][0] in guards
+    # 冷却期内（刚布防）不触发：同一时刻扫描应为空。
+    assert day._scan_breaches(guards, datetime(2026, 9, 10, 10, 0, tzinfo=tz)) == []
+    FakeMiniQMT.submissions.clear()
+    ScriptedModel.seen["reader"] = 0
+    scoped = day.run_round(focus_group=fired[0][0])
+    assert ScriptedModel.seen["reader"] == 1  # 只读触发的那一组，不碰其余组
+    assert len(scoped["readings"]) == 1 and scoped["result"]
+
+    # 收盘后启动必须直接退出，不能空转到第二天。
     monkeypatch.setattr(pipeline, "datetime", _FrozenClock(datetime(2026, 9, 10, 15, 30, tzinfo=tz)))
     day.run_day()
 

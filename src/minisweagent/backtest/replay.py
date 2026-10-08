@@ -57,10 +57,11 @@ def fetch_bars(
 
 
 def slot_times(index_minutes: list[dict], trade_date: date, interval_minutes: int) -> list[str]:
-    """生成槽位时刻：和实盘 _round_slot 一样按固定间隔对齐时段，指数分钟线做有效性闸门。
+    """生成槽位时刻：按固定间隔对齐时段，指数分钟线做有效性闸门。
 
-    少于 2 根 bar 画不出分钟图；之后连 1 根 bar 都没有就没有评估窗口。这两种槽位直接不跑，
-    所以最后一个槽位天然是"还剩至少一分钟"的那个。
+    回测固定间隔重放（实盘已改为随机间隔 + 盘中监控触发，但回测只问"结论×固定仓位规则"的盈亏，
+    固定间隔采样更可比）。少于 2 根 bar 画不出分钟图；之后连 1 根 bar 都没有就没有评估窗口。这两种
+    槽位直接不跑，所以最后一个槽位天然是"还剩至少一分钟"的那个。
     """
     stamps = [stamp for stamp in (_minute_stamp(bar) for bar in index_minutes) if stamp]
     day = trade_date.strftime("%Y%m%d")

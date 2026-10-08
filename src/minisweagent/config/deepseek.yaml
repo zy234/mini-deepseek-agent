@@ -52,8 +52,11 @@ agents:
     model:
       reasoning_effort: low
 trading:
-  premarket_at: '09:20'
-  round_interval_minutes: 10
+  premarket_at: '10:00'
+  round_interval_min: 25
+  round_interval_max: 30
+  monitor_poll_seconds: 60
+  monitor_cooldown_minutes: 8
   sector_count: 5
   picks_per_sector: 2
   sectors_scanned: 8

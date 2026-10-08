@@ -174,7 +174,7 @@ def _acquire_trading_lock() -> Any:
 
 
 def _install_schedule(config: Path) -> Path:
-    """安装 macOS 工作日 09:15 启动的交易日任务。"""
+    """安装 macOS 工作日 09:55 启动的交易日任务。"""
     if sys.platform != "darwin":
         raise RuntimeError("--install-schedule 仅支持 macOS launchd")
     working_directory = Path.cwd().resolve()
@@ -196,8 +196,8 @@ def _install_schedule(config: Path) -> Path:
             str(config.resolve()),
         ],
         "WorkingDirectory": str(working_directory),
-        # 09:15 启动，留几分钟给进程拉起和板块缓存预热，09:20 正好跑盘前选池。
-        "StartCalendarInterval": [{"Weekday": weekday, "Hour": 9, "Minute": 15} for weekday in range(1, 6)],
+        # 09:55 启动，留几分钟给进程拉起和板块缓存预热，10:00 正好跑盘前选池。
+        "StartCalendarInterval": [{"Weekday": weekday, "Hour": 9, "Minute": 55} for weekday in range(1, 6)],
         "RunAtLoad": False,
         "ProcessType": "Background",
         "ThrottleInterval": 30,
@@ -220,11 +220,11 @@ def main(
     output: Path | None = typer.Option(None, "-o", "--output", help="Save the trajectory JSON here."),
     step_limit: int | None = typer.Option(None, "--step-limit", min=0, help="Maximum model calls; 0 disables."),
     timeout: int | None = typer.Option(None, "--timeout", min=1, help="Bash timeout in seconds."),
-    trading_day: bool = typer.Option(False, "--trading-day", help="跑完整交易日：09:20 盘前选池，盘中每 10 分钟读图与执行，收盘退出。"),
+    trading_day: bool = typer.Option(False, "--trading-day", help="跑完整交易日：10:00 盘前选池，盘中每 25-30 分钟读图与执行并按价带监控异动，收盘退出。"),
     premarket: bool = typer.Option(False, "--premarket", help="只跑一次盘前选池，写出当日待观测清单。"),
     trading_round: bool = typer.Option(False, "--round", help="只跑一轮盘中读图与汇总执行，需要当日待观测清单已存在。"),
     miniqmt_mode: str | None = typer.Option(None, "--miniqmt-mode", help=f"交易权限：{'、'.join(MINIQMT_MODES)}；默认读配置。"),
-    install_schedule: bool = typer.Option(False, "--install-schedule", help="安装 macOS 工作日 09:15 自动运行交易日的定时任务。"),
+    install_schedule: bool = typer.Option(False, "--install-schedule", help="安装 macOS 工作日 09:55 自动运行交易日的定时任务。"),
     backtest: str | None = typer.Option(None, "--backtest", help="回测指定交易日（YYYY-MM-DD）：重放历史行情问模型拿读图结论，纸面模拟收益；不会发真实委托。"),
     report: str | None = typer.Option(None, "--report", help="生成指定交易日的固定复盘报告（YYYY-MM-DD）。"),
     backtest_codes: str | None = typer.Option(None, "--codes", help="回测标的，逗号分隔的股票代码；缺省读该日的待观测清单。"),

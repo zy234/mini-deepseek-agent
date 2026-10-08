@@ -2,12 +2,15 @@
 
 阶段之间只由宿主传递结构化数据，没有任何 Agent 能调度另一个 Agent：
 
-- 阶段一（默认 09:20）：宿主取板块摘要，`candidate_scout` 按需查个股详情后选出
+- 阶段一（默认 10:00）：宿主取板块摘要，`candidate_scout` 按需查个股详情后选出
   若干板块各若干只票，落盘成当日待观测清单。
-- 阶段二（开盘后每 interval 分钟）：宿主为每只待观测股和大盘渲染日线图与当日分钟图，按板块
-  分组并行交给 `chart_reader`，每组一次带图请求，直接给出买卖结论。
+- 阶段二（选池后每 25-30 分钟随机）：宿主为每只待观测股和大盘渲染日线图与当日分钟图，按板块
+  分组并行交给 `chart_reader`，每组一次带图请求，直接给出买卖结论；每只票同时给出盘中监控价带。
 - 阶段三：宿主把本轮全部结论、账户快照、当日委托成交、交易账本和硬限额注入 `execution_manager`，
   由它决定并提交交易。
+
+固定轮次间隔拉长到 25-30 分钟后，宿主在轮次之间按 `monitor_poll_seconds` 轮询最新价：读图产出的
+`trigger_low`/`trigger_high` 价带一旦越界，立刻对该组补跑一次 scoped 读图+执行，补上长间隔里的盲区。
 
 三个阶段的模式完全相同：宿主取数 → 模型判断 → 宿主校验。模型给出的股票代码必须落在宿主注入的
 池子里，否则这一步作废重来——凭记忆编出来的代码会让账户买到完全无关的票。
@@ -18,16 +21,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import secrets
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from datetime import time as clock_time
+from functools import partial
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from minisweagent.agents import get_agent
 from minisweagent.environments import get_environment
@@ -46,20 +52,42 @@ BUY_MODES = ("OPEN", "T_ADD", "T_BUYBACK")
 SELL_MODES = ("NONE", "T_REDUCE", "RISK_EXIT")
 # 连续竞价时段。收盘前最后一轮跑完就结束当天，尾盘集中竞价不参与。
 SESSIONS = ((clock_time(9, 30), clock_time(11, 30)), (clock_time(13, 0), clock_time(15, 0)))
-# 盘前清单缺失时的补跑上限：09:20 首跑一次，之后每个槽位各补一次，共 10 次约覆盖 100 分钟，
-# 足够等一次 Bridge/QMT 抖动恢复，又不至于在真故障时空转到收盘。
+# 盘前清单缺失时的补跑上限：10:00 首跑一次，失败后每隔 PREMARKET_RETRY_SPACING_SECONDS 再补一次，
+# 共 10 次约覆盖 20 分钟，足够等一次 Bridge/QMT 抖动恢复，又不至于在真故障时空转到收盘。
 MAX_PREMARKET_ATTEMPTS = 10
+# 盘前补跑的最小间隔：premarket 本身要跑好几分钟，但失败可能瞬间返回（如板块数据缺），不加间隔会在
+# 几秒内把 10 次预算烧光。
+PREMARKET_RETRY_SPACING_SECONDS = 120
 
 
 class PipelineError(RuntimeError):
     """某一阶段拿不到可用结果。这一轮明确失败，不许拿残缺结论继续往下走。"""
 
 
+@dataclass
+class GroupGuard:
+    """一组标的的盘中监控护栏：读图给出的每只票价带，加上这组护栏的布防时刻。
+
+    布防时刻用来做冷却：每次固定轮次或监控触发的 scoped 轮次都会刷新它，`monitor_cooldown_minutes`
+    之内不再对这组重复触发，避免一只抖动的票每个轮询周期都把整组拉去读图下单。
+    """
+
+    bands: dict[str, tuple[float | None, float | None]]
+    armed_at: datetime
+
+
 class TradingConfig(BaseModel):
     """流水线节奏与规模。改这些不需要碰代码，但它们不是 prompt，放在配置的 trading 段。"""
 
-    premarket_at: str = "09:20"
-    round_interval_minutes: int = Field(default=10, ge=1, le=60)
+    premarket_at: str = "10:00"
+    # 固定轮次间隔是一个区间，每次跑完在 [min, max] 里随机取一个：间隔拉长省 token，随机避免每天
+    # 固定在同几个整点读图被行情规律摸透；真正的盘中异动交给监控轮询补。
+    round_interval_min: int = Field(default=25, ge=1, le=120)
+    round_interval_max: int = Field(default=30, ge=1, le=120)
+    # 轮次之间多久拉一次最新价比对护栏。tick 走 ZMQ 很便宜，但没必要秒级轮询。
+    monitor_poll_seconds: int = Field(default=60, ge=10, le=600)
+    # 同一组两次监控触发之间的冷却，也用于固定轮次刚布防后压制立即重触发。
+    monitor_cooldown_minutes: int = Field(default=8, ge=1, le=60)
     sector_count: int = Field(default=5, ge=1, le=10)
     picks_per_sector: int = Field(default=2, ge=1, le=5)
     sectors_scanned: int = Field(default=8, ge=1, le=20)
@@ -71,9 +99,19 @@ class TradingConfig(BaseModel):
     max_parallel_groups: int = Field(default=6, ge=1, le=12)
     round_json_attempts: int = Field(default=2, ge=1, le=4)
 
+    @model_validator(mode="after")
+    def _check_interval(self) -> TradingConfig:
+        if self.round_interval_max < self.round_interval_min:
+            raise ValueError("round_interval_max 不能小于 round_interval_min")
+        return self
+
     def premarket_time(self) -> clock_time:
         hour, _, minute = self.premarket_at.partition(":")
         return clock_time(int(hour), int(minute))
+
+    def random_interval(self) -> timedelta:
+        """固定轮次之间的随机间隔，两端闭区间。"""
+        return timedelta(minutes=random.randint(self.round_interval_min, self.round_interval_max))
 
 
 class TradingPipeline:
@@ -194,11 +232,15 @@ class TradingPipeline:
 
     # ---------- 阶段二与阶段三：盘中一轮 ----------
 
-    def run_round(self) -> dict[str, Any]:
-        """一轮 = 并行读图 + 一次汇总执行。读图组失败不打死整轮，但失败必须进汇总的输入。"""
+    def run_round(self, focus_group: str | None = None) -> dict[str, Any]:
+        """一轮 = 并行读图 + 一次汇总执行。读图组失败不打死整轮，但失败必须进汇总的输入。
+
+        `focus_group` 非空时只跑这一组（监控越界触发的 scoped 轮次），其余组不取数、不读图；
+        执行阶段仍拿到完整账户上下文，否则无法给单只票定仓位。
+        """
         started = datetime.now(TRADING_TZ)
         watchlist = self._read_watchlist(started.date())
-        trace, session_id = self._trace(started, "round")
+        trace, session_id = self._trace(started, "monitor" if focus_group else "round")
         pack = context.round_context(
             self._data_client(),
             watchlist=watchlist,
@@ -206,6 +248,7 @@ class TradingPipeline:
             index_codes=self.config.index_codes,
             chart_dir=trace.parent / "charts" / started.strftime("%H%M%S"),
             daily_days=self.config.daily_chart_days,
+            focus_group=focus_group,
         )
         index_charts = [path for index in pack["indexes"] if (path := index.get("chart"))]
         self.echo(
@@ -357,62 +400,142 @@ class TradingPipeline:
     # ---------- 交易日循环 ----------
 
     def run_day(self) -> None:
-        """按时钟推进一个交易日：先跑盘前，再按固定间隔跑盘中轮次，收盘后返回。
+        """按时钟推进一个交易日：先跑盘前选池，再按随机间隔跑盘中轮次，轮次之间轮询监控，收盘后返回。
 
-        盘前失败不锁死全天：清单缺失时 09:20 首跑一次，之后每个槽位补跑一次，
-        上限 MAX_PREMARKET_ATTEMPTS 次。盘中迟到启动（Bridge 抖动恢复后重启进程）
-        从下一个槽位的补跑开始，watchlist 已存在则直接进盘中轮次。
+        盘前失败不锁死全天：到点首跑一次，失败后每隔 PREMARKET_RETRY_SPACING_SECONDS 补跑一次，
+        上限 MAX_PREMARKET_ATTEMPTS 次。迟到启动（Bridge 抖动恢复后重启进程）：watchlist 已存在则
+        直接进盘中；距上次固定轮次不足一个最小间隔时顺延，避免重启后立刻重复下单。
         """
-        finished_slots: set[str] = set()
         attempts = 0
-        # 盘前彻底失败只通知一次：耗尽补跑后的每个新槽位都会再走一遍 else 分支，不加这个标志会刷屏。
+        ran_any = False
         premarket_failed_notified = False
-        # 上次盘前尝试对应的触发点（"premarket" 或槽位名）：同一触发点 5 秒一圈的循环里只试一次。
-        attempted_key: str | None = None
+        last_premarket_at: datetime | None = None
+        next_round_at: datetime | None = None
+        last_poll_at: datetime | None = None
+        guards: dict[str, GroupGuard] = {}
         while True:
             now = datetime.now(TRADING_TZ)
             if now.weekday() >= 5:
                 self.echo("周末不开盘，退出。")
                 return
-            if now.time() > SESSIONS[-1][1]: # 过了15:00 退出，顺便发summary
+            if now.time() > SESSIONS[-1][1]:  # 过了 15:00 退出，顺便发 summary
                 # 收盘后直接结束，包括"启动就已经过了收盘"这种迟到启动：否则会空转到明天。
-                self.echo(f"已过收盘时间，交易日结束，本日跑了 {len(finished_slots)} 轮。")
+                self.echo("已过收盘时间，交易日结束。")
                 # 只在当天真跑过轮次时推盘后总结：迟到启动到收盘后什么都没跑，没有可总结的东西。
-                if finished_slots:
+                if ran_any:
                     notify.summary(self.journal_dir, now.date(), echo=self.echo)
                 return
-            slot = self._round_slot(now) # 计算现在输入哪个槽位
-            # premarket 触发点只存在于 09:20 到开盘之间；开盘后由槽位接管，午休和收盘后都是 None。
-            key = slot or (
-                "premarket" if self.config.premarket_time() <= now.time() < SESSIONS[0][0] else None
-            )
-            missing = self._read_watchlist_or_none(now.date()) is None
-            if key is not None and key != attempted_key:
-                attempted_key = key
-                if not missing:
-                    if key == "premarket":
-                        self.echo(f"今日待观测清单已存在，跳过盘前：{self._watchlist_path(now.date().isoformat())}")
-                elif attempts < MAX_PREMARKET_ATTEMPTS:
-                    attempts += 1
-                    self._guarded(self.premarket, f"盘前选池（第 {attempts}/{MAX_PREMARKET_ATTEMPTS} 次）")
-                else:
-                    self.echo(f"盘前选池补跑已达 {MAX_PREMARKET_ATTEMPTS} 次上限，剩余槽位跳过。")
+            if now.time() < self.config.premarket_time():  # 还没到选池时间，静等
+                time.sleep(5)
+                continue
+            # 盘前：清单缺失时按节流补跑，耗尽上限只通知一次。
+            if self._read_watchlist_or_none(now.date()) is None:
+                if attempts >= MAX_PREMARKET_ATTEMPTS:
                     if not premarket_failed_notified:
                         premarket_failed_notified = True
+                        self.echo(f"盘前选池补跑已达 {MAX_PREMARKET_ATTEMPTS} 次上限，今日放弃。")
                         notify.premarket_failed(MAX_PREMARKET_ATTEMPTS, echo=self.echo)
-            # 清单落盘后当轮立即接上盘中：补跑成功不必等下一个槽位。
-            if slot and slot not in finished_slots and self._read_watchlist_or_none(now.date()) is not None:
-                finished_slots.add(slot)
-                self._guarded(self.run_round, f"{slot} 盘中轮次")
+                    time.sleep(5)
+                    continue
+                if last_premarket_at and (now - last_premarket_at).total_seconds() < PREMARKET_RETRY_SPACING_SECONDS:
+                    time.sleep(5)
+                    continue
+                attempts += 1
+                last_premarket_at = now
+                self._guarded(self.premarket, f"盘前选池（第 {attempts}/{MAX_PREMARKET_ATTEMPTS} 次）")
+                if self._read_watchlist_or_none(now.date()) is None:
+                    time.sleep(5)
+                    continue
+                next_round_at = self._initial_next_round(now)  # 选池刚成功，安排首轮
+            # 清单已就绪。
+            if next_round_at is None:
+                next_round_at = self._initial_next_round(now)
+            if not any(start <= now.time() <= end for start, end in SESSIONS):  # 午休：既不跑轮次也不监控
+                time.sleep(5)
+                continue
+            if now >= next_round_at:  # 固定轮次到点：跑全量，刷新全部护栏
+                ran_any = True
+                outcome = self._run_round_capture()
+                completed = datetime.now(TRADING_TZ)
+                if outcome is not None:
+                    guards = self._arm_guards(outcome.get("readings") or [], completed)
+                self._save_last_round_at(completed)
+                next_round_at = completed + self.config.random_interval()
+                self.echo(f"下一固定轮次约 {next_round_at.strftime('%H:%M')}，期间按价带监控异动")
+                continue
+            # 轮次之间：按 poll 间隔拉最新价比对护栏，越界即对该组补跑。
+            if guards and (last_poll_at is None or (now - last_poll_at).total_seconds() >= self.config.monitor_poll_seconds):
+                last_poll_at = now
+                self._guarded(partial(self._monitor, guards, datetime.now(TRADING_TZ)), "盘中监控轮询")
             time.sleep(5)
 
-    def _round_slot(self, now: datetime) -> str | None:
-        """当前时刻属于哪个轮次槽位；不在连续竞价时段返回 None。槽位按固定间隔对齐时钟。"""
-        current = now.time()
-        if not any(start <= current <= end for start, end in SESSIONS):
+    # ---------- 盘中监控 ----------
+
+    def _run_round_capture(self, focus_group: str | None = None) -> dict[str, Any] | None:
+        """跑一轮并返回结果（含 readings 供布防），单轮失败不终止整天，只留痕返回 None。"""
+        what = f"监控触发 {focus_group} 组补跑" if focus_group else "固定盘中轮次"
+        try:
+            return self.run_round(focus_group=focus_group)
+        except Exception as error:
+            logger.exception("%s 失败", what)
+            self.echo(f"[失败] {what}：{type(error).__name__}: {error}")
             return None
-        minute = now.minute - now.minute % self.config.round_interval_minutes
-        return f"{now.hour:02d}{minute:02d}"
+
+    def _arm_guards(self, readings: list[dict], armed_at: datetime) -> dict[str, GroupGuard]:
+        """从读图结论里提取每组的监控价带并布防。只给出价带的票才进护栏，null 表示本轮不监控。"""
+        guards: dict[str, GroupGuard] = {}
+        for reading in readings:
+            name = reading.get("group")
+            bands: dict[str, tuple[float | None, float | None]] = {}
+            for verdict in reading.get("verdicts") or []:
+                code = verdict.get("stock_code")
+                low = verdict.get("trigger_low")
+                high = verdict.get("trigger_high")
+                low = low if isinstance(low, (int, float)) and not isinstance(low, bool) else None
+                high = high if isinstance(high, (int, float)) and not isinstance(high, bool) else None
+                if code and (low is not None or high is not None):
+                    bands[code] = (low, high)
+            if name and bands:
+                guards[name] = GroupGuard(bands=bands, armed_at=armed_at)
+        return guards
+
+    def _scan_breaches(self, guards: dict[str, GroupGuard], now: datetime) -> list[tuple[str, str, float, float | None, float | None]]:
+        """拉一次最新价，返回越界触发的 (组名, 代码, 现价, 下沿, 上沿)。只判定不下单，便于单独验证。
+
+        冷却期内的组不参与：固定轮次或上次触发刚布防的组要等 monitor_cooldown_minutes 才能再触发。
+        """
+        cooldown = self.config.monitor_cooldown_minutes * 60
+        due = {name: guard for name, guard in guards.items() if (now - guard.armed_at).total_seconds() >= cooldown}
+        codes = sorted({code for guard in due.values() for code in guard.bands})
+        if not codes:
+            return []
+        result = self._data_client().quotes(codes)
+        if not result["ok"]:
+            self.echo(f"[监控] 最新价拉取失败，跳过本次轮询：{(result.get('error') or {}).get('detail', '')}")
+            return []
+        ticks = (result["data"] or {}).get("ticks") or {}
+        fired: list[tuple[str, str, float, float | None, float | None]] = []
+        for name, guard in due.items():
+            for code, (low, high) in guard.bands.items():
+                tick = ticks.get(code)
+                last = tick.get("lastPrice") if isinstance(tick, dict) else None
+                if not isinstance(last, (int, float)) or isinstance(last, bool):
+                    continue
+                if (low is not None and last <= low) or (high is not None and last >= high):
+                    fired.append((name, code, float(last), low, high))
+                    break  # 一组里有一只越界就够触发，不必凑齐
+        return fired
+
+    def _monitor(self, guards: dict[str, GroupGuard], now: datetime) -> None:
+        """一次监控轮询：越界的组各补跑一次 scoped 读图+执行，并用新结论重新布防（失败也刷新冷却）。"""
+        for name, code, last, low, high in self._scan_breaches(guards, now):
+            self.echo(f"[监控] {name} · {code} 现价 {last} 越出价带 [{low}, {high}]，自动触发该组读图+执行")
+            outcome = self._run_round_capture(focus_group=name)
+            fresh = datetime.now(TRADING_TZ)
+            if outcome is not None:
+                guards.update(self._arm_guards(outcome.get("readings") or [], fresh))
+            if name in guards:  # 即便读图/执行失败也要推进冷却，否则下一次轮询立刻又触发同一组
+                guards[name].armed_at = fresh
 
     def _guarded(self, action: Callable[[], Any], what: str) -> None:
         """单轮失败不终止整天：把现场写进日志和终端，等下一个槽位继续。"""
@@ -537,6 +660,36 @@ class TradingPipeline:
             return None
         return json.loads(path.read_text(encoding="utf-8"))
 
+    def _last_round_path(self) -> Path:
+        return self.journal_dir / "last_round_at"
+
+    def _initial_next_round(self, now: datetime) -> datetime:
+        """首次进入盘中时安排下一轮：距上次固定轮次不足一个最小间隔就顺延，否则立即跑。
+
+        随机间隔没有槽位对齐可依赖，重启后靠落盘的上次轮次时刻兜底，避免重启就立刻重跑一轮重复下单。
+        """
+        last = self._load_last_round_at(now.date())
+        if last and (now - last) < timedelta(minutes=self.config.round_interval_min):
+            return last + self.config.random_interval()
+        return now
+
+    def _save_last_round_at(self, moment: datetime) -> None:
+        path = self._last_round_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.tmp")
+        tmp.write_text(moment.isoformat(), encoding="utf-8")
+        tmp.replace(path)
+
+    def _load_last_round_at(self, today: date) -> datetime | None:
+        path = self._last_round_path()
+        if not path.is_file():
+            return None
+        try:
+            moment = datetime.fromisoformat(path.read_text(encoding="utf-8").strip())
+        except ValueError:
+            return None
+        return moment if moment.date() == today else None  # 只有当天的记录才用来做节流
+
 
 def _validate_watchlist(data: Any, pool: dict[str, dict[str, Any]], config: TradingConfig) -> dict[str, Any]:
     """校验盘前清单：板块必须来自注入的热度榜，个股必须来自该板块注入的行情行且可买。"""
@@ -624,11 +777,21 @@ def _validate_verdicts(data: Any, codes: list[str]) -> dict[str, Any]:
             raise ValueError(f"{code} 的 T_REDUCE 最多只能卖出可卖仓的 50%")
         if action != "SELL" and sell_volume_pct != 1.0:
             raise ValueError(f"{code} 只有 SELL 才能设置 sell_volume_pct")
+        # 盘中监控价带：两个键必须显式给出。缺键说明模型没按要求产出监控带，让它重来；给 null 是
+        # "本票本轮不纳入监控"的明确选择（如数据缺失无法定价），不是静默省略。
+        if "trigger_low" not in verdict or "trigger_high" not in verdict:
+            raise ValueError(f"{code} 必须给出 trigger_low 和 trigger_high（无法设定时填 null）")
+        trigger_low = _trigger_bound(code, "trigger_low", verdict["trigger_low"])
+        trigger_high = _trigger_bound(code, "trigger_high", verdict["trigger_high"])
+        if trigger_low is not None and trigger_high is not None and trigger_low >= trigger_high:
+            raise ValueError(f"{code} 的 trigger_low 必须小于 trigger_high")
         verdict = {
             **verdict,
             "buy_mode": buy_mode,
             "sell_mode": sell_mode,
             "sell_volume_pct": float(sell_volume_pct),
+            "trigger_low": trigger_low,
+            "trigger_high": trigger_high,
         }
         if code in seen:
             raise ValueError(f"{code} 给了两条结论")
@@ -637,3 +800,12 @@ def _validate_verdicts(data: Any, codes: list[str]) -> dict[str, Any]:
     if missing:
         raise ValueError(f"这些标的没有结论：{'、'.join(missing)}")
     return {**data, "verdicts": [seen[code] for code in codes]}
+
+
+def _trigger_bound(code: str, label: str, value: Any) -> float | None:
+    """监控价带的一个边界：允许 null（本轮不监控这一侧），非 null 必须是正数。"""
+    if value is None:
+        return None
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{code} 的 {label} 必须是正数或 null")
+    return float(value)

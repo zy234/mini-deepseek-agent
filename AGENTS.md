@@ -3,7 +3,7 @@
 本仓库有意实现一个小型 Agent 框架，主体是一条按交易日运行的三阶段视觉交易流水线：
 
 - 模型：通过 DeepSeek 兼容 OpenAI 的 Chat Completions API 调用 `deepseek-flash`（平台只认这个名字，`deepseek-v4.1-flash` 这类写法直接 400）。它支持图片输入，K 线图就是靠这个通道给模型看的。
-- 流水线：阶段一盘前选池（09:20），阶段二盘中每 10 分钟按板块分组并行读图，阶段三汇总执行。选池先注入板块与账户摘要，再用只读工具按需查询个股；盘中行情、账户、账本仍由宿主取好注入 prompt。
+- 流水线：阶段一盘前选池（10:00），阶段二盘中每 25-30 分钟（随机）按板块分组并行读图，阶段三汇总执行。固定轮次之间宿主按读图产出的监控价带轮询最新价，越界即对该组补跑一次读图+执行。选池先注入板块与账户摘要，再用只读工具按需查询个股；盘中行情、账户、账本仍由宿主取好注入 prompt。
 - 工具：选池只开放 `candidate_details`，执行阶段使用 `miniqmt_trade`、`miniqmt_account` 和 `account_journal`；通用 `interactive` 角色另有 `bash`、`str_replace_editor`、`web_search`、`web_fetch`。
 - 环境：只执行本地子进程和工作区内的文件编辑，加上宿主绑定的 MiniQMT Bridge。
 - CLI：一个 `mini` 入口和一个 YAML 配置文件；`mini-inspect` 提供轨迹观测与角色配置。
@@ -51,6 +51,8 @@ tests/test_core.py                              核心功能测试
 - 图上一律不写中文：mac 默认字体没有中文字形，缺字渲染成方块且不会报错。中文说明写在 prompt 里。
 - 交易硬限额只有一份定义（`miniqmt.host_limits`），交易工具照它拦单、prompt 照它注入；两处各读一遍环境变量必然漂移，模型就会按一套限额做计划、撞上另一套被拒。
 - 每个角色的 thinking 强度和是否流式写在 `deepseek.yaml` 的 `agents.<role>.model` 子块（对全局 `model` 的覆盖），宿主装配时 merge 进 model 设置，不在代码里按角色名硬编码。读图 `medium`、选池/下单 `low` 是实测结论：完全关思考会把读图的 BUY/SELL 打成 HOLD，只降档不关；并行读图关流式避免多路交错刷屏，执行阶段保留流式。全局 `model.stream_output` 仍为真，供不经过流水线装配的 `interactive` 角色使用。
+- 盘中节奏是随机间隔（`round_interval_min`~`round_interval_max`，默认 25-30 分钟）加价带监控，不再对齐时钟槽位。间隔拉长省 token，随机避免被摸透固定整点；长间隔里的异动由监控补：读图每只票给 `trigger_low`/`trigger_high` 两个绝对价，宿主每 `monitor_poll_seconds` 拉一次最新价，越界即对该组补跑一次 scoped 读图+执行（`run_round(focus_group=...)`，只取该组、执行阶段仍给完整账户）。价带要"只有异动才越界"：宿主在 `monitor_ref` 里按近期日线振幅与今日已走振幅算一个推荐带注入，模型据此设定，不自己凭图估波动；`monitor_cooldown_minutes` 防一只抖动票把整组反复拉起。候选板块和持仓组都挂监控——持仓在长间隔里跌破止损要能自动触发卖出。随机间隔没有槽位可做重启幂等，改用落盘的上次轮次时刻 `last_round_at` 节流：重启后距上轮不足一个最小间隔就顺延，避免重复下单。
+- `chart_reader` 的输出 schema 多了 `trigger_low`/`trigger_high`：两键必须显式给出，`null` 表示本轮不监控这只（如数据缺失无法定价），缺键则校验打回重来——这是"必须产出监控带"的硬约束，不是可选项。回测只问前向盈亏、不盘中监控，replay 不注入 `monitor_ref`，模型据图给带或留 null，校验照过。
 
 ## 回测约定
 

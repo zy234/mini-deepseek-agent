@@ -132,11 +132,15 @@ def round_context(
     index_codes: list[str],
     chart_dir: Path,
     daily_days: int = 30,
+    focus_group: str | None = None,
 ) -> dict[str, Any]:
     """盘中一轮的数据包：按板块分组的候选、持仓组、大盘，每只票两张图。
 
     持仓票只出现在持仓组：同一只票在两个组里各出一次结论，汇总阶段就得先解决两份互相矛盾的
     判断，那是自己给自己造的特殊情况。
+
+    `focus_group` 非空时只保留这一组（监控越界触发的 scoped 轮次），取数、渲染、读图都只覆盖它；
+    触发的组本轮已无标的（清仓或移出清单）则直接失败，由上层记一笔跳过。
     """
     now = datetime.now(TRADING_TZ)
     errors: list[str] = []
@@ -156,6 +160,10 @@ def round_context(
                 "stocks": [{"stock_code": code} for code in held],
             }
         )
+    if focus_group is not None:
+        groups = [group for group in groups if group["name"] == focus_group]
+        if not groups:
+            raise MarketDataError(f"监控触发组 {focus_group} 本轮没有可观测标的（可能已清仓或移出清单）")
     if not groups:
         raise MarketDataError("本轮既没有候选也没有持仓，无可观测标的")
     codes = [stock["stock_code"] for group in groups for stock in group["stocks"]]
@@ -169,6 +177,9 @@ def round_context(
             stock["chart"], stock["chart_missing"] = _render_pair(
                 chart_dir, code, daily.get(code) or [], intraday.get(code) or [], daily_days, errors
             )
+            # 盘中监控价带的参考值由宿主算好注入：今日高低、近期波动率、以及一个"只有异动才越界"的推荐带，
+            # 读图 Agent 据此给 trigger_low/trigger_high，不自己凭图估波动。
+            stock["monitor_ref"] = _monitor_reference(stock, daily.get(code) or [])
     indexes = index_quotes(client, index_codes, errors)
     for index in indexes:
         code = index["stock_code"]
@@ -406,6 +417,50 @@ def _prev_close(daily_bars: list[dict]) -> float | None:
     today = usable[-1]["date"]
     prior = [bar for bar in usable if bar["date"] != today]
     return float(prior[-1]["close"]) if prior else None
+
+
+def _daily_atr_pct(daily_bars: list[dict]) -> float | None:
+    """近 10 根历史日线的平均振幅百分比（(高-低)/收），作为"这只票一天通常波动多少"的参考。
+
+    去掉最后一根当日 bar（盘中实时更新、不是完整振幅）。数据不够或字段缺就返回 None，让上层退回别的口径。
+    """
+    usable = charts.usable_bars(daily_bars)
+    if len(usable) < 2:
+        return None
+    ranges = []
+    for bar in usable[:-1][-10:]:
+        high, low, close = bar.get("high"), bar.get("low"), bar.get("close")
+        if all(isinstance(value, (int, float)) and value for value in (high, low, close)):
+            ranges.append((high - low) / close * 100)
+    return round(sum(ranges) / len(ranges), 2) if ranges else None
+
+
+def _monitor_reference(stock: dict[str, Any], daily_bars: list[dict]) -> dict[str, Any] | None:
+    """盘中监控价带的宿主推荐：给读图 Agent 一个"只有异动才越界"的默认带，它可据此收窄或放宽。
+
+    带宽取"日线典型振幅"与"今日已走振幅"的较大者，并设 1.5% 下限防低波动票被噪声反复触发；
+    推荐上/下沿同时不低于/不高于今日已出现的高低点——价格还没突破今日区间就不该算异动。
+    没有可用现价就返回 None：无价可比，这只票本轮不给监控参考。
+    """
+    last = stock.get("last_price")
+    if not isinstance(last, (int, float)) or isinstance(last, bool) or last <= 0:
+        return None
+    today_high = stock.get("high") if isinstance(stock.get("high"), (int, float)) else None
+    today_low = stock.get("low") if isinstance(stock.get("low"), (int, float)) else None
+    atr_pct = _daily_atr_pct(daily_bars)
+    today_range_pct = (
+        round((today_high - today_low) / last * 100, 2) if today_high and today_low and today_high >= today_low else None
+    )
+    band_pct = max(value for value in (atr_pct, today_range_pct, 1.5) if value is not None)
+    span = last * band_pct / 100
+    return {
+        "last_price": last,
+        "today_high": today_high,
+        "today_low": today_low,
+        "recent_vol_pct": round(band_pct, 2),
+        "recommended_low": round(min(today_low if today_low else last, last - span), 2),
+        "recommended_high": round(max(today_high if today_high else last, last + span), 2),
+    }
 
 
 def _position_view(item: dict[str, Any]) -> dict[str, Any]:
