@@ -123,12 +123,61 @@ pre {
 }
 pre.err { color: var(--err); }
 .hint { padding: 12px; color: var(--dim); }
+#view-history { display: flex; flex-direction: column; min-width: 0; }
+#view-history[hidden] { display: none; }
+#history-days { flex: none; border-bottom: 1px solid var(--line); padding: 12px; }
+#history-days b { color: var(--accent); }
+#history-days button { margin: 8px 6px 0 0; }
+#history-days button.selected { color: var(--accent); border-color: var(--accent); }
+#history-detail { flex: 1; min-height: 0; overflow-y: auto; padding: 18px 22px; }
+.history-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; }
+.history-card { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 12px; cursor: pointer; }
+.history-card:hover, .history-card.selected { border-color: var(--accent); background: #202630; }
+.history-card h4 { margin: 0 0 6px; color: var(--fg); font-size: 14px; }
+.history-card p { margin: 3px 0; color: var(--dim); }
+.history-title { margin: 0 0 12px; color: var(--fg); }
+.history-section { background: var(--panel); border: 1px solid var(--line); border-radius: 7px; margin: 12px 0; overflow: hidden; }
+.history-section h4 { margin: 0; padding: 10px 12px; border-bottom: 1px solid var(--line); color: var(--accent); }
+.history-section .k { padding: 10px 12px 0; color: var(--dim); }
+.history-section pre { max-height: 460px; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 14px; line-height: 1.7; }
+.history-meta { display:flex; flex-wrap:wrap; gap:8px; margin: 8px 0 16px; }
+.history-meta .tag { padding: 3px 8px; }
+.history-empty { padding: 28px 0; color: var(--dim); text-align: center; }
+.history-table { width: 100%; min-width: 560px; table-layout: fixed; border-collapse: collapse; font-family: ui-sans-serif, system-ui, sans-serif; font-size: 13px; }
+.history-table th, .history-table td { border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; overflow: hidden; overflow-wrap: anywhere; }
+.history-table th { color: var(--dim); font-weight: 500; }
+.history-table td { color: var(--fg); }
+.history-table th.num, .history-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.history-table th.code, .history-table td.code { width: 18%; white-space: nowrap; }
+.history-table th.time, .history-table td.time { width: 18%; white-space: nowrap; }
+.history-table th.num { width: 13%; }
+.history-json { margin: 8px 12px 12px; }
+.history-json summary { color: var(--dim); cursor: pointer; }
+.tool-summary { padding: 8px 12px 12px; font-family: ui-sans-serif, system-ui, sans-serif; }
+.tool-summary p { margin: 4px 0 8px; }
+.history-nested { max-width: 100%; }
+.history-nested summary { color: var(--accent); cursor: pointer; white-space: nowrap; }
+.history-nested pre { max-height: 260px; overflow: auto; font-size: 12px; }
+#view-research { display:flex; flex-direction:column; min-width:0; overflow:auto; padding:14px 18px; }
+#research-toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; border-bottom:1px solid var(--line); padding-bottom:10px; }
+#research-toolbar select { min-width:150px; }
+#research-body { min-width:0; }
+.research-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:10px; margin:12px 0; }
+.research-card { background:var(--panel); border:1px solid var(--line); border-radius:7px; padding:10px; }
+.research-card h3 { margin:0 0 8px; color:var(--accent); font-size:14px; }
+.research-days button { margin:8px 6px 0 0; }
+.research-days button.selected { color:var(--accent); border-color:var(--accent); }
+.research-warning { color:var(--warn); padding:8px 0; }
+.research-chart { width:100%; height:210px; background:#191c21; border:1px solid var(--line); border-radius:5px; }
+.research-chart text { fill:var(--dim); font:11px ui-monospace,monospace; }
 </style>
 </head>
 <body>
 <header>
   <b>mini-inspect</b>
   <button id="tab-trace" class="on">观测</button>
+  <button id="tab-history">历史回放</button>
+  <button id="tab-research">量化研究</button>
   <button id="tab-config">配置</button>
   <span id="trace-filters" style="display:flex;gap:14px">
     <label>角色 <select id="f-agent"><option value="">全部</option></select></label>
@@ -145,6 +194,15 @@ pre.err { color: var(--err); }
     <div id="path"><div class="hint">左侧选一个会话查看执行路径。</div></div>
     <div id="detail"><div class="hint">选一步查看模型思考、工具参数和完整输出。</div></div>
   </div>
+  <div id="view-history" hidden>
+    <div id="history-days" class="hint">历史回放加载中…</div>
+    <div id="history-detail" class="hint">选择交易日查看 Agent 实际输入。</div>
+  </div>
+  <div id="view-research" hidden>
+    <div id="research-toolbar"><b>量化研究</b><label>日期 <select id="research-date"></select></label><label>类别 <select id="research-family"><option>概念</option><option>行业</option></select></label><label>板块 <select id="research-sector"></select></label><button id="research-refresh">刷新</button></div>
+    <div id="research-days" class="research-days hint">板块历史加载中…</div>
+    <div id="research-body" class="hint">选择日期和板块。</div>
+  </div>
   <div id="view-config" hidden>
     <div id="agents"></div>
     <div id="agent-form"><div class="hint">左侧选一个角色开始编辑。</div></div>
@@ -156,6 +214,8 @@ pre.err { color: var(--err); }
 </main>
 <script>
 const S = { roots: [], id: null, data: null, sel: null, kids: new Set(), rows: {} };
+let historyLoaded = false;
+let researchLoaded = false;
 const $ = (q) => document.querySelector(q);
 const esc = (t) => String(t ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const clock = (iso) => (iso ? iso.slice(11, 19) : "--:--:--");
@@ -314,6 +374,181 @@ async function openSession(id) {
   S.id = id; S.sel = null; S.kids.clear();
   renderList();
   await reload();
+}
+
+async function loadHistory() {
+  const box = $("#history-days");
+  try {
+    const data = await (await fetch("/api/history-days?limit=10")).json();
+    const days = data.days || [];
+    box.innerHTML = `<b>历史回放 · 选择交易日</b><div class="premarket-days">${days.map(d => `<button data-day="${esc(d.trade_date)}">${esc(d.trade_date)} · ${d.sessions.length} 个会话</button>`).join("")}</div>`;
+    box.querySelectorAll("button[data-day]").forEach(el => el.onclick = () => {
+      const day = days.find(item => item.trade_date === el.dataset.day);
+      box.querySelectorAll("button").forEach(button => button.classList.toggle("selected", button === el));
+      renderHistoryDay(day);
+    });
+    if (days[0]) { box.querySelector("button")?.click(); }
+  } catch (error) { box.textContent = `历史回放加载失败：${error}`; }
+}
+
+function researchNumber(value) { return value == null ? "—" : typeof value === "number" ? value.toLocaleString('zh-CN', {maximumFractionDigits: 2}) : String(value); }
+function researchChart(points, key, label) {
+  const vals = points.map(p => Number(p[key])).filter(Number.isFinite); if (!vals.length) return '<div class="history-empty">没有可画的历史点</div>';
+  const min = Math.min(...vals), max = Math.max(...vals), width = 760, height = 190, pad = 28, span = max - min || 1;
+  const xy = points.map((p,i) => { const v=Number(p[key]); return Number.isFinite(v) ? `${pad+i*(width-pad*2)/Math.max(points.length-1,1)},${height-pad-(v-min)/span*(height-pad*2)}` : ''; }).filter(Boolean).join(' ');
+  return `<div><div class="note">${esc(label)} · ${esc(points[0]?.trade_date || '')} → ${esc(points.at(-1)?.trade_date || '')}</div><svg class="research-chart" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none"><polyline points="${xy}" fill="none" stroke="var(--accent)" stroke-width="2"/><text x="4" y="18">${esc(researchNumber(max))}</text><text x="4" y="${height-6}">${esc(researchNumber(min))}</text></svg></div>`;
+}
+function researchFillSelectors(payload) {
+  const dates = payload.days || []; const dateEl=$('#research-date'); dateEl.innerHTML=dates.map(d=>`<option>${esc(d.trade_date)}</option>`).join('');
+  const fill=async()=>{ const date=dateEl.value; const day=await (await fetch(`/api/research-day?date=${encodeURIComponent(date)}`)).json(); const family=$('#research-family').value; const rows=(day.families||{})[family]||[]; const sec=$('#research-sector'); sec.innerHTML=rows.map(r=>`<option>${esc(r.sector||'')}</option>`).join(''); await loadResearchSector(); };
+  const loadResearchSector=async()=>{ const date=dateEl.value, family=$('#research-family').value, sector=$('#research-sector').value; if(!date||!sector){ $('#research-body').innerHTML='<div class="history-empty">该日期没有可用板块数据；请先生成 sector_backfill。</div>'; return; } const res=await fetch(`/api/research-sector?date=${encodeURIComponent(date)}&family=${encodeURIComponent(family)}&sector=${encodeURIComponent(sector)}`); const data=await res.json(); if(!res.ok){$('#research-body').innerHTML=`<div class="miss">${esc(data.error||'读取失败')}</div>`;return;} renderResearch(data); };
+  dateEl.onchange=fill; $('#research-family').onchange=fill; $('#research-sector').onchange=loadResearchSector; $('#research-refresh').onclick=()=>loadResearch(); if(dates[0]) fill();
+}
+function renderResearch(data) { const s=data.summary||{}; const rows=data.members||[]; const buyable=rows.filter(r=>r.buyable===true).length; $('#research-body').innerHTML=`<h2 class="history-title">${esc(data.trade_date)} · ${esc(data.family)} · ${esc(data.sector)}</h2>${data.warning?`<div class="research-warning">${esc(data.warning)}</div>`:''}<div class="research-grid"><div class="research-card"><h3>当天板块指标</h3><div>涨跌中位数：${researchNumber(s.median_change_pct)}%</div><div>可买股中位涨幅：${researchNumber(s.buyable_median_change_pct)}%</div><div>上涨比例：${researchNumber(s.up_ratio)}</div><div>成交额：${researchNumber(s.amount)}</div><div>主力净流入：${researchNumber(s.main_net_inflow_yi)} 亿</div></div><div class="research-card"><h3>成员与可买性</h3><div>成员：${rows.length || s.members || 0}，当前读取日线：${rows.filter(r=>r.bar).length}</div><div>可买：${buyable}，不可买/未知：${Math.max(0,rows.length-buyable)}</div><div class="note">可买规则复用宿主 lot_size、单笔限额、688/689 买入限制。</div></div></div><div class="research-card">${researchChart(data.curve||[],'median_change_pct','板块涨跌中位数')}</div><div class="research-card"><h3>个股日线数据</h3><div style="overflow:auto"><table class="history-table"><thead><tr><th>代码</th><th>收盘</th><th>涨跌</th><th>可买</th><th>日线</th></tr></thead><tbody>${rows.map(r=>`<tr><td class="code">${esc(r.stock_code)}</td><td>${researchNumber(r.bar?.close)}</td><td>${researchNumber(r.bar?.change_pct)}</td><td>${r.buyable===true?'是':r.buyable===false?'<span class="err-text">否</span>':'未知'}</td><td>${r.bar?'已取':'缺失'}</td></tr>`).join('')}</tbody></table></div></div>`; }
+async function loadResearch() { const res=await fetch('/api/research-days?start=2026-09-18'); const data=await res.json(); $('#research-days').innerHTML=data.days?.length?`<b>已落盘日期</b> ${data.days.map(d=>`<span class="tag">${esc(d.trade_date)} · 概念 ${d.families.概念||0} · 行业 ${d.families.行业||0}</span>`).join(' ')}`:'<span class="research-warning">没有 sector_backfill 数据。页面不会把东财实时失败伪装成历史结果。</span>'; researchFillSelectors(data); }
+
+function historyStage(summary) {
+  const name = summary.agent_name || "未知角色";
+  if (name === "candidate_scout" || summary.kind === "premarket") return "盘前选池";
+  if (name === "chart_reader") return "盘中读图";
+  if (name === "execution_manager") return "汇总执行";
+  return summary.kind || "Agent 会话";
+}
+
+// 展示仅转换排版，保留原始值和未知字段，不推断缺失行情。
+const HISTORY_LABELS = {
+  stock_code:'股票代码', name:'名称', sector:'板块', family:'类别', quote_at:'行情时间',
+  snapshot_at:'账户时间', as_of:'取数时间', last_price:'现价', last:'现价', prev_close:'昨收',
+  change_pct:'涨跌幅（%）', buyable_median_change_pct:'可买股中位涨幅（%）', up_ratio:'上涨比例',
+  main_net_inflow_yi:'主力净流入（亿元）', main_net_inflow_pct:'主力净流入占比（%）', buyable_count:'可买股数',
+  asset:'资产', positions:'持仓', orders:'委托', trades:'成交', available_cash:'可用资金',
+  total_asset:'总资产', market_value:'市值', frozen_cash:'冻结资金', volume:'数量', can_use_volume:'可卖数量',
+  avg_price:'成本价', float_profit:'浮动盈亏', profit_rate:'收益率', reason:'判断依据', risk:'风险',
+  action:'建议动作', verdicts:'个股判断', market_view:'市场判断', picks:'候选股票', sectors:'板块',
+  errors:'数据缺口', data:'查询结果', stocks:'股票', rows:'个股行情', buyable:'是否可买',
+  trend_gate:'趋势标签', ma5:'5日均线', ma10:'10日均线', ma20:'20日均线', vol_ratio:'量比',
+  high_20d_gap_pct:'距20日前高（%）', lot_cost:'一手金额', amount:'成交额', status:'状态',
+  traded_volume:'已成交数量', traded_price:'成交价格', order_remark:'委托标记', limits:'交易限额',
+  max_buy_notional:'单笔买入上限', remaining_calls:'剩余查询次数', remaining_sectors:'剩余板块名额',
+  remaining_stocks:'剩余个股名额', error:'错误', message:'说明', ok:'查询成功'
+};
+function historyValue(value) {
+  if (value === null || value === undefined) return '<span class="hint">未提供</span>';
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  if (typeof value !== 'object') return esc(value);
+  if (Array.isArray(value)) {
+    if (!value.length) return '<div class="hint">该项记录为空</div>';
+    if (value.every(row => row && typeof row === 'object' && !Array.isArray(row))) {
+      const keys = [...new Set(value.flatMap(row => Object.keys(row)))];
+      const priority = ['stock_code', 'sector', 'family', 'last_price', 'change_pct', 'buyable', 'trend_gate', 'reason', 'risk'];
+      const displayKeys = [...priority.filter(k => keys.includes(k)), ...keys.filter(k => !priority.includes(k))].slice(0, 8);
+      const extraKeys = keys.filter(k => !displayKeys.includes(k));
+      const more = extraKeys.length ? '<th>更多</th>' : '';
+      return `<div style="overflow-x:auto"><table class="history-table"><thead><tr>${displayKeys.map(k => `<th class="${historyColumnClass(k)}">${esc(HISTORY_LABELS[k] || k)}</th>`).join('')}${more}</tr></thead><tbody>${value.map(row => `<tr>${displayKeys.map(k => `<td class="${historyColumnClass(k)}">${historyCell(row[k])}</td>`).join('')}${extraKeys.length ? `<td>${historyCell(Object.fromEntries(extraKeys.filter(k => row[k] !== undefined).map(k => [k, row[k]])))}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+    }
+    return `<ul>${value.map(item => `<li>${historyValue(item)}</li>`).join('')}</ul>`;
+  }
+  return `<table class="history-table"><tbody>${Object.entries(value).map(([k,v]) => `<tr><th class="${historyColumnClass(k)}">${esc(HISTORY_LABELS[k] || k)}</th><td class="${historyColumnClass(k)}">${historyCell(v)}</td></tr>`).join('')}</tbody></table>`;
+}
+function historyCell(value) {
+  if (value === null || value === undefined) return '<span class="hint">未提供</span>';
+  if (typeof value === 'number') return esc(historyNumber(value));
+  if (typeof value !== 'object') return esc(value);
+  const label = Array.isArray(value) ? `${value.length} 项` : `${Object.keys(value).length} 个字段`;
+  return `<details class="history-nested"><summary>查看明细（${label}）</summary><pre>${esc(JSON.stringify(value, null, 2))}</pre></details>`;
+}
+function historyColumnClass(key) {
+  if (key === 'stock_code' || key === 'code') return 'code';
+  if (key.endsWith('_at') || key === 'timestamp') return 'time';
+  return ['number', 'amount', 'price', 'pct', 'ratio', 'volume', 'count', 'cash', 'asset'].some(token => key.includes(token)) ? 'num' : '';
+}
+function historyNumber(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return value;
+  return Number.isInteger(value) ? value.toLocaleString('zh-CN') : Number(value.toFixed(4)).toLocaleString('zh-CN', {maximumFractionDigits: 4});
+}
+function historyContent(text) {
+  const raw = String(text || '').trim();
+  try { return historyValue(JSON.parse(raw)); } catch (_) { /* 普通说明保留文本。 */ }
+  // prompt 的章节可能在 JSON 前后附带说明；只解析完整 JSON 段。
+  const start = raw.search(/[\[{]/);
+  if (start >= 0) {
+    const end = Math.max(raw.lastIndexOf(']'), raw.lastIndexOf('}'));
+    try {
+      const value = JSON.parse(raw.slice(start, end + 1));
+      return `<pre>${esc(raw.slice(0,start))}</pre>${historyValue(value)}<pre>${esc(raw.slice(end+1))}</pre>`;
+    } catch (_) { /* 无法解析时必须保留原文，不能把字段丢掉。 */ }
+  }
+  return `<pre>${esc(raw)}</pre>`;
+}
+
+function friendlyInput(text) {
+  const parts = String(text || "").split(/\n(?=## )/);
+  return parts.map(part => {
+    const lines = part.split("\n");
+    const title = lines.shift() || "输入";
+    const body = lines.join("\n").trim();
+    if (!body) return `<div class="history-section"><pre>${esc(part)}</pre></div>`;
+    return `<div class="history-section"><h4>${esc(title.replace(/^## /, ""))}</h4>${historyContent(body)}<details class="history-json"><summary>查看原文</summary><pre>${esc(body)}</pre></details></div>`;
+  }).join("");
+}
+function parseToolPayload(step) {
+  try { return JSON.parse(step.content || step.stdout || "{}"); } catch (_) { return null; }
+}
+function candidateToolView(step) {
+  const payload = parseToolPayload(step);
+  const data = payload && payload.data ? payload.data : payload;
+  if (!data || typeof data !== 'object') return historyContent(step.content || step.stdout);
+  const args = step.args || {};
+  const queried = [...(args.sectors || []), ...(args.stock_codes || [])];
+  const sectors = data.sectors || [];
+  const stocks = data.stocks || [];
+  const rows = sectors.flatMap(item => (item.rows || []).map(row => ({...row, sector: item.sector, family: item.family}))).concat(stocks);
+  const queryText = queried.length ? `查询：${queried.map(esc).join('、')}` : '查询：板块与股票详情';
+  const resultText = rows.length ? `返回 ${rows.length} 条可读行情` : sectors.length ? `返回 ${sectors.length} 个板块` : '本次没有返回候选行情';
+  const fields = ['stock_code', 'sector', 'family', 'last_price', 'change_pct', 'buyable', 'trend_gate', 'vol_ratio', 'high_20d_gap_pct'];
+  const available = fields.filter(key => rows.some(row => row[key] !== undefined));
+  const table = rows.length ? `<div style="overflow-x:auto"><table class="history-table"><thead><tr>${available.map(k => `<th class="${historyColumnClass(k)}">${esc(HISTORY_LABELS[k] || k)}</th>`).join('')}</tr></thead><tbody>${rows.map(row => `<tr>${available.map(k => `<td class="${historyColumnClass(k)}">${historyCell(row[k])}</td>`).join('')}</tr>`).join('')}</tbody></table></div>` : '';
+  return `<div class="tool-summary"><p><b>${queryText}</b></p><p>${resultText}${data.already_returned?.length ? `，重复查询 ${data.already_returned.length} 项` : ''}</p>${table}<details class="history-json"><summary>查看原始返回</summary><pre>${esc(step.content || step.stdout || '')}</pre></details></div>`;
+}
+
+async function renderHistoryDay(day) {
+  const box = $("#history-detail");
+  const groups = {};
+  day.sessions.forEach(summary => (groups[historyStage(summary)] ||= []).push(summary));
+  box.innerHTML = `<h2 class="history-title">${esc(day.trade_date)} · Agent 实际看到的信息</h2>`
+    + `<div class="history-grid">${Object.entries(groups).map(([stage, rows]) => `<div class="history-card" data-stage="${esc(stage)}"><h4>${esc(stage)}</h4><p>${rows.length} 个会话</p><p>${esc(rows[0].started_at?.slice(11, 19) || "")}${rows.length > 1 ? ` → ${esc(rows.at(-1).started_at?.slice(11, 19) || "")}` : ""}</p></div>`).join("")}</div><div id="history-sessions"></div>`;
+  const sessionBox = $("#history-sessions");
+  box.querySelectorAll(".history-card").forEach(card => card.onclick = () => {
+    box.querySelectorAll(".history-card").forEach(item => item.classList.toggle("selected", item === card));
+    const rows = groups[card.dataset.stage];
+    sessionBox.innerHTML = `<div class="history-meta">${rows.map((summary, i) => `<button data-session="${esc(summary.id)}">${i + 1}. ${esc(summary.agent_name || "Agent")} · ${esc(summary.started_at?.slice(11, 19) || "")}</button>`).join("")}</div><div id="history-session-detail" class="history-empty">选择一轮查看模型实际收到的内容。</div>`;
+    sessionBox.querySelectorAll("button[data-session]").forEach(button => button.onclick = () => loadHistorySession(button.dataset.session, button));
+    sessionBox.querySelector("button")?.click();
+  });
+  box.querySelector(".history-card")?.click();
+}
+
+async function loadHistorySession(id, button) {
+  const detail = $("#history-session-detail");
+  document.querySelectorAll("#history-sessions button").forEach(item => item.classList.toggle("selected", item === button));
+  detail.dataset.request = id;
+  detail.innerHTML = "加载中…";
+  try {
+    const response = await fetch(`/api/session?id=${encodeURIComponent(id)}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "读取失败");
+    if (!detail.isConnected || detail.dataset.request !== id) return;
+    const s = data.session || {};
+    const inputs = (data.steps || []).filter(step => step.role === "user");
+    detail.className = "";
+    detail.innerHTML = `<div class="history-meta"><span class="tag kind">${esc(historyStage(s))}</span><span class="tag">${esc(s.agent_name || "Agent")}</span><span class="tag">${esc(s.started_at || "")}</span><span class="tag ${s.n_errors ? "bad" : "ok"}">${s.n_errors ? `${s.n_errors} 个工具错误` : s.exit_status === "Submitted" ? "已提交" : esc(s.exit_status || "未结束")}</span></div>`
+      + inputs.map(step => friendlyInput(step.content) + (step.images || []).map(path => `<div class="shot"><div class="note">模型看到的图：${esc(path.split("/").pop())}</div><a href="/api/image?path=${encodeURIComponent(path)}" target="_blank" rel="noopener"><img loading="lazy" alt="历史行情图" src="/api/image?path=${encodeURIComponent(path)}" onerror="this.replaceWith(document.createTextNode('历史图片已缺失，无法还原'))"></a></div>`).join("")).join("")
+      + (data.steps || []).filter(step => step.role === 'system').map(step => `<details class="history-section"><summary>当时的角色规则</summary>${historyContent(step.content)}</details>`).join('')
+      + (data.steps || []).filter(step => step.status).map(step => `<div class="history-section"><h4>后续收到的信息 · ${esc(({candidate_details:'候选查询',miniqmt_account:'账户查询',miniqmt_trade:'交易回执',account_journal:'交易账本'})[step.tool] || step.tool)} · ${step.ok ? '成功' : '失败'}</h4>${step.tool === 'candidate_details' ? candidateToolView(step) : historyValue(step.args || {}) + historyContent(step.content || step.stdout)}${step.stderr ? `<pre class="err">${esc(step.stderr)}</pre>` : ''}</div>`).join('')
+      + `<details class="history-section"><summary>查看本轮最终输出（与输入区分）</summary>${historyContent(s.submission)}</details>`
+      + `<p><button data-open-trace="${esc(id)}">打开完整技术轨迹</button></p>`;
+    detail.querySelector("button[data-open-trace]").onclick = () => { showTab("trace"); openSession(id); };
+  } catch (error) { detail.innerHTML = `<div class="miss">历史轨迹加载失败：${esc(error)}</div>`; }
 }
 
 async function reload() {
@@ -498,15 +733,25 @@ function removeAgent() {
 
 function showTab(which) {
   const trace = which === "trace";
+  const history = which === "history";
+  const research = which === "research";
   $("#view-trace").hidden = !trace;
-  $("#view-config").hidden = trace;
+  $("#view-history").hidden = !history;
+  $("#view-research").hidden = !research;
+  $("#view-config").hidden = trace || history || research;
   $("#tab-trace").classList.toggle("on", trace);
-  $("#tab-config").classList.toggle("on", !trace);
+  $("#tab-history").classList.toggle("on", history);
+  $("#tab-research").classList.toggle("on", research);
+  $("#tab-config").classList.toggle("on", !trace && !history && !research);
   $("#trace-filters").style.display = trace ? "flex" : "none";
-  if (!trace && !C.agents) loadConfig();
+  if (history && !historyLoaded) { historyLoaded = true; loadHistory(); }
+  if (research && !researchLoaded) { researchLoaded = true; loadResearch(); }
+  if (!trace && !history && !research && !C.agents) loadConfig();
 }
 
 $("#tab-trace").onclick = () => showTab("trace");
+$("#tab-history").onclick = () => showTab("history");
+$("#tab-research").onclick = () => showTab("research");
 $("#tab-config").onclick = () => showTab("config");
 
 // ---- 就地试跑：子进程跑一轮 mini，轨迹落回观测目录，用观测页看它 ----

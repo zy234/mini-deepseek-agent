@@ -36,7 +36,7 @@ from minisweagent.environments.candidate_details import CandidateDetails
 from minisweagent.environments.local import LocalEnvironmentConfig
 from minisweagent.environments.miniqmt import TRADING_TZ, MiniQMTClient
 from minisweagent.models import get_model
-from minisweagent.trading import context, notify
+from minisweagent.trading import context, notify, premarket_replay
 from minisweagent.utils.serialize import recursive_merge
 
 logger = logging.getLogger("minisweagent.trading")
@@ -144,6 +144,7 @@ class TradingPipeline:
             "data_errors": pack["errors"],
         }
         self._write_watchlist(watchlist)
+        premarket_replay.write_snapshot(self.journal_dir, pack, watchlist, trace)
         # 日线和板块热度榜同属"一天只取一次"的东财数据：热度榜产出清单已落盘，紧接着把这些票的日线
         # 历史也预热进缓存（多试几遍绕过东财间歇限流）。盘中各轮直接读缓存，不再每轮打东财——这是
         # 2026-09-23 盘中日线整批缺失的根治。持仓票是唯一必须看日线图定止盈止损的那批，而 09:30 第一轮
@@ -373,14 +374,14 @@ class TradingPipeline:
             if now.weekday() >= 5:
                 self.echo("周末不开盘，退出。")
                 return
-            if now.time() > SESSIONS[-1][1]:
+            if now.time() > SESSIONS[-1][1]: # 过了15:00 退出，顺便发summary
                 # 收盘后直接结束，包括"启动就已经过了收盘"这种迟到启动：否则会空转到明天。
                 self.echo(f"已过收盘时间，交易日结束，本日跑了 {len(finished_slots)} 轮。")
                 # 只在当天真跑过轮次时推盘后总结：迟到启动到收盘后什么都没跑，没有可总结的东西。
                 if finished_slots:
                     notify.summary(self.journal_dir, now.date(), echo=self.echo)
                 return
-            slot = self._round_slot(now)
+            slot = self._round_slot(now) # 计算现在输入哪个槽位
             # premarket 触发点只存在于 09:20 到开盘之间；开盘后由槽位接管，午休和收盘后都是 None。
             key = slot or (
                 "premarket" if self.config.premarket_time() <= now.time() < SESSIONS[0][0] else None

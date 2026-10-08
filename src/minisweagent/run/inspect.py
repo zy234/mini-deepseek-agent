@@ -36,7 +36,9 @@ from minisweagent.config import (
     save_config_file,
     validate_agents,
 )
+from minisweagent.environments.miniqmt import host_limits
 from minisweagent.models.utils.actions_toolcall import TOOL_DEFINITIONS_BY_NAME
+from minisweagent.trading import premarket_replay
 
 PROMPT_DIR = "prompts"
 
@@ -47,6 +49,27 @@ UI_PATH = Path(__file__).resolve().parent / "inspect_ui.html"
 IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
 # 没有 exit 消息且近期还在写盘的轨迹当作正在运行；轨迹每步覆盖写，mtime 就是心跳。
 RUNNING_GRACE_SECONDS = 180
+
+
+def _research_buyable(bar: dict | None, limits: dict | None) -> bool | None:
+    """研究页只复用已落盘的买入规则；缺少价格时返回未知，不猜可买。"""
+    if not bar or not isinstance(bar, dict):
+        return None
+    close = bar.get("close")
+    if not isinstance(close, (int, float)) or close <= 0:
+        return None
+    limits = limits if isinstance(limits, dict) else {}
+    max_notional = limits.get("max_buy_notional")
+    if not max_notional:
+        try:
+            max_notional = host_limits().get("max_buy_notional")
+        except (KeyError, ValueError):
+            return None
+    try:
+        max_notional = float(max_notional)
+    except (TypeError, ValueError):
+        return None
+    return close * 100 <= max_notional and not str(bar.get("stock_code", "")).startswith(("688", "689"))
 
 app = typer.Typer(add_completion=False)
 
@@ -200,6 +223,10 @@ class TraceIndex:
 
     def __init__(self, root: Path):
         self.root = root.resolve()
+        state_dir = os.environ.get("MINIQMT_AGENT_STATE_DIR", "")
+        self.journal_dir = (Path(state_dir) if state_dir else self.root.parent / "account-manager").expanduser()
+        if not self.journal_dir.is_absolute():
+            self.journal_dir = (Path.cwd() / self.journal_dir).resolve()
         self._cache: dict[Path, tuple[float, int, dict]] = {}
 
     def _paths(self) -> list[Path]:
@@ -301,6 +328,81 @@ class TraceIndex:
             if child["parent"] and child["parent"] == summary["session_id"]
         ]
         return {"session": summary, "steps": parsed[1], "children": children}
+
+    def premarket_days(self, limit: int = 10) -> list[dict]:
+        return premarket_replay.list_snapshots(self.journal_dir, limit)
+
+    def premarket_day(self, trade_date: str) -> dict:
+        item = premarket_replay.read_snapshot(self.journal_dir, trade_date)
+        if item is None:
+            raise FileNotFoundError(f"没有 {trade_date} 的盘前快照")
+        return item
+
+    def history_days(self, limit: int = 10) -> list[dict]:
+        """按交易日列出实际运行过的 Agent 轨迹，回放直接复用原始轨迹。"""
+        rows = {}
+        for item in self._scan():
+            day = (item.get("started_at") or "")[:10]
+            if day:
+                rows.setdefault(day, []).append(item)
+        result = []
+        for day in sorted(rows, reverse=True)[:limit]:
+            sessions = sorted(rows[day], key=lambda item: item.get("started_at", ""))
+            result.append({"trade_date": day, "sessions": sessions})
+        return result
+
+    def research_days(self, start: str = "2026-09-18") -> list[dict]:
+        """列出已经落盘的板块历史；不在线抓取，避免观测页被东财限流拖住。"""
+        root = self.journal_dir / "sector_backfill"
+        rows = []
+        for path in sorted(root.glob("20??-??-??.json"), reverse=True):
+            if path.stem < start:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            families = payload.get("families") if isinstance(payload, dict) else {}
+            rows.append({"trade_date": path.stem, "families": {k: len(v) for k, v in (families or {}).items()}})
+        return rows
+
+    def research_day(self, trade_date: str) -> dict:
+        path = self.journal_dir / "sector_backfill" / f"{trade_date}.json"
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+        # 盘前快照是降级信息源：有板块指标但可能没有历史成员明细，前端要把这个事实显式显示出来。
+        raise FileNotFoundError(f"没有 {trade_date} 的板块历史数据；请先生成 sector_backfill")
+
+    def research_sector(self, trade_date: str, family: str, sector: str) -> dict:
+        payload = self.research_day(trade_date)
+        rows = [row for row in (payload.get("families", {}).get(family) or []) if row.get("sector") == sector]
+        if not rows:
+            raise FileNotFoundError(f"{trade_date} 没有 {family}·{sector}")
+        selected = rows[0]
+        codes = [str(code) for code in selected.get("member_codes") or []]
+        members = []
+        cache_root = self.journal_dir / "qmt_daily_cache" / trade_date.replace("-", "")
+        for code in codes:
+            path = cache_root / f"{code}.json"
+            try:
+                saved = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                saved = {}
+            bars = saved.get("rows") if isinstance(saved, dict) else []
+            bar = next((item for item in bars if str(item.get("date", ""))[:8] == trade_date.replace("-", "")), None)
+            if bar is not None:
+                bar = {**bar, "stock_code": code}
+            members.append({"stock_code": code, "bar": bar, "buyable": _research_buyable(bar, selected.get("buy_limits"))})
+        curve = []
+        for item in self.research_days():
+            try:
+                day_payload = self.research_day(item["trade_date"])
+            except (FileNotFoundError, ValueError):
+                continue
+            match = next((r for r in (day_payload.get("families", {}).get(family) or []) if r.get("sector") == sector), None)
+            if match:
+                curve.append({"trade_date": item["trade_date"], **{key: match.get(key) for key in ("median_change_pct", "buyable_median_change_pct", "up_ratio", "amount", "main_net_inflow_yi")}})
+        return {"trade_date": trade_date, "family": family, "sector": sector, "summary": selected, "members": members, "curve": curve, "source": payload.get("source", "sector_backfill"), "warning": payload.get("warning", "")}
 
 
 class ConfigStore:
@@ -515,6 +617,12 @@ class Handler(BaseHTTPRequestHandler):
             "/index.html": self._ui,
             "/api/sessions": self._sessions,
             "/api/session": self._session,
+            "/api/premarket-days": self._premarket_days,
+            "/api/premarket-day": self._premarket_day,
+            "/api/history-days": self._history_days,
+            "/api/research-days": self._research_days,
+            "/api/research-day": self._research_day,
+            "/api/research-sector": self._research_sector,
             "/api/image": self._image,
             "/api/config": self._config,
             "/api/prompt": self._prompt,
@@ -577,6 +685,43 @@ class Handler(BaseHTTPRequestHandler):
         if not session_id:
             raise ValueError("缺少 id 参数")
         self._json(index.load(session_id))
+
+    def _premarket_days(self, query: dict) -> None:
+        index: TraceIndex = self.server.index  # type: ignore[attr-defined]
+        raw = (query.get("limit") or ["10"])[0]
+        self._json({"days": index.premarket_days(min(max(int(raw), 1), 30))})
+
+    def _premarket_day(self, query: dict) -> None:
+        index: TraceIndex = self.server.index  # type: ignore[attr-defined]
+        trade_date = (query.get("date") or [""])[0]
+        if not trade_date:
+            raise ValueError("缺少 date 参数")
+        self._json(index.premarket_day(trade_date))
+
+    def _history_days(self, query: dict) -> None:
+        index: TraceIndex = self.server.index  # type: ignore[attr-defined]
+        raw = (query.get("limit") or ["10"])[0]
+        self._json({"days": index.history_days(min(max(int(raw), 1), 30))})
+
+    def _research_days(self, query: dict) -> None:
+        index: TraceIndex = self.server.index  # type: ignore[attr-defined]
+        self._json({"days": index.research_days((query.get("start") or ["2026-09-18"])[0])})
+
+    def _research_day(self, query: dict) -> None:
+        index: TraceIndex = self.server.index  # type: ignore[attr-defined]
+        trade_date = (query.get("date") or [""])[0]
+        if not trade_date:
+            raise ValueError("缺少 date 参数")
+        self._json(index.research_day(trade_date))
+
+    def _research_sector(self, query: dict) -> None:
+        index: TraceIndex = self.server.index  # type: ignore[attr-defined]
+        date = (query.get("date") or [""])[0]
+        family = (query.get("family") or [""])[0]
+        sector = (query.get("sector") or [""])[0]
+        if not date or family not in {"概念", "行业"} or not sector:
+            raise ValueError("date、family、sector 参数不完整")
+        self._json(index.research_sector(date, family, sector))
 
     def _config(self, _query: dict) -> None:
         self._json(self._store().read())
