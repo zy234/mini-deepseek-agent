@@ -1,17 +1,23 @@
-"""板块热度榜与成分股数据源：akshare（东方财富公开接口）。
+"""板块热度榜与成分股数据源：akshare 的新浪接口（stock_sector_spot / stock_sector_detail）。
 
 大 QMT 撤掉极简接口后，native xtdata 的行情服务连不上，`get_sector_list` 枚举和申万/通达信
 板块成分在 ZMQ 后端都取不到（只剩 ~13 个内置板块）。所以板块「有哪些、哪个热、里面有哪些票」
-改由 akshare 从东方财富取——这部分是纯本地 HTTP，不碰交易终端；成分股的实时 tick 与日线趋势
+改由 akshare 取——这部分是纯本地 HTTP，不碰交易终端；成分股的实时 tick 与日线趋势
 仍然走 ZMQ（get_full_tick / get_market_data 都正常）。
 
-口径对齐 pipeline 原来的两族：
-- 概念（原 TGN 通达信概念）→ 东财概念板块，定当日主线。
-- 行业（原 SW2 申万二级）→ 东财行业板块，交叉验证主线背后有没有行业级资金。
+板块榜原先走东财 push2 clist，2026-10-14 整天对本机出口 IP 掐连接（握手后空响应，三个榜单接口
+全挂，没有同源备路），盘前选池 10 次全废。改走新浪：板块表和成分表各一次请求、约 0.1~0.2s，
+成分行带昨收/开高低/成交额，正好映射成 tick 形状。新浪没有板块资金流，也没有可与新浪板块名
+对上号的第三方资金流，所以榜单不再带主力净流入，宁可缺这个维度也不拿对不上口径的数硬凑。
+
+口径：
+- 概念 → 新浪概念板块（label 形如 gn_*），定当日主线。
+- 行业 → 新浪行业板块（label 形如 hangye_*），交叉验证主线背后有没有行业级强度。
 
 热度排序沿用原策略：不按板块指数涨幅（会被买不起的龙头抬高），而是取板块成分里「可买票」的
-中位涨幅——复用 miniqmt 的 `_screen_row` / `_sector_summary`，把 akshare 成分行情映射成 tick 形状。
-每个板块还带上当日主力资金净流入，让模型能挑「可买票在动 且 主力在进」的方向。
+中位涨幅——复用 miniqmt 的 `_screen_row` / `_sector_summary`，把成分行情映射成 tick 形状。
+没有资金流可排序，下钻哪些板块改按新浪板块自身涨跌幅取前 N；N 比以前大（新浪请求便宜），
+免得被买不起的龙头抬高的板块涨幅把真正可买的方向挡在下钻名单外。
 """
 
 from __future__ import annotations
@@ -37,13 +43,14 @@ from minisweagent.environments.miniqmt import (
 
 logger = logging.getLogger(__name__)
 
-# 东财每天随机断连（实测行业榜首拉 RemoteDisconnected、重试即过）。单次请求先重试 3 次，
-# 板块仍失败时由 board_rank 在全局 5 分钟窗口内继续重试，避免一次板块失败拖完全部时间。
+# 单次请求先重试 3 次，板块仍失败时由 board_rank 在全局 5 分钟窗口内继续重试，
+# 避免一次板块失败拖完全部时间。
 RETRY_ATTEMPTS = 3
 RETRY_SLEEP_SECONDS = 4.0
 MEMBER_RETRY_WINDOW_SECONDS = 300.0
-# 板块全表几百个，逐个拉成分太慢；只对按资金净流入排在前面的这些板块拉成分算可买热度。
-DEFAULT_SCAN_BOARDS = 15
+# 没有资金流排名，按新浪板块涨跌幅取前 N 个下钻拉成分。新浪一次成分请求约 0.1~0.2s，
+# 每族 40 个合计十几秒，比只看前 15 个更不容易漏掉「板块均价被龙头拉高/拉低」的可买方向。
+DEFAULT_SCAN_BOARDS = 40
 # 日线历史统一取 90 天：MA20 从图上第一根就有值，趋势字段也只用尾部 20 根，多给无害。
 DAILY_LOOKBACK_DAYS = 90
 # 单只票日线当天的取数配额：所有调用方（盘前预热、盘中读图取数、趋势字段）共用这一份缓存和配额。
@@ -55,16 +62,12 @@ class BoardDataError(RuntimeError):
     """板块数据取不到。盘前必须有主线板块，宁可这一轮明确失败也不拿残缺数据选池。"""
 
 
-# 两族到 akshare 三个接口的映射：板块行情表、成分股表、资金流排名的 sector_type。
-# 概念=东财概念（原 TGN 通达信概念），行业=东财行业（原 SW2 申万二级）。
-FAMILY_FUNCS = {
-    "概念": ("stock_board_concept_name_em", "stock_board_concept_cons_em", "概念资金流"),
-    "行业": ("stock_board_industry_name_em", "stock_board_industry_cons_em", "行业资金流"),
-}
+# 两族到新浪 stock_sector_spot 的 indicator 映射。
+FAMILY_INDICATORS = {"概念": "概念", "行业": "行业"}
 
 
 def _retry(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    """东财会随机断连，重试几次；用尽还失败就抛，让调用方把原因带进 errors。"""
+    """公开行情接口会随机断连，重试几次；用尽还失败就抛，让调用方把原因带进 errors。"""
     last: Exception | None = None
     for attempt in range(RETRY_ATTEMPTS):
         try:
@@ -75,7 +78,8 @@ def _retry(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
             now = datetime.now(TRADING_TZ)
             record = {
                 "at": now.isoformat(timespec="seconds"), "function": getattr(fn, "__name__", type(fn).__name__),
-                "symbol": kwargs.get("symbol"), "attempt": attempt + 1, "max_attempts": RETRY_ATTEMPTS,
+                "symbol": kwargs.get("symbol") or kwargs.get("sector") or kwargs.get("indicator"), "attempt": attempt + 1,
+                "max_attempts": RETRY_ATTEMPTS,
                 "error_type": type(exc).__name__, "error": str(exc),
             }
             try:
@@ -91,7 +95,7 @@ def _retry(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
 
 def _to_qmt_code(raw: Any) -> str | None:
-    """东财返回 6 位纯代码，补 .SH/.SZ 后缀成 QMT/ZMQ 认的格式；非 A 股返回 None。"""
+    """6 位纯代码补 .SH/.SZ 后缀成 QMT/ZMQ 认的格式；非沪深 A 股返回 None。"""
     code = str(raw).strip()
     if len(code) != 6 or not code.isdigit():
         return None
@@ -113,49 +117,44 @@ def _load_ak() -> Any:
     return ak
 
 
-def _fund_flow(family: str) -> dict[str, dict[str, float]]:
-    """按板块名取当日主力资金净流入；东财按净流入排序，序号即资金热度名次。
+def _board_list(family: str) -> list[tuple[str, str]]:
+    """取一族的板块表，返回 [(label, 板块名)]，按新浪板块自身涨跌幅从高到低。
 
-    返回 {板块名: {main_net_inflow_yi, main_net_inflow_pct, fund_rank}}。
-    注意：09:20 盘前连续竞价未开始，「今日」资金流还没形成，此时拿到的是上一交易日尾盘口径，
-    只能当昨日资金主线的延续参考，不能当今日实时资金。
+    label 是新浪成分接口的入参。涨跌幅缺失（NaN）的板块排在最后，不当作 0%。
     """
     ak = _load_ak()
-    sector_type = FAMILY_FUNCS[family][2]
-    frame = _retry(ak.stock_sector_fund_flow_rank, indicator="今日", sector_type=sector_type)
-    flow: dict[str, dict[str, float]] = {}
-    for rank, (_, row) in enumerate(frame.iterrows(), start=1):
-        name = str(row.get("名称") or "").strip()
-        if not name:
-            continue
-        flow[name] = {
-            "main_net_inflow_yi": round(float(row.get("今日主力净流入-净额") or 0.0) / 1e8, 2),
-            "main_net_inflow_pct": round(float(row.get("今日主力净流入-净占比") or 0.0), 2),
-            "fund_rank": rank,
-        }
-    return flow
+    frame = _retry(ak.stock_sector_spot, indicator=FAMILY_INDICATORS[family])
+    rows = []
+    for _, row in frame.iterrows():
+        label, name = str(row.get("label") or "").strip(), str(row.get("板块") or "").strip()
+        if label and name:
+            change = _num(row.get("涨跌幅"))
+            rows.append((change if change is not None else float("-inf"), label, name))
+    rows.sort(key=lambda item: item[0], reverse=True)
+    return [(label, name) for _, label, name in rows]
 
 
-def _cons_ticks(family: str, sector_name: str) -> tuple[list[str], dict[str, dict[str, Any]]]:
+def _cons_ticks(label: str) -> tuple[list[str], dict[str, dict[str, Any]]]:
     """取一个板块的成分股，映射成 miniqmt tick 形状（复用 _screen_row / _sector_summary）。"""
     ak = _load_ak()
-    cons_func = getattr(ak, FAMILY_FUNCS[family][1])
-    frame = _retry(cons_func, symbol=sector_name)
+    frame = _retry(ak.stock_sector_detail, sector=label)
     codes: list[str] = []
     quotes: dict[str, dict[str, Any]] = {}
     for _, row in frame.iterrows():
-        code = _to_qmt_code(row.get("代码"))
+        code = _to_qmt_code(row.get("code"))
         if code is None or code in quotes:
             continue
         codes.append(code)
+        shares = _num(row.get("volume"))
         quotes[code] = {
-            "lastPrice": row.get("最新价"),
-            "lastClose": row.get("昨收"),
-            "open": row.get("今开"),
-            "high": row.get("最高"),
-            "low": row.get("最低"),
-            "volume": row.get("成交量"),
-            "amount": row.get("成交额"),
+            "lastPrice": row.get("trade"),
+            "lastClose": row.get("settlement"),
+            "open": row.get("open"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            # 新浪成交量是股，tick 契约里的 volume 是手，和下游其他来源保持同一量纲。
+            "volume": shares / LOT_SIZE if shares is not None else None,
+            "amount": row.get("amount"),
         }
     return codes, quotes
 
@@ -169,43 +168,36 @@ def board_rank(
     scan_boards: int = DEFAULT_SCAN_BOARDS,
     retry_until: float | None = None,
 ) -> dict[str, Any]:
-    """板块热度榜：东财板块行情 + 主力资金流，取资金最热的若干板块下钻算「可买中位涨幅」。
+    """板块热度榜：新浪板块行情取涨幅靠前的若干板块下钻，算「可买中位涨幅」。
 
-    排序沿用原策略——按可买票中位涨幅排（不被买不起的龙头抬高），但每行同时带上主力资金净流入，
-    让模型能挑「可买票在动 且 主力在进」的方向。下钻板块按主力净流入名次选，把 cons 请求压到 scan_boards 个。
+    排序沿用原策略——按可买票中位涨幅排（不被买不起的龙头抬高）。新浪没有板块资金流，下钻名单只能按
+    板块自身涨跌幅取前 scan_boards 个，把成分请求数压在可控范围内。
     """
-    if family not in FAMILY_FUNCS:
-        raise BoardDataError(f"family 只能是 {'、'.join(FAMILY_FUNCS)}")
-    ak = _load_ak()
-    board_frame = _retry(getattr(ak, FAMILY_FUNCS[family][0]))
-    flow = _fund_flow(family)
-    # 先按主力资金净流入名次挑要下钻的板块：资金在进的方向才值得逐个拉成分算可买热度。
-    boards = [str(row.get("板块名称") or "").strip() for _, row in board_frame.iterrows()]
-    boards = [name for name in boards if name]
-    boards.sort(key=lambda name: flow.get(name, {}).get("fund_rank", 10**9))
+    if family not in FAMILY_INDICATORS:
+        raise BoardDataError(f"family 只能是 {'、'.join(FAMILY_INDICATORS)}")
+    boards = _board_list(family)
     ranked: list[dict[str, Any]] = []
     failed: list[str] = []
     # 失败板块继续保留简短名称供兼容；原始异常另存，便于事后区分超时、断连、限流和解析错误。
     failed_details: dict[str, str] = {}
-    pending = list(boards[:scan_boards])
+    pending = boards[:scan_boards]
     retry_until = retry_until if retry_until is not None else time.monotonic() + MEMBER_RETRY_WINDOW_SECONDS
     while pending:
-        next_pending: list[str] = []
-        for name in pending:
+        next_pending: list[tuple[str, str]] = []
+        for label, name in pending:
             try:
-                codes, quotes = _cons_ticks(family, name)
+                codes, quotes = _cons_ticks(label)
             except BoardDataError as exc:
                 failed_details[name] = f"{name}: {exc}"
-                next_pending.append(name)
+                next_pending.append((label, name))
                 continue
             summary = _sector_summary(name, codes, quotes, max_buy_notional)
             if not summary or summary["members_quoted"] < SECTOR_RANK_MIN_MEMBERS or summary["buyable_count"] < min_buyable:
                 continue
-            summary.update(flow.get(name, {"main_net_inflow_yi": None, "main_net_inflow_pct": None, "fund_rank": None}))
             summary["member_codes"] = [code for code in codes if STOCK_CODE_PATTERN.match(code)]
             ranked.append(summary)
         if not next_pending or time.monotonic() >= retry_until:
-            failed = next_pending
+            failed = [name for _, name in next_pending]
             break
         pending = next_pending
         time.sleep(RETRY_SLEEP_SECONDS)

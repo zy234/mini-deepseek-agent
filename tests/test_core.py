@@ -902,8 +902,8 @@ def _minute_bars(day="20260910"):
     ]
 
 
-# 板块热度榜和日线现在走 akshare（东财），不打 bridge：端到端测试里用构造数据替掉，
-# 既不依赖网络，也不依赖 600001.SH 这类假代码在东财真的存在。
+# 板块热度榜（新浪）和日线（东财）都走 akshare，不打 bridge：端到端测试里用构造数据替掉，
+# 既不依赖网络，也不依赖 600001.SH 这类假代码在数据源里真的存在。
 _FAKE_POOL = {
     "TGN热门一": ["600001.SH", "600002.SH", "600003.SH"],
     "TGN热门二": ["000004.SZ", "000005.SZ", "000006.SZ"],
@@ -922,9 +922,6 @@ def _fake_board_rank(family, *, limit=12, min_buyable=3, max_buy_notional, scan_
             "amount": 1.2e9,
             "buyable_count": len(codes),
             "buyable_median_change_pct": 4.2 - index,
-            "main_net_inflow_yi": 1.5 - index,
-            "main_net_inflow_pct": 3.0 - index,
-            "fund_rank": index + 1,
             "member_codes": codes,
         }
         for index, (name, codes) in enumerate(_FAKE_POOL.items())
