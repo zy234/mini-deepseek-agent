@@ -22,7 +22,7 @@ from minisweagent.environments.miniqmt import TRADING_TZ, MiniQMTClient, host_li
 from minisweagent.trading import charts
 
 # 概念与行业共同竞争候选名额，不能因类别固定排在后面就失去取个股明细的机会。
-# 数据源：akshare 的新浪板块接口。大 QMT 撤极简接口后，QMT 已取不到申万/通达信板块数据，见 akshare_board。
+# 数据源：同花顺板块资金流页与成分页。大 QMT 撤极简接口后，QMT 已取不到申万/通达信板块数据，见 akshare_board。
 SECTOR_FAMILIES = ("概念", "行业")
 SECTOR_RANK_LIMIT = 12
 QUOTE_BATCH = 20
@@ -65,7 +65,7 @@ def premarket_context(
     errors: list[str] = []
     limits = host_limits()
     retry_until = time.monotonic() + akshare_board.MEMBER_RETRY_WINDOW_SECONDS
-    # 板块热度榜与成分股走 akshare 的新浪接口；成分股的实时行情/趋势仍走 ZMQ（client.screen）。
+    # 板块热度榜与成分股走同花顺网页；成分股的实时行情/趋势仍走 ZMQ（client.screen）。
     ranks: dict[str, list[dict]] = {}
     for family in SECTOR_FAMILIES:
         try:
@@ -91,14 +91,25 @@ def premarket_context(
             errors.append(f"{family} 板块热度榜没有数据")
     # 两类摘要统一排序供模型比较，但不预先截断为要查询明细的板块。
     ranked = [{**sector, "family": family} for family, sectors in ranks.items() for sector in sectors]
-    ranked.sort(key=lambda item: (item["buyable_median_change_pct"], item["up_ratio"]), reverse=True)
+    # 资金净额缺失的排在已知值之后，不当作零流入。
+    ranked.sort(
+        key=lambda item: (
+            item["buyable_median_change_pct"],
+            item["up_ratio"],
+            item["net_inflow_yi"] if item.get("net_inflow_yi") is not None else float("-inf"),
+        ),
+        reverse=True,
+    )
     if not ranked:
         raise MarketDataError(f"概念和行业板块热度榜均没有数据，盘前无法选池：{'；'.join(errors)}")
     # 下游按板块名索引，同名板块只保留排名靠前的一份，避免占两份预算或在校验时互相覆盖。
     selected: dict[str, dict] = {}
     for sector in ranked:
         selected.setdefault(sector["sector"], sector)
-    summary_fields = ("sector", "family", "quote_at", "buyable_median_change_pct", "up_ratio", "buyable_count")
+    summary_fields = (
+        "sector", "family", "quote_at", "buyable_median_change_pct", "up_ratio",
+        "net_inflow_yi", "buyable_count", "members_total",
+    )
     summaries = [{key: sector.get(key) for key in summary_fields} for sector in selected.values()]
     account = account_context(client, errors)
     return {

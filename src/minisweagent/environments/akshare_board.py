@@ -1,23 +1,25 @@
-"""板块热度榜与成分股数据源：akshare 的新浪接口（stock_sector_spot / stock_sector_detail）。
+"""板块热度榜与成分股数据源：同花顺公开网页（资金流页 + 板块成分页）；个股/指数日线仍用 akshare。
 
 大 QMT 撤掉极简接口后，native xtdata 的行情服务连不上，`get_sector_list` 枚举和申万/通达信
 板块成分在 ZMQ 后端都取不到（只剩 ~13 个内置板块）。所以板块「有哪些、哪个热、里面有哪些票」
-改由 akshare 取——这部分是纯本地 HTTP，不碰交易终端；成分股的实时 tick 与日线趋势
-仍然走 ZMQ（get_full_tick / get_market_data 都正常）。
+改由本模块取——纯本地 HTTP，不碰交易终端；成分股的实时 tick 与日线趋势仍走 ZMQ。
 
 板块榜原先走东财 push2 clist，2026-10-14 整天对本机出口 IP 掐连接（握手后空响应，三个榜单接口
-全挂，没有同源备路），盘前选池 10 次全废。改走新浪：板块表和成分表各一次请求、约 0.1~0.2s，
-成分行带昨收/开高低/成交额，正好映射成 tick 形状。新浪没有板块资金流，也没有可与新浪板块名
-对上号的第三方资金流，所以榜单不再带主力净流入，宁可缺这个维度也不拿对不上口径的数硬凑。
+同源全挂），盘前选池 10 次全废。改走同花顺，口径以同花顺为准：
+- 概念 → 同花顺概念板块（资金流页 data.10jqka.com.cn/funds/gnzjl，成分页 q.10jqka.com.cn/gn/detail）。
+- 行业 → 同花顺行业板块（hyzjl / thshy）。
+资金流页一张表同时给出板块名、板块码、公司家数和资金净额，所以不需要另抓板块名单。
 
-口径：
-- 概念 → 新浪概念板块（label 形如 gn_*），定当日主线。
-- 行业 → 新浪行业板块（label 形如 hangye_*），交叉验证主线背后有没有行业级强度。
+同花顺的硬约束（2026-10-14 实测）：
+- 成分页第 6 页起恒返回反爬挑战页，概念每页 10 只、行业每页 20 只，所以每个板块最多拿 50（概念）/100（行业）只。
+  排序固定用成交额降序（field/19），样本是板块里最活跃的一批，不随涨跌方向漂移；`members_total` 大于样本数说明样本不全。
+- 请求太密会被软限流（挑战页或读超时，约一分钟自愈）。每个请求之后固定歇 THS_SPACING_SECONDS，
+  一次完整盘前约 120 个请求、90 秒；10 次盘前重试按 120 秒间隔实测 366 个请求全部放行。
+- 成分表没有昨收/开高低，昨收用「现价 - 涨跌」还原；开高低量留空，close_position 因此缺失。
 
 热度排序沿用原策略：不按板块指数涨幅（会被买不起的龙头抬高），而是取板块成分里「可买票」的
 中位涨幅——复用 miniqmt 的 `_screen_row` / `_sector_summary`，把成分行情映射成 tick 形状。
-没有资金流可排序，下钻哪些板块改按新浪板块自身涨跌幅取前 N；N 比以前大（新浪请求便宜），
-免得被买不起的龙头抬高的板块涨幅把真正可买的方向挡在下钻名单外。
+下钻哪些板块按同花顺资金净额取前 N，让模型能挑「可买票在动 且 资金在进」的方向。
 """
 
 from __future__ import annotations
@@ -26,10 +28,13 @@ import json
 import logging
 import math
 import os
+import random
+import re
 import tempfile
 import time
 from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
@@ -48,9 +53,18 @@ logger = logging.getLogger(__name__)
 RETRY_ATTEMPTS = 3
 RETRY_SLEEP_SECONDS = 4.0
 MEMBER_RETRY_WINDOW_SECONDS = 300.0
-# 没有资金流排名，按新浪板块涨跌幅取前 N 个下钻拉成分。新浪一次成分请求约 0.1~0.2s，
-# 每族 40 个合计十几秒，比只看前 15 个更不容易漏掉「板块均价被龙头拉高/拉低」的可买方向。
-DEFAULT_SCAN_BOARDS = 40
+# 板块全表几百个，逐个拉成分太慢也会触发限流；只对同花顺资金净额靠前的这些板块拉成分算可买热度。
+DEFAULT_SCAN_BOARDS = 15
+# 同花顺请求之间的固定间隔（再加最多 0.2s 抖动）。0.5s 下完整盘前 122 个请求全部放行；
+# 实测在无间隔连发 50 个请求后，紧接着的成分请求被挑战页拦下。
+THS_SPACING_SECONDS = 0.5
+THS_TIMEOUT_SECONDS = 10.0
+# 成分页第 6 页起恒返回挑战页；排序字段 19 是成交额，降序取最活跃的一批。
+THS_MEMBER_PAGES = 5
+THS_SORT_AMOUNT = 19
+THS_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.85 Safari/537.36"
+)
 # 日线历史统一取 90 天：MA20 从图上第一根就有值，趋势字段也只用尾部 20 根，多给无害。
 DAILY_LOOKBACK_DAYS = 90
 # 单只票日线当天的取数配额：所有调用方（盘前预热、盘中读图取数、趋势字段）共用这一份缓存和配额。
@@ -62,8 +76,8 @@ class BoardDataError(RuntimeError):
     """板块数据取不到。盘前必须有主线板块，宁可这一轮明确失败也不拿残缺数据选池。"""
 
 
-# 两族到新浪 stock_sector_spot 的 indicator 映射。
-FAMILY_INDICATORS = {"概念": "概念", "行业": "行业"}
+# 两族到同花顺的映射：资金流页路径、板块成分页路径。
+FAMILIES = {"概念": ("gnzjl", "gn"), "行业": ("hyzjl", "thshy")}
 
 
 def _retry(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -78,7 +92,7 @@ def _retry(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
             now = datetime.now(TRADING_TZ)
             record = {
                 "at": now.isoformat(timespec="seconds"), "function": getattr(fn, "__name__", type(fn).__name__),
-                "symbol": kwargs.get("symbol") or kwargs.get("sector") or kwargs.get("indicator"), "attempt": attempt + 1,
+                "symbol": kwargs.get("symbol") or (args[0] if args else None), "attempt": attempt + 1,
                 "max_attempts": RETRY_ATTEMPTS,
                 "error_type": type(exc).__name__, "error": str(exc),
             }
@@ -117,45 +131,133 @@ def _load_ak() -> Any:
     return ak
 
 
-def _board_list(family: str) -> list[tuple[str, str]]:
-    """取一族的板块表，返回 [(label, 板块名)]，按新浪板块自身涨跌幅从高到低。
+_ths_js: Any = None
 
-    label 是新浪成分接口的入参。涨跌幅缺失（NaN）的板块排在最后，不当作 0%。
+
+def _ths_cookie() -> str:
+    """同花顺的 hexin-v 校验值由它自家的 ths.js 算（akshare 随包带着），算好的值同时放 Cookie 和请求头。"""
+    global _ths_js
+    if _ths_js is None:
+        try:
+            import py_mini_racer
+            from akshare.stock_feature.stock_board_industry_ths import _get_file_content_ths
+        except ImportError as exc:
+            raise BoardDataError("缺少 akshare/py_mini_racer，同花顺板块数据不可用") from exc
+        _ths_js = py_mini_racer.MiniRacer()
+        _ths_js.eval(_get_file_content_ths("ths.js"))
+    return _ths_js.call("v")
+
+
+def _ths_html(url: str, **headers: str) -> str:
+    """一次同花顺请求，返回带表格的 HTML。
+
+    挑战页、403、超时都拿不到表格，统一抛 BoardDataError 交给 _retry；成功后固定歇一下，
+    这是对软限流的控速，不是礼貌——密了会被拦。
     """
-    ak = _load_ak()
-    frame = _retry(ak.stock_sector_spot, indicator=FAMILY_INDICATORS[family])
-    rows = []
-    for _, row in frame.iterrows():
-        label, name = str(row.get("label") or "").strip(), str(row.get("板块") or "").strip()
-        if label and name:
-            change = _num(row.get("涨跌幅"))
-            rows.append((change if change is not None else float("-inf"), label, name))
-    rows.sort(key=lambda item: item[0], reverse=True)
-    return [(label, name) for _, label, name in rows]
+    import requests
+
+    cookie = _ths_cookie()
+    try:
+        response = requests.get(
+            url,
+            headers={"User-Agent": THS_USER_AGENT, "Cookie": f"v={cookie}", "hexin-v": cookie, **headers},
+            timeout=THS_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        raise BoardDataError(f"同花顺请求失败：{type(exc).__name__}: {exc}") from exc
+    if response.status_code != 200 or "<table" not in response.text:
+        raise BoardDataError(f"同花顺未返回表格（反爬挑战或限流）：HTTP {response.status_code} {response.text[:60]!r}")
+    time.sleep(THS_SPACING_SECONDS + random.random() * 0.2)
+    return response.text
 
 
-def _cons_ticks(label: str) -> tuple[list[str], dict[str, dict[str, Any]]]:
-    """取一个板块的成分股，映射成 miniqmt tick 形状（复用 _screen_row / _sector_summary）。"""
-    ak = _load_ak()
-    frame = _retry(ak.stock_sector_detail, sector=label)
+def _page_total(html: str) -> int:
+    match = re.search(r"page_info\">\s*\d+/(\d+)", html)
+    return int(match.group(1)) if match else 1
+
+
+def _read_table(html: str, **kwargs: Any) -> Any:
+    """HTML 里的表格转 DataFrame；页面结构变了会让下游按列取值 KeyError，统一在入口翻成数据错误。"""
+    import pandas as pd
+
+    try:
+        return pd.read_html(StringIO(html), **kwargs)[0]
+    except (ValueError, IndexError) as exc:
+        raise BoardDataError(f"同花顺页面表格解析失败：{exc}") from exc
+
+
+def _flow_table(family: str) -> list[dict[str, Any]]:
+    """一族的全部板块：名称、板块码、公司家数、资金净额（亿元，同花顺口径：流入减流出）。
+
+    板块码只存在于表格行的链接里，pandas 读不出来，按出现顺序用正则取出；数量对不上说明页面结构变了，
+    宁可整张表作废也不让板块名和板块码错位——错位的后果是拿 A 板块的成分当 B 板块的热度。
+    """
+    page_path, kind = FAMILIES[family]
+    base = f"http://data.10jqka.com.cn/funds/{page_path}/field/tradezdf/order/desc/page/{{}}/ajax/1/free/1/"
+    headers = {
+        "Host": "data.10jqka.com.cn",
+        "Referer": f"http://data.10jqka.com.cn/funds/{page_path}/",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    boards: list[dict[str, Any]] = []
+    page, total = 1, 1
+    while page <= total:
+        html = _retry(_ths_html, base.format(page), **headers)
+        total = _page_total(html) if page == 1 else total
+        frame = _read_table(html)
+        codes = re.findall(rf"/{kind}/detail/code/(\d+)/", html)
+        if len(codes) != len(frame):
+            raise BoardDataError(f"同花顺资金流表第 {page} 页行数 {len(frame)} 与板块码数 {len(codes)} 对不上")
+        try:
+            for code, (_, row) in zip(codes, frame.iterrows(), strict=True):
+                boards.append(
+                    {
+                        "code": code,
+                        "name": str(row.iloc[1]).strip(),
+                        "members_total": _num(row["公司家数"]),
+                        "net_inflow_yi": _num(row["净额(亿)"]),
+                    }
+                )
+        except KeyError as exc:
+            raise BoardDataError(f"同花顺资金流表缺少列 {exc}，页面结构可能变了") from exc
+        page += 1
+    return boards
+
+
+def _amount_yuan(text: Any) -> float | None:
+    """同花顺成交额是 '5.57亿' / '1234.5万' / '1234' 这种带单位的文本，折成元。"""
+    raw = str(text).strip()
+    scale = {"亿": 1e8, "万": 1e4}.get(raw[-1:])
+    value = _num(raw[:-1] if scale else raw)
+    return value * (scale or 1.0) if value is not None else None
+
+
+def _cons_ticks(family: str, board_code: str) -> tuple[list[str], dict[str, dict[str, Any]]]:
+    """取一个板块成交额最大的前 5 页成分（概念至多 50 只、行业至多 100 只），映射成 miniqmt tick 形状（复用 _screen_row / _sector_summary）。"""
+    kind = FAMILIES[family][1]
     codes: list[str] = []
     quotes: dict[str, dict[str, Any]] = {}
-    for _, row in frame.iterrows():
-        code = _to_qmt_code(row.get("code"))
-        if code is None or code in quotes:
-            continue
-        codes.append(code)
-        shares = _num(row.get("volume"))
-        quotes[code] = {
-            "lastPrice": row.get("trade"),
-            "lastClose": row.get("settlement"),
-            "open": row.get("open"),
-            "high": row.get("high"),
-            "low": row.get("low"),
-            # 新浪成交量是股，tick 契约里的 volume 是手，和下游其他来源保持同一量纲。
-            "volume": shares / LOT_SIZE if shares is not None else None,
-            "amount": row.get("amount"),
-        }
+    page, pages = 1, 1
+    while page <= min(pages, THS_MEMBER_PAGES):
+        url = f"http://q.10jqka.com.cn/{kind}/detail/code/{board_code}/field/{THS_SORT_AMOUNT}/order/desc/page/{page}/ajax/1/"
+        html = _retry(_ths_html, url)
+        pages = _page_total(html) if page == 1 else pages
+        frame = _read_table(html, converters={"代码": str})
+        if "代码" not in frame.columns:  # 板块暂无成分时同花顺返回一行「暂无成份股数据」
+            break
+        for _, row in frame.iterrows():
+            code = _to_qmt_code(row["代码"])
+            if code is None or code in quotes:
+                continue
+            last, change = _num(row["现价"]), _num(row["涨跌"])
+            codes.append(code)
+            quotes[code] = {
+                "lastPrice": last,
+                # 成分表没有昨收，用现价减涨跌还原；停牌或缺失就留空，由 _screen_row 丢掉这一行。
+                "lastClose": last - change if last is not None and change is not None else None,
+                "amount": _amount_yuan(row["成交额"]),
+            }
+        page += 1
     return codes, quotes
 
 
@@ -168,14 +270,16 @@ def board_rank(
     scan_boards: int = DEFAULT_SCAN_BOARDS,
     retry_until: float | None = None,
 ) -> dict[str, Any]:
-    """板块热度榜：新浪板块行情取涨幅靠前的若干板块下钻，算「可买中位涨幅」。
+    """板块热度榜：同花顺资金流页 + 板块成分，取资金净流入最多的若干板块下钻算「可买中位涨幅」。
 
-    排序沿用原策略——按可买票中位涨幅排（不被买不起的龙头抬高）。新浪没有板块资金流，下钻名单只能按
-    板块自身涨跌幅取前 scan_boards 个，把成分请求数压在可控范围内。
+    排序沿用原策略——按可买票中位涨幅排（不被买不起的龙头抬高），但每行同时带上资金净流入，
+    让模型能挑「可买票在动 且 资金在进」的方向。下钻板块按资金净额名次选，把成分请求压到 scan_boards 个。
+    每个板块的样本是成交额最大的前 5 页成分（同花顺成分页的上限），`members_total` 给出板块真实家数。
     """
-    if family not in FAMILY_INDICATORS:
-        raise BoardDataError(f"family 只能是 {'、'.join(FAMILY_INDICATORS)}")
-    boards = _board_list(family)
+    if family not in FAMILIES:
+        raise BoardDataError(f"family 只能是 {'、'.join(FAMILIES)}")
+    boards = _flow_table(family)
+    boards.sort(key=lambda board: board["net_inflow_yi"] if board["net_inflow_yi"] is not None else float("-inf"), reverse=True)
     ranked: list[dict[str, Any]] = []
     failed: list[str] = []
     # 失败板块继续保留简短名称供兼容；原始异常另存，便于事后区分超时、断连、限流和解析错误。
@@ -183,21 +287,24 @@ def board_rank(
     pending = boards[:scan_boards]
     retry_until = retry_until if retry_until is not None else time.monotonic() + MEMBER_RETRY_WINDOW_SECONDS
     while pending:
-        next_pending: list[tuple[str, str]] = []
-        for label, name in pending:
+        next_pending: list[dict[str, Any]] = []
+        for board in pending:
+            name = board["name"]
             try:
-                codes, quotes = _cons_ticks(label)
+                codes, quotes = _cons_ticks(family, board["code"])
             except BoardDataError as exc:
                 failed_details[name] = f"{name}: {exc}"
-                next_pending.append((label, name))
+                next_pending.append(board)
                 continue
             summary = _sector_summary(name, codes, quotes, max_buy_notional)
             if not summary or summary["members_quoted"] < SECTOR_RANK_MIN_MEMBERS or summary["buyable_count"] < min_buyable:
                 continue
+            summary["net_inflow_yi"] = board["net_inflow_yi"]
+            summary["members_total"] = int(board["members_total"]) if board["members_total"] is not None else None
             summary["member_codes"] = [code for code in codes if STOCK_CODE_PATTERN.match(code)]
             ranked.append(summary)
         if not next_pending or time.monotonic() >= retry_until:
-            failed = [name for _, name in next_pending]
+            failed = [board["name"] for board in next_pending]
             break
         pending = next_pending
         time.sleep(RETRY_SLEEP_SECONDS)
