@@ -69,6 +69,7 @@ trading:
   daily_chart_days: 30
   max_parallel_groups: 6
   round_json_attempts: 2
+  round_stream_retry_attempts: 1
 environment:
   timeout: 120
   web_search_engines:

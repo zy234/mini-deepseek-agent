@@ -179,10 +179,16 @@ class DeepSeekModel:
         stream_started = time.time()
         last_chunk_at = stream_started
 
+        # httpx 的 read timeout 会被每个 chunk（哪怕是极小的心跳）重置，吞吐低但没完全断流时
+        # 不会触发；这里自己量距上一个 chunk 的间隔，到点就主动放弃，不依赖 SDK 层超时。
+        stall_limit = self.config.api_timeout_seconds
         try:
             for chunk in response:
+                now = time.time()
+                if now - last_chunk_at > stall_limit:
+                    raise TimeoutError(f"流间隔 {now - last_chunk_at:.1f}s 超过停更上限")
                 chunks += 1
-                last_chunk_at = time.time()
+                last_chunk_at = now
                 if getattr(chunk, "usage", None):
                     usage = chunk.usage.model_dump(exclude_none=True)
                 for choice in getattr(chunk, "choices", []) or []:

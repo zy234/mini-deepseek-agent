@@ -99,6 +99,9 @@ class TradingConfig(BaseModel):
     daily_chart_days: int = Field(default=30, ge=10, le=120)
     max_parallel_groups: int = Field(default=6, ge=1, le=12)
     round_json_attempts: int = Field(default=2, ge=1, le=4)
+    # 连接层异常（流中断等）接不上已断的半截流，只能整个对话重开一局；这个重试独立于
+    # round_json_attempts（那个是格式/校验不过关的同一对话内重试）。
+    round_stream_retry_attempts: int = Field(default=1, ge=0, le=3)
 
     @model_validator(mode="after")
     def _check_interval(self) -> TradingConfig:
@@ -292,44 +295,59 @@ class TradingPipeline:
         session_id: str,
         position: int,
     ) -> tuple[dict[str, Any], str]:
-        """一个板块（或持仓组）一次带图请求。返回结论或错误文本，不在这里抛。"""
-        child = trace.with_name(f"{trace.stem}-{position:02d}-chart_reader.json")
+        """一个板块（或持仓组）一次带图请求。返回结论或错误文本，不在这里抛。
+
+        连接层异常（如流中断）发生在 `_ask_json` 的格式重试循环之外，续不上已断的半截流，
+        只能整个对话从头开一局重问；这里独立重试 `round_stream_retry_attempts` 次，
+        跟其他组各自独立，不影响没失败的组。
+        """
         codes = [stock["stock_code"] for stock in group["stocks"]]
         images = index_charts + [path for stock in group["stocks"] if (path := stock.get("chart"))]
-        agent = self._build_agent(
-            "chart_reader",
-            trace=child,
-            session_id=f"{session_id}-{position:02d}",
-            cycle_kind="intraday",
-            parent=session_id,
-            label=group["name"],
-        )
-        try:
-            payload = self._ask_json(
-                agent,
-                task=(
-                    f"{pack['as_of']} 读图判断：分组 {group['name']}（{group['kind']}），"
-                    f"标的 {'、'.join(codes)}。每只票都要给出结论。"
-                ),
-                validate=lambda data: _validate_verdicts(data, codes),
-                images=images,
-                template_vars={
-                    "as_of": pack["as_of"],
-                    "group_name": group["name"],
-                    "group_kind": group["kind"],
-                    "group_note": group.get("note", ""),
-                    "group": context.block(group),
-                    "indexes": context.block(pack["indexes"]),
-                    "limits": context.block(pack["limits"]),
-                    "image_order": context.block(
-                        [Path(path).name for path in images]
-                    ),
-                },
+        last_error: Exception | None = None
+        for retry in range(self.config.round_stream_retry_attempts + 1):
+            child = trace.with_name(
+                f"{trace.stem}-{position:02d}-chart_reader.json"
+                if retry == 0
+                else f"{trace.stem}-{position:02d}-retry{retry}-chart_reader.json"
             )
-        except Exception as error:  # 一个组失败不能打死整轮，但失败要带着现场进汇总输入
-            logger.exception("读图组 %s 失败", group["name"])
-            return {}, f"{type(error).__name__}: {error}"
-        return {"group": group["name"], "kind": group["kind"], **payload}, ""
+            agent = self._build_agent(
+                "chart_reader",
+                trace=child,
+                session_id=f"{session_id}-{position:02d}" + (f"-retry{retry}" if retry else ""),
+                cycle_kind="intraday",
+                parent=session_id,
+                label=group["name"],
+            )
+            try:
+                payload = self._ask_json(
+                    agent,
+                    task=(
+                        f"{pack['as_of']} 读图判断：分组 {group['name']}（{group['kind']}），"
+                        f"标的 {'、'.join(codes)}。每只票都要给出结论。"
+                    ),
+                    validate=lambda data: _validate_verdicts(data, codes),
+                    images=images,
+                    template_vars={
+                        "as_of": pack["as_of"],
+                        "group_name": group["name"],
+                        "group_kind": group["kind"],
+                        "group_note": group.get("note", ""),
+                        "group": context.block(group),
+                        "indexes": context.block(pack["indexes"]),
+                        "limits": context.block(pack["limits"]),
+                        "image_order": context.block(
+                            [Path(path).name for path in images]
+                        ),
+                    },
+                )
+            except Exception as error:  # 一个组失败不能打死整轮，但失败要带着现场进汇总输入
+                last_error = error
+                logger.exception(
+                    "读图组 %s 失败（第 %s/%s 次）", group["name"], retry + 1, self.config.round_stream_retry_attempts + 1
+                )
+                continue
+            return {"group": group["name"], "kind": group["kind"], **payload}, ""
+        return {}, f"{type(last_error).__name__}: {last_error}"
 
     def _execute(
         self,
