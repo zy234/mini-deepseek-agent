@@ -105,11 +105,14 @@ class CandidateDetails:
                 limit=self.rows_per_sector,
                 enrich_trend=True,
                 enrich_liquidity=True,
+                skip_near_limit_up=True,
             )
             if not response["ok"]:
                 raise ValueError((response.get("error") or {}).get("detail", "个股查询失败"))
             data = response["data"]
             result["quote_at"] = data["quote_at"]
+            # 剔掉的数目交给模型：板块里涨停一片是热度事实，不能让它误以为板块没涨。
+            result["near_limit_up_skipped"] = data["near_limit_up_skipped"]
             result["errors"].extend(data.get("trend_errors") or [])
             for row in data["rows"]:
                 code = row["stock_code"]

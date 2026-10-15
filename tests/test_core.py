@@ -343,6 +343,17 @@ def test_screen_trend_enrichment_labels_breakout_and_broken(tmp_path, monkeypatc
     assert "breakout_entry" not in rows["600002.SH"]
     assert result["data"]["trend_gate_counts"] == {"breakout": 1, "broken": 1}
 
+    # 选池剔除接近涨停：主板 9.8% 的封板票 close_position=1，不在截断前剔掉就会独占 limit=1 的名额；
+    # 创业板 12% 离 20% 涨停还远，必须留下。
+    ticks.clear()
+    ticks.update({
+        "600003.SH": {"lastPrice": 10.98, "lastClose": 10.0, "high": 10.98, "low": 10.5, "volume": 100, "amount": 9e8},
+        "300001.SZ": {"lastPrice": 11.2, "lastClose": 10.0, "high": 11.5, "low": 10.4, "volume": 100, "amount": 1e8},
+    })
+    result = client.screen(stock_codes=list(ticks), sort_by="close_position_desc", limit=1, skip_near_limit_up=True)
+    assert [row["stock_code"] for row in result["data"]["rows"]] == ["300001.SZ"]
+    assert result["data"]["near_limit_up_skipped"] == 1
+
 
 def test_web_search_failure_diagnostics_are_visible_in_model_observation():
     attempts = [{
@@ -758,7 +769,7 @@ class FakeMiniQMT:
 
     def screen(
         self, *, sector_name="", stock_codes=None, sort_by="change_pct_desc", limit=20,
-        enrich_trend=False, enrich_liquidity=False,
+        enrich_trend=False, enrich_liquidity=False, skip_near_limit_up=False,
     ):
         codes = self.pool.get(sector_name, []) if sector_name else list(stock_codes or [])
         return _ok(
@@ -767,6 +778,7 @@ class FakeMiniQMT:
                 "quote_at": "20260910 10:00:03",
                 "universe_size": len(codes),
                 "rows": [_row(code) for code in codes[:limit]],
+                "near_limit_up_skipped": 0,
                 "trend_gate_counts": {"breakout": len(codes)},
             }
         )

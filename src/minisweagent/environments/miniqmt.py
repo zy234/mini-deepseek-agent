@@ -26,6 +26,11 @@ TRADING_TZ = timezone(timedelta(hours=8), "Asia/Shanghai")
 # 账户只开通了沪深主板和创业板；科创板要单独签风险协议，买入到券商侧才会被拒，不如在本地就拦住。
 # 只拦买入：万一历史上持有过科创板股票，卖出路径必须留着。
 BUY_BLOCKED_PREFIXES = ("688", "689")
+# 创业板和科创板涨跌幅 20%，其余主板 10%。ST 的 5% 识别不了（行情行没有名称），只会漏拦不会误拦。
+LIMIT_UP_20CM_PREFIXES = ("300", "301", "688", "689")
+# 涨幅到了涨停幅度的 80%（主板 8%、创业板 16%）就不进候选：要么封死买不进，要么追在当天最高处。
+# 这条曾只写在选池 prompt 里，prompt 一放宽，入选票一半是涨停票，所以落成宿主硬过滤。
+NEAR_LIMIT_UP_RATIO = 0.8
 LOT_SIZE = 100
 QUOTE_BATCH_SIZE = 1000
 SCREEN_UNIVERSE_LIMIT = 6000
@@ -146,6 +151,7 @@ class MiniQMTClient:
         limit: int = 20,
         enrich_trend: bool = False,
         enrich_liquidity: bool = False,
+        skip_near_limit_up: bool = False,
     ) -> dict[str, Any]:
         """按板块或指定代码批量取实时行情，只回排序后的紧凑行，避免整版 tick 淹没上下文。"""
         if sort_by not in SCREEN_SORTS:
@@ -192,6 +198,10 @@ class MiniQMTClient:
                 if row:
                     rows.append(row)
                 quote_at = max(quote_at, str(tick.get("timetag") or ""))
+        quoted = len(rows)
+        if skip_near_limit_up:
+            # 必须在排序截断之前剔：涨停票价格顶在最高价，close_position 恒为 1，不先剔就占满前排名额。
+            rows = [row for row in rows if not _near_limit_up(row)]
         rows.sort(key=SCREEN_SORTS[sort_by][0], reverse=SCREEN_SORTS[sort_by][1])
         selected = rows[:limit]
         trend_errors: list[str] = []
@@ -204,10 +214,11 @@ class MiniQMTClient:
             "sector": sector_name,
             "quote_at": quote_at,
             "universe_size": len(universe),
-            "quoted": len(rows),
+            "quoted": quoted,
             # 行情缺失和停牌不能混进榜单，也不能被静默丢掉，单独计数交出去。
             "no_tick_count": len(universe) - returned,
-            "unquotable_count": returned - len(rows),
+            "unquotable_count": returned - quoted,
+            "near_limit_up_skipped": quoted - len(rows),
             # 不可买的票仍然留在榜单里用于判断情绪，但必须带着为什么买不了。
             "buy_limits": {
                 "lot_size": LOT_SIZE,
@@ -1050,6 +1061,11 @@ def _screen_row(code: str, tick: dict[str, Any], max_buy_notional: float) -> dic
     if not row["buyable"]:
         row["unbuyable"] = "科创板无权限" if code.startswith(BUY_BLOCKED_PREFIXES) else "一手成本超过单笔买入上限"
     return row
+
+
+def _near_limit_up(row: dict[str, Any]) -> bool:
+    limit_pct = 20.0 if row["stock_code"].startswith(LIMIT_UP_20CM_PREFIXES) else 10.0
+    return row["change_pct"] >= limit_pct * NEAR_LIMIT_UP_RATIO
 
 
 def _close_position(last: float, high: float | None, low: float | None) -> float | None:
