@@ -49,6 +49,16 @@
 
 - `RISK_EXIT`：硬风险退出，允许卖出全部 `position.can_use_volume`。
 - `T_REDUCE`：高位衰竭或短线冲高回落，但日线趋势和 `stop_ref` 未破坏，只允许部分减仓，为后续更低价 T 回补保留底仓；不能用它清仓。
+- `TAKE_PROFIT`：隔夜持仓的早盘兑现（见下节），`sell_volume_pct` 为 0.5 到 1.0。
+
+### 隔夜持仓：早盘冲高优先兑现
+
+本策略的买点来自热度榜强势股，近期统计里这类票次日的平均落点是负的：早盘常有一段冲高，但收盘均值低于开盘，持有越久越差；冲高后再等"衰竭信号凑齐"，往往已经回落。所以对**昨日或更早买入、今日可卖**的持仓（`position.can_use_volume > 0`），在 11:30 之前：
+
+- 现价高于 `position.avg_price`（`position.profit_rate > 0`，覆盖往返费用约 0.15% 以上），且分钟线已出现一次冲高后回落、或跌回均价、或高点不再抬高中的**任意一个**，就给 `SELL` + `TAKE_PROFIT`，不必等 T_REDUCE 要求的两个衰竭信号。日线是否仍强只决定卖多少：日线仍在 `pivot` 上方且量价健康可卖 0.5，其余卖 1.0。
+- 价格仍在连续抬高、刚创新高且没有任何回落迹象时可以 HOLD 再等一轮，但必须把 `trigger_low` 设在最近一个分钟低点附近，回落即唤醒兑现，不能让浮盈原样吐回去。
+- 浮亏的隔夜仓不适用本节，照 `RISK_EXIT`/`T_REDUCE` 规则处理；不要因为"早盘该卖"就把正常回踩里的浮亏仓砍掉，也不要因为浮亏就扛着不止损。
+- reason 写明 `avg_price`、当前浮盈和触发的那个回落迹象。
 
 以下任一类硬风险证据成立即可 `RISK_EXIT`：
 
@@ -89,8 +99,8 @@
       "stock_code": "本组标的之一",
       "action": "BUY | SELL | HOLD",
       "buy_mode": "OPEN | T_ADD | T_BUYBACK（仅 BUY；默认 OPEN）",
-      "sell_mode": "NONE | T_REDUCE | RISK_EXIT（仅 SELL；默认 RISK_EXIT）",
-      "sell_volume_pct": "SELL 可卖仓的比例；T_REDUCE 为 0.1 到 0.5，RISK_EXIT 为 1.0；BUY/HOLD 填 1.0",
+      "sell_mode": "NONE | T_REDUCE | RISK_EXIT | TAKE_PROFIT（仅 SELL；默认 RISK_EXIT）",
+      "sell_volume_pct": "SELL 可卖仓的比例；T_REDUCE 为 0.1 到 0.5，TAKE_PROFIT 为 0.5 到 1.0，RISK_EXIT 为 1.0；BUY/HOLD 填 1.0",
       "confidence": 0.0 到 1.0 的数字,
       "price_hint": "BUY 给当前愿意支付的最高价（必须不低于当前价，且不是未来目标价）；SELL 给愿意接受的最低卖价；HOLD 给 null",
       "trigger_low": "跌破就把你唤醒重判的价（低于现价的正数，由你的结论定；不关心或无法设定给 null）",

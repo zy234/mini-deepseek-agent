@@ -2,6 +2,7 @@
 
 阶段之间只由宿主传递结构化数据，没有任何 Agent 能调度另一个 Agent：
 
+- 开盘后选池前（默认 09:32）：只对隔夜持仓跑一次读图+执行并挂监控，隔夜仓的早盘出场不等选池。
 - 阶段一（默认 10:00）：宿主取板块摘要，`candidate_scout` 按需查个股详情后选出
   若干板块各若干只票，落盘成当日待观测清单。
 - 阶段二（选池后每 25-30 分钟随机）：宿主为每只待观测股和大盘渲染日线图与当日分钟图，按板块
@@ -49,7 +50,7 @@ logger = logging.getLogger("minisweagent.trading")
 
 ACTIONS = ("BUY", "SELL", "HOLD")
 BUY_MODES = ("OPEN", "T_ADD", "T_BUYBACK")
-SELL_MODES = ("NONE", "T_REDUCE", "RISK_EXIT")
+SELL_MODES = ("NONE", "T_REDUCE", "RISK_EXIT", "TAKE_PROFIT")
 # 连续竞价时段。收盘前最后一轮跑完就结束当天，尾盘集中竞价不参与。
 SESSIONS = ((clock_time(9, 30), clock_time(11, 30)), (clock_time(13, 0), clock_time(15, 0)))
 # 盘前清单缺失时的补跑上限：10:00 首跑一次，失败后每隔 PREMARKET_RETRY_SPACING_SECONDS 再补一次，
@@ -80,6 +81,10 @@ class TradingConfig(BaseModel):
     """流水线节奏与规模。改这些不需要碰代码，但它们不是 prompt，放在配置的 trading 段。"""
 
     premarket_at: str = "10:00"
+    # 选池前的隔夜持仓轮：选池放在 10:00 才看得出强势板块，但隔夜仓次日冲高多在 9:30-10:00，
+    # 2026-10-16 复盘 10-08 改选池时间后隔夜仓最早 10:03 才卖得出。开盘后先只对持仓读图+执行一次，
+    # 留两分钟让分钟线长出路径，否则图上只有一两根 bar。
+    holding_round_at: str = "09:32"
     # 固定轮次间隔是一个区间，每次跑完在 [min, max] 里随机取一个：间隔拉长省 token，随机避免每天
     # 固定在同几个整点读图被行情规律摸透；真正的盘中异动交给监控轮询补。
     round_interval_min: int = Field(default=25, ge=1, le=120)
@@ -111,6 +116,10 @@ class TradingConfig(BaseModel):
 
     def premarket_time(self) -> clock_time:
         hour, _, minute = self.premarket_at.partition(":")
+        return clock_time(int(hour), int(minute))
+
+    def holding_round_time(self) -> clock_time:
+        hour, _, minute = self.holding_round_at.partition(":")
         return clock_time(int(hour), int(minute))
 
     def random_interval(self) -> timedelta:
@@ -243,7 +252,9 @@ class TradingPipeline:
         执行阶段仍拿到完整账户上下文，否则无法给单只票定仓位。
         """
         started = datetime.now(TRADING_TZ)
-        watchlist = self._read_watchlist(started.date())
+        # 清单缺失只出现在选池之前（隔夜持仓轮及其监控补跑）：此时没有候选，只剩持仓组可看；
+        # 既无清单又无持仓由 round_context 报"无可观测标的"。
+        watchlist = self._read_watchlist_or_none(started.date()) or {"sectors": []}
         trace, session_id = self._trace(started, "monitor" if focus_group else "round")
         pack = context.round_context(
             self._data_client(),
@@ -419,7 +430,8 @@ class TradingPipeline:
     # ---------- 交易日循环 ----------
 
     def run_day(self) -> None:
-        """按时钟推进一个交易日：先跑盘前选池，再按随机间隔跑盘中轮次，轮次之间轮询监控，收盘后返回。
+        """按时钟推进一个交易日：选池前先跑一次隔夜持仓轮，再跑盘前选池，之后按随机间隔跑盘中轮次，
+        轮次之间轮询监控，收盘后返回。
 
         盘前失败不锁死全天：到点首跑一次，失败后每隔 PREMARKET_RETRY_SPACING_SECONDS 补跑一次，
         上限 MAX_PREMARKET_ATTEMPTS 次。迟到启动（Bridge 抖动恢复后重启进程）：watchlist 已存在则
@@ -427,6 +439,7 @@ class TradingPipeline:
         """
         attempts = 0
         ran_any = False
+        holding_round_checked = False
         premarket_failed_notified = False
         last_premarket_at: datetime | None = None
         next_round_at: datetime | None = None
@@ -444,7 +457,21 @@ class TradingPipeline:
                 if ran_any:
                     notify.summary(self.journal_dir, now.date(), echo=self.echo)
                 return
-            if now.time() < self.config.premarket_time():  # 还没到选池时间，静等
+            if now.time() < self.config.premarket_time():  # 选池之前：只管隔夜持仓
+                in_session = any(start <= now.time() <= end for start, end in SESSIONS)
+                if not in_session or now.time() < self.config.holding_round_time():
+                    time.sleep(5)
+                    continue
+                if not holding_round_checked:
+                    holding_round_checked = True
+                    outcome = self._holding_round()
+                    if outcome is not None:
+                        ran_any = True
+                        guards = self._arm_guards(outcome.get("readings") or [], datetime.now(TRADING_TZ))
+                    continue
+                if guards and (last_poll_at is None or (now - last_poll_at).total_seconds() >= self.config.monitor_poll_seconds):
+                    last_poll_at = now
+                    self._guarded(partial(self._monitor, guards, datetime.now(TRADING_TZ)), "盘中监控轮询")
                 time.sleep(5)
                 continue
             # 盘前：清单缺失时按节流补跑，耗尽上限只通知一次。
@@ -465,7 +492,9 @@ class TradingPipeline:
                 if self._read_watchlist_or_none(now.date()) is None:
                     time.sleep(5)
                     continue
-                next_round_at = self._initial_next_round(now)  # 选池刚成功，安排首轮
+                # 选池刚成功就跑首轮：新候选还没被看过。不走 _initial_next_round 的重启节流——那份
+                # last_round_at 可能是刚才的隔夜持仓轮写的，拿它顺延会把首个候选轮推迟半小时。
+                next_round_at = now
             # 清单已就绪。
             if next_round_at is None:
                 next_round_at = self._initial_next_round(now)
@@ -489,6 +518,29 @@ class TradingPipeline:
             time.sleep(5)
 
     # ---------- 盘中监控 ----------
+
+    def _holding_round(self) -> dict[str, Any] | None:
+        """选池前的隔夜持仓轮：只读持仓组并执行，给隔夜仓留出 9:30-10:00 的出场窗口。
+
+        今天已经跑过任何轮次（重启进程）就不再跑，和固定轮次共用 last_round_at 做幂等；没有持仓则跳过。
+        """
+        now = datetime.now(TRADING_TZ)
+        if self._load_last_round_at(now.date()) is not None:
+            self.echo("今日已跑过盘中轮次，跳过选池前的隔夜持仓轮")
+            return None
+        try:
+            positions = context.account_context(self._data_client(), [])["positions"]
+        except Exception as error:
+            logger.exception("隔夜持仓轮取账户失败")
+            self.echo(f"[失败] 隔夜持仓轮取账户失败：{type(error).__name__}: {error}")
+            return None
+        if not positions:
+            self.echo("无隔夜持仓，选池前不读图")
+            return None
+        self.echo(f"选池前先看 {len(positions)} 只隔夜持仓")
+        outcome = self._run_round_capture()
+        self._save_last_round_at(datetime.now(TRADING_TZ))
+        return outcome
 
     def _run_round_capture(self, focus_group: str | None = None) -> dict[str, Any] | None:
         """跑一轮并返回结果（含 readings 供布防），单轮失败不终止整天，只留痕返回 None。"""
@@ -794,6 +846,9 @@ def _validate_verdicts(data: Any, codes: list[str]) -> dict[str, Any]:
             raise ValueError(f"{code} 的 SELL 必须说明 sell_mode")
         if sell_mode == "T_REDUCE" and float(sell_volume_pct) > 0.5:
             raise ValueError(f"{code} 的 T_REDUCE 最多只能卖出可卖仓的 50%")
+        # 早盘兑现是"落袋"而不是试探性减仓：卖得比一半还少就和 T_REDUCE 混在一起，执行阶段分不清意图。
+        if sell_mode == "TAKE_PROFIT" and float(sell_volume_pct) < 0.5:
+            raise ValueError(f"{code} 的 TAKE_PROFIT 至少卖出可卖仓的 50%")
         if action != "SELL" and sell_volume_pct != 1.0:
             raise ValueError(f"{code} 只有 SELL 才能设置 sell_volume_pct")
         # 盘中监控价带：两个键必须显式给出。缺键说明模型没按要求产出监控带，让它重来；给 null 是

@@ -1026,6 +1026,8 @@ class ScriptedModel:
                         {
                             "stock_code": code,
                             "action": "SELL" if holding else ("BUY" if code.startswith("6000") else "HOLD"),
+                            # 持仓组走早盘兑现：宿主校验必须认得 TAKE_PROFIT 及其最小卖出比例。
+                            **({"sell_mode": "TAKE_PROFIT", "sell_volume_pct": 1.0} if holding else {}),
                             "confidence": 0.7,
                             "price_hint": 15.8,
                             "trigger_low": 15.0,
@@ -1185,6 +1187,17 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch, 
         assert not ScriptedModel.seen and not FakeMiniQMT.submissions
         return
 
+    # 选池前的隔夜持仓轮：还没有清单，只读持仓组并执行；跑过一次后同日重启不再重跑。
+    holding_outcome = day._holding_round()
+    assert ScriptedModel.seen["reader"] == 1
+    assert [reading["group"] for reading in holding_outcome["readings"]] == ["当前持仓"]
+    assert holding_outcome["readings"][0]["verdicts"][0]["sell_mode"] == "TAKE_PROFIT"
+    assert day._arm_guards(holding_outcome["readings"], datetime.now(pipeline.TRADING_TZ))  # 选池前持仓也挂监控
+    assert day._holding_round() is None and ScriptedModel.seen["reader"] == 1
+    FakeMiniQMT.submissions.clear()
+    ScriptedModel.seen.clear()
+    fetch_calls["n"] = 0
+
     watchlist = day.premarket()
     # 首轮只有摘要，个股简表和完整详情分两步进入工具观测，重复查询不再注入相同数据。
     scout_trace = json.loads(next(sessions_dir.rglob("*-premarket.json")).read_text())
@@ -1216,6 +1229,7 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch, 
     with journal_path.open("a", encoding="utf-8") as handle:
         handle.write(history)
 
+    holding_traces = set(sessions_dir.rglob("*-round.json"))
     outcome = day.run_round()
 
     # 两个候选板块各一组，加上持仓组，一共三组并行读图。
@@ -1236,8 +1250,9 @@ def test_trading_pipeline_runs_three_stages_and_executes(tmp_path, monkeypatch, 
     journal = (journal_dir / "journals" / f"{watchlist['trade_date']}.md").read_text(encoding="utf-8")
     assert "买入 600001.SH 一手" in journal
     roots = inspect.TraceIndex(sessions_dir).sessions()
-    round_root = next(root for root in roots if root["agent_name"] == "execution_manager")
-    execution_trace = json.loads(next(sessions_dir.rglob("*-round.json")).read_text())
+    # 隔夜持仓轮也是一棵 execution_manager 树，按子会话数认出选池后的全量轮。
+    round_root = next(root for root in roots if root["agent_name"] == "execution_manager" and len(root["children"]) == 3)
+    execution_trace = json.loads(next(iter(set(sessions_dir.rglob("*-round.json")) - holding_traces)).read_text())
     injected = execution_trace["messages"][1]["content"]
     assert "cycle:early-trade" in injected and "trade:early-trade:intent:1" in injected
     assert "cycle:latest-hold" in injected and "最新观察" in injected
